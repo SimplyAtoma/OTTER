@@ -55,7 +55,7 @@ const mockWords: TranscriptWord[] = [
   { word: "test2", start: 0.5, end: 1.0 },
   { word: "test3", start: 1.0, end: 1.3 },
   { word: "test4", start: 1.3, end: 1.5 },
-  { word: "test5", start: 1.5, end: 1.6 },
+  { word: "hello5", start: 1.5, end: 1.6 },
   { word: "test6", start: 1.6, end: 2.0 },
   { word: "test7", start: 2.0, end: 2.8 },
   { word: "test8", start: 2.8, end: 3.0 },
@@ -64,7 +64,7 @@ const mockWords: TranscriptWord[] = [
   { word: "test11", start: 4.2, end: 4.5 },
   { word: "test12", start: 4.5, end: 5.0 },
   { word: "test13", start: 5.0, end: 5.4 },
-  { word: "test14", start: 5.4, end: 5.6 },
+  { word: "hello14", start: 5.4, end: 5.6 },
   { word: "test15", start: 5.6, end: 6.1 },
   { word: "test16", start: 6.1, end: 6.3 },
   { word: "test17", start: 6.3, end: 6.7 },
@@ -193,6 +193,101 @@ const statusEl = mustGetEl<HTMLDivElement>("status");
 function normalizeRange(a: number, b: number) {
   return a <= b ? { start: a, end: b } : { start: b, end: a };
 }
+
+
+// For search function
+const findBar = document.getElementById("searchBar")!;
+const findInput = document.getElementById("searchInput") as HTMLInputElement;
+const findClose = document.getElementById("findClose")!;
+findBar.hidden = true;
+
+//Ctrl + F keyboard shortcut
+window.addEventListener("keydown", (event: KeyboardEvent) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    findBar.hidden = false;
+    findInput.focus();
+    findInput.select();
+  }
+
+  if (event.key === "Escape") {
+    findBar.hidden = true;
+  }
+});
+
+findClose.addEventListener("click", () => {
+  findBar.hidden = true;
+});
+
+
+let lastFoundIndex = -1;
+let lastSearchQuery = "";
+//Search word (Enter key)
+findInput.addEventListener("keydown", (event: KeyboardEvent) => {
+    if(event.key !== "Enter")
+    {
+      return;
+    }
+   
+    const searchQuery = findInput.value.trim().toLowerCase();
+    if(!searchQuery) 
+    {
+      return;
+    }
+
+    // If the user types in a new word, start from the beginning again
+    if (searchQuery !== lastSearchQuery) {
+        lastFoundIndex = -1;
+        lastSearchQuery = searchQuery;
+      }
+    let found = false;
+      // Go to the next word (same word)
+    for(let i = lastFoundIndex + 1; i < words.length; i++)
+    {
+      if(words[i].word.toLowerCase().includes(searchQuery))
+      {
+        lastFoundIndex=  i;
+        found = true;
+        lastSearchQuery = searchQuery;
+      const wordFound = words[i];
+      setSelectionRange(i, i); //highlights the word
+      ws.setTime(Number(wordFound.start) + SEEK_EPS); // also adjusts the word's start time
+
+      const el = transcriptEl.querySelector(
+      `.word[data-index="${i}"]`
+      ) as HTMLElement | null;
+
+      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      break;
+    }
+
+    }
+
+   if(!found)
+    {
+      //Wrap around search
+      for(let i = 0; i < lastFoundIndex; i++)
+      {
+        if(words[i].word.toLowerCase().includes(searchQuery))
+        {
+          lastFoundIndex = i;
+            lastSearchQuery = searchQuery;
+      const wordFound = words[i];
+      setSelectionRange(i, i); //highlights the word
+      ws.setTime(Number(wordFound.start) + SEEK_EPS); // also adjusts the word's start time
+
+      const el = transcriptEl.querySelector(
+      `.word[data-index="${i}"]`
+      ) as HTMLElement | null;
+
+      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      break;
+        }
+      }
+    }
+
+  });
+
 
 /**
  * Update the visual "playhead" state to reflect the word currently
@@ -358,6 +453,7 @@ function renderTranscript(words: TranscriptWord[]) {
       event.preventDefault();
       isDragging =true;
       dragStart = i;
+      setPlayheadIndex(-1); 
       setSelectionRange(i, i);
     });
 
@@ -801,6 +897,7 @@ async function populateSpecSelect() {
 
 // Events
 
+
 chkCustomSpec.addEventListener("change", async () => {
   if (chkCustomSpec.checked) {
     // Enter customize mode: show textarea and seed it from selected file
@@ -881,4 +978,5 @@ const WORD_REGION_COLOR = getCssVar(
 );
 
 //Will delete later, just to see test highlighting some words
-renderTranscript(mockWords);
+words = mockWords;
+renderTranscript(words);
