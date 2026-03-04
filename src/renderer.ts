@@ -281,13 +281,13 @@ async function loadDetailForRange(start: number, end: number) {
  *
  * This removes words at indices [selectionStart, selectionEnd] from the
  * in-memory words[] array and re-renders the transcript.
+ * It also clears the selection and playhead, since they may now reference
+ * invalid indices after deletion.
  *
- * Side effects:
- *   • Mutates words[] (removes selected indices)
- *   • Re-renders transcript DOM
- *   • Clears selection and playhead
- *   • Disables detail view (indices may be stale)
- */
+ * This is a non-destructive operation for demonstration purposes;
+ * it does not modify the source audio or persist changes.
+ * It serves to illustrate how transcript-driven editing might work in principle.
+ */ 
 function deleteSelectedWords() {
   if (selectionStart == null || selectionEnd == null) {
     setStatus("No selection to delete.", "error");
