@@ -25,7 +25,6 @@ import os
 import sys
 from typing import Any, Dict, Optional
 from contextlib import redirect_stdout
-import sys
 from pydash import get as deep_get
 
 def run_with_stdout_redirect(fn):
@@ -88,16 +87,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "list":
         data = list_components()
-        json.dump(data, sys.stderr, indent=2)
-        sys.stderr.write("\n")
+        json.dump(data, sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return 0
 
     if args.cmd == "run":
-        spec = read_spec(args.spec_json, args.spec_file)
+        try:
+            spec = read_spec(args.spec_json, args.spec_file)
+        except (ValueError, json.JSONDecodeError) as e:
+            eprint(f"ERROR:SpecError:{e}")
+            return 1
 
         audio_path = args.audio
         if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            eprint(f"ERROR:FileNotFoundError:Audio file not found: {audio_path}")
+            return 1
 
         # Progress callback for Electron:
         # - emit "PROGRESS:NN" lines to stderr (easy to parse, keeps stdout clean)
@@ -114,10 +118,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # Emit machine-readable JSON ONLY on stdout.
         if not args.emit_meta:
-            language = deep_get(result, "meta.transcriber.meta.language", default="unknown")
+            language = deep_get(result, "meta.transcriber.meta.language", default=None)
             result.pop("meta", None)
             result["language"] = language
-        
+        if language is None:
+            eprint("WARN: could not extract language from meta, defaulting to 'unknown'")
+            language = "unknown"
         json.dump(result, sys.stdout)
 
         sys.stdout.write("\n")
@@ -132,6 +138,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as ex:
-        # Emit a structured error to stderr so Electron can show it / log it.
-        eprint(f"ERROR:{type(ex).__name__}:{ex}")
+        json.dump({"error": type(ex).__name__, "message": str(ex)}, sys.stdout)
+        sys.stdout.write("\n")
         raise
