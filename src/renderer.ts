@@ -51,7 +51,7 @@ type TranscriptWord = {
 };
 
 const mockWords: TranscriptWord[] = [
-  { word: "test1", start: 0.0, end: 0.5 },
+  { word: "te1", start: 0.0, end: 0.5 },
   { word: "test2", start: 0.5, end: 1.0 },
   { word: "test3", start: 1.0, end: 1.3 },
   { word: "test4", start: 1.3, end: 1.5 },
@@ -62,13 +62,13 @@ const mockWords: TranscriptWord[] = [
   { word: "test9", start: 3.0, end: 3.6 },
   { word: "test10", start: 3.6, end: 4.2 },
   { word: "test11", start: 4.2, end: 4.5 },
-  { word: "test12", start: 4.5, end: 5.0 },
+  { word: "hero12", start: 4.5, end: 5.0 },
   { word: "test13", start: 5.0, end: 5.4 },
   { word: "hello14", start: 5.4, end: 5.6 },
   { word: "test15", start: 5.6, end: 6.1 },
   { word: "test16", start: 6.1, end: 6.3 },
   { word: "test17", start: 6.3, end: 6.7 },
-  { word: "test18", start: 6.7, end: 7.2 },
+  { word: "tent18", start: 6.7, end: 7.2 },
   { word: "test19", start: 7.2, end: 7.4 },
   { word: "test20", start: 7.4, end: 8.0 },
 ];
@@ -201,6 +201,7 @@ const findInput = document.getElementById("searchInput") as HTMLInputElement;
 const findClose = document.getElementById("findClose")!;
 findBar.hidden = true;
 
+
 //Ctrl + F keyboard shortcut
 window.addEventListener("keydown", (event: KeyboardEvent) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
@@ -212,11 +213,13 @@ window.addEventListener("keydown", (event: KeyboardEvent) => {
 
   if (event.key === "Escape") {
     findBar.hidden = true;
+    clearSearchHighlights();
   }
 });
 
 findClose.addEventListener("click", () => {
   findBar.hidden = true;
+  clearSearchHighlights();
 });
 
 
@@ -253,11 +256,11 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
       setSelectionRange(i, i); //highlights the word
       ws.setTime(Number(wordFound.start) + SEEK_EPS); // also adjusts the word's start time
 
-      const el = transcriptEl.querySelector(
+      const wordElement = transcriptEl.querySelector(
       `.word[data-index="${i}"]`
       ) as HTMLElement | null;
 
-      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      wordElement?.scrollIntoView({ block: "center", behavior: "smooth" });
       break;
     }
 
@@ -276,17 +279,58 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
       setSelectionRange(i, i); //highlights the word
       ws.setTime(Number(wordFound.start) + SEEK_EPS); // also adjusts the word's start time
 
-      const el = transcriptEl.querySelector(
+      const wordElement = transcriptEl.querySelector(
       `.word[data-index="${i}"]`
       ) as HTMLElement | null;
 
-      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      wordElement?.scrollIntoView({ block: "center", behavior: "smooth" });
       break;
         }
       }
     }
 
   });
+
+  //Reset function for searching
+function clearSearchHighlights() {
+
+  const transcriptWords = transcriptEl.querySelectorAll(".word");
+
+  for (let i = 0; i < transcriptWords.length; i++) {
+
+    const wordElement = transcriptWords[i] as HTMLElement;
+    const index = Number(wordElement.dataset.index);
+    const wordText = words[index].word;    
+    wordElement.innerHTML = wordText + " ";
+  }
+}
+
+  //Highlighting the user's entry in the search bar
+  findInput.addEventListener("input", () =>{
+    const searchQuery = findInput.value.trim().toLowerCase();
+    const transcriptWords = transcriptEl.querySelectorAll(".word");
+   
+    for(let i = 0; i < transcriptWords.length; i++)
+    {
+      const wordElement = transcriptWords[i] as HTMLElement;
+      const index = Number(wordElement.dataset.index);
+      const wordText = words[index].word;
+      wordElement.innerHTML = wordText + " ";
+      const matchPosition = wordText.toLowerCase().indexOf(searchQuery)
+      if(matchPosition === -1)
+      {
+        continue;
+      }
+      
+      //Slicing the highlights
+      const before = wordText.slice(0,matchPosition);
+      const matchingChar = wordText.slice(matchPosition, matchPosition + searchQuery.length);
+      const after = wordText.slice(matchPosition + searchQuery.length);
+      wordElement.innerHTML=  before +'<span class="highlight">' + matchingChar + '</span>' +after +" ";
+    }
+
+})
+
 
 
 /**

@@ -273,3 +273,8 @@ main {
   font-size: 12px;
   line-height: 1.35;
 }
+
+/* Highlight search words */
+.highlight {
+  background: #f4a949;
+}
