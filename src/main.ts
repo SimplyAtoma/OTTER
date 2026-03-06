@@ -181,7 +181,7 @@ ipcMain.handle(
   function getPythonPath() {
     const venvPython = path.join(repoRoot, ".venv", "bin", "python3");
     if (fs.existsSync(venvPython)) return venvPython;
-    return "C:\\Users\\18315\\AppData\\Local\\Programs\\Python\\Python311\\python.exe";
+    return "python3";
   }
 
   // Run from the repo root so "python -m otter_py.transcribe" works.
