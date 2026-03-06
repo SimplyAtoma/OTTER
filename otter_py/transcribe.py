@@ -23,6 +23,8 @@ import argparse
 import json
 import os
 import sys
+import hashlib
+import tempfile
 from typing import Any, Dict, Optional
 from contextlib import redirect_stdout
 from pydash import get as deep_get
@@ -58,6 +60,37 @@ def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, A
 
     raise ValueError("Missing pipeline spec. Provide --spec-json or --spec-file")
 
+def _cache_key(audio_path: str, spec: Dict[str, Any]) -> str:
+    h = hashlib.sha256()
+    # Hash file contents (not path — path can change, contents shouldn't)
+    with open(audio_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    # Hash the spec so different models/settings don't share a cache entry
+    h.update(json.dumps(spec, sort_keys=True).encode())
+    return h.hexdigest()
+
+def _cache_dir() -> str:
+    base = os.environ.get("OTTER_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "otter_cache")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+def _cache_path(key: str) -> str:
+    return os.path.join(_cache_dir(), f"{key}.json")
+
+def _load_cache(key: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(_cache_path(key), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+def _save_cache(key: str, result: Dict[str, Any]) -> None:
+    try:
+        with open(_cache_path(key), "w", encoding="utf-8") as f:
+            json.dump(result, f)
+    except OSError as e:
+        eprint(f"WARN: failed to write cache: {e}")
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="OTTER PoC transcription pipeline runner")
@@ -69,6 +102,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_run.add_argument("--audio", required=True, help="Path to input audio file")
     p_run.add_argument("--spec-json", help="Pipeline spec as JSON string")
     p_run.add_argument("--spec-file", help="Path to pipeline spec JSON file")
+    p_run.add_argument("--no-cache", action="store_true", help="Skip cache and overwrite cached result")
 
     # Optional: let Electron ask for meta too (debug)
     p_run.add_argument("--emit-meta", action="store_true", help="Emit {words, meta} instead of just words[]")
@@ -109,18 +143,25 @@ def main(argv: Optional[list[str]] = None) -> int:
             eprint(f"PROGRESS:{pct}")
 
         ctx: Dict[str, Any] = {"progress": progress}
-
+        cache_key = _cache_key(audio_path, spec)
+        cached = None if args.no_cache else _load_cache(cache_key)
         # Run the pipeline with stdout redirected to stderr so that any library
         # chatter (e.g. WhisperX notices) can't corrupt our JSON output channel.
-        try:
-            result = run_with_stdout_redirect(
-                lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
-            )
-        except Exception as e:
-            eprint(f"ERROR:{type(e).__name__}:{e}")
-            json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
-            sys.stdout.write("\n")
-            return 1
+        if cached is not None:
+            eprint("INFO:cache hit, skipping pipeline execution")
+            result = cached
+        else:
+            eprint("INFO:cache miss, running pipeline")
+            try:
+                result = run_with_stdout_redirect(
+                    lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
+                )
+            except Exception as e:
+                eprint(f"ERROR:{type(e).__name__}:{e}")
+                json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
+                sys.stdout.write("\n")
+                return 1
+            _save_cache(cache_key, result)
 
         # Emit machine-readable JSON ONLY on stdout (no extra logs, progress, or library chatter).
         if not args.emit_meta:
