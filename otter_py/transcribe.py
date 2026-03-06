@@ -112,18 +112,24 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # Run the pipeline with stdout redirected to stderr so that any library
         # chatter (e.g. WhisperX notices) can't corrupt our JSON output channel.
-        result = run_with_stdout_redirect(
-            lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
-        )
+        try:
+            result = run_with_stdout_redirect(
+                lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
+            )
+        except Exception as e:
+            eprint(f"ERROR:{type(e).__name__}:{e}")
+            json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
+            sys.stdout.write("\n")
+            return 1
 
-        # Emit machine-readable JSON ONLY on stdout.
+        # Emit machine-readable JSON ONLY on stdout (no extra logs, progress, or library chatter).
         if not args.emit_meta:
             language = deep_get(result, "meta.transcriber.meta.language", default=None)
+            if language is None:
+                eprint("WARN: could not extract language from meta, defaulting to 'unknown'")
+                language = "unknown"
             result.pop("meta", None)
             result["language"] = language
-        if language is None:
-            eprint("WARN: could not extract language from meta, defaulting to 'unknown'")
-            language = "unknown"
         json.dump(result, sys.stdout)
 
         sys.stdout.write("\n")
@@ -137,7 +143,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except SystemExit:
+        raise  # let normal exits through
     except Exception as ex:
         json.dump({"error": type(ex).__name__, "message": str(ex)}, sys.stdout)
         sys.stdout.write("\n")
-        raise
+        sys.exit(1)  # clean exit, no traceback
