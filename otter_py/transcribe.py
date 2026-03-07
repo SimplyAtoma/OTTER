@@ -103,6 +103,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_run.add_argument("--spec-json", help="Pipeline spec as JSON string")
     p_run.add_argument("--spec-file", help="Path to pipeline spec JSON file")
     p_run.add_argument("--no-cache", action="store_true", help="Skip cache and overwrite cached result")
+    p_clear = sub.add_parser("clear-cache", help="Delete all cached results (for testing/debugging)") 
 
     # Optional: let Electron ask for meta too (debug)
     p_run.add_argument("--emit-meta", action="store_true", help="Emit {words, meta} instead of just words[]")
@@ -176,7 +177,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         sys.stdout.write("\n")
         return 0
 
-
+    if args.cmd == "clear-cache":
+        # For testing/debugging: clear the cache directory
+        cache = _cache_dir()
+        deleted = 0
+        for f in os.listdir(cache):
+            if f.endswith(".json"):
+                try:
+                    os.remove(os.path.join(cache, f))
+                    deleted += 1
+                except OSError as e:
+                    eprint(f"WARN: failed to remove cache file {f}: {e}")
+        json.dump({"deleted": deleted, "cache_dir": cache}, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
     parser.error("Unhandled command")
     return 2
 
