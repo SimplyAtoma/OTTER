@@ -441,6 +441,55 @@ function applyStatusToRange(
   return changed;
 }
 
+function moveWord(pt: PieceTableData, fromIndex: number, toIndex: number): boolean {
+  if (fromIndex === toIndex) return false;
+
+  const entries = getViewEntries(pt);
+  if (fromIndex < 0 || fromIndex >= entries.length) return false;
+  if (toIndex < 0 || toIndex >= entries.length) return false;
+
+  const moving = entries[fromIndex];
+
+  const withoutSource: ViewEntry[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (i !== fromIndex) withoutSource.push(entries[i]);
+  }
+
+  const insertAt = toIndex > fromIndex ? toIndex - 1 : toIndex;
+  const reordered: ViewEntry[] = [];
+  for (let i = 0; i <= withoutSource.length; i++) {
+    if (i === insertAt) reordered.push(moving);
+    if (i < withoutSource.length) reordered.push(withoutSource[i]);
+  }
+
+  const newPieces: Piece[] = reordered.map(ve => {
+    const buf = ve.entry.sourceStart !== undefined
+      ? (pt.originalBuffer.indexOf(ve.entry) !== -1 ? "original" as const : "add" as const)
+      : "original" as const;
+    const bufArr = buf === "original" ? pt.originalBuffer : pt.addBuffer;
+    const offset = bufArr.indexOf(ve.entry);
+    return {
+      source: buf,
+      offset,
+      length: 1,
+      status: ve.status,
+    };
+  });
+
+  pt.pieces = mergePieces(newPieces);
+  pt.modifiedAt = new Date().toISOString();
+  return true;
+}
+
+function moveRange(
+  pt: PieceTableData,
+  fromStart: number,
+  fromEnd: number,
+  toIndex: number
+): boolean {
+  return false;
+}
+
 /**
  * Validate a parsed object as a v2 EDL (piece table format).
  */
