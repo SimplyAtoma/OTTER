@@ -117,16 +117,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
-    from otter_py.pipeline_registry import load_components, list_components, run_pipeline
-    load_components()
-
     if args.cmd == "list":
+        from otter_py.pipeline_registry import load_components, list_components
+        load_components()  # ensure components are loaded before listing
         data = list_components()
         json.dump(data, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0
 
     if args.cmd == "run":
+        from otter_py.pipeline_registry import load_components, run_pipeline
+        load_components()  # ensure components are loaded before running
         try:
             spec = read_spec(args.spec_json, args.spec_file)
         except (ValueError, json.JSONDecodeError) as e:
