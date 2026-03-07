@@ -68,6 +68,7 @@ class _PostEntry(TypedDict):
 
 _TRANSCIBERS: Dict[str, _TranscriberEntry] = {}
 _POSTS: Dict[str, _PostEntry] = {}
+_LOADED: bool = False  # to prevent double-loading of components
 
 
 # -----------------------------------------------------------------------------
