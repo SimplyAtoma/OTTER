@@ -122,8 +122,12 @@ def load_components() -> None:
     Registration happens at import time as a side effect of importing the
     component modules.
     """
+    global _LOADED
+    if _LOADED:
+        return
     import otter_py.pipelines.transcribers  # noqa: F401
     import otter_py.pipelines.postprocessors  # noqa: F401
+    _LOADED = True
 
 def list_components() -> Dict[str, Any]:
     """
