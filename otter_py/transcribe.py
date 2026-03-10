@@ -23,11 +23,11 @@ import argparse
 import json
 import os
 import sys
-import hashlib
-import tempfile
 from typing import Any, Dict, Optional
 from contextlib import redirect_stdout
 from pydash import get as deep_get
+from otter_py.util import eprint
+from otter_py.cacheUtil import _cache_key, _cache_dir, _cache_path, _load_cache, _save_cache
 
 def run_with_stdout_redirect(fn):
     """
@@ -40,11 +40,6 @@ def run_with_stdout_redirect(fn):
     """
     with redirect_stdout(sys.stderr):
         return fn()
-
-def eprint(*args: Any, **kwargs: Any) -> None:
-    """Print to stderr (keeps stdout reserved for machine-readable JSON)."""
-    print(*args, file=sys.stderr, **kwargs)
-
 
 def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, Any]:
     """Load the pipeline spec from a JSON string or file."""
@@ -59,38 +54,6 @@ def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, A
         return json.loads(spec_json)
 
     raise ValueError("Missing pipeline spec. Provide --spec-json or --spec-file")
-
-def _cache_key(audio_path: str, spec: Dict[str, Any]) -> str:
-    h = hashlib.sha256()
-    # Hash file contents (not path — path can change, contents shouldn't)
-    with open(audio_path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    # Hash the spec so different models/settings don't share a cache entry
-    h.update(json.dumps(spec, sort_keys=True).encode())
-    return h.hexdigest()
-
-def _cache_dir() -> str:
-    base = os.environ.get("OTTER_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "otter_cache")
-    os.makedirs(base, exist_ok=True)
-    return base
-
-def _cache_path(key: str) -> str:
-    return os.path.join(_cache_dir(), f"{key}.json")
-
-def _load_cache(key: str) -> Optional[Dict[str, Any]]:
-    try:
-        with open(_cache_path(key), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
-def _save_cache(key: str, result: Dict[str, Any]) -> None:
-    try:
-        with open(_cache_path(key), "w", encoding="utf-8") as f:
-            json.dump(result, f)
-    except OSError as e:
-        eprint(f"WARN: failed to write cache: {e}")
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="OTTER PoC transcription pipeline runner")
