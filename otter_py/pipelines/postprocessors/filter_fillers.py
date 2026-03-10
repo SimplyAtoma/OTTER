@@ -60,7 +60,7 @@ def filter_fillers(
                 if conf is not None and float(conf) >= min_conf:
                     out.append(dict(w))
                     continue
-            dbg(f"filter_fillers: removing '{w['word']}'", DebugLevel.VERBOSE)
+            dbg(f"filter_fillers: removing '{w['word']}'", DebugLevel.DETAIL)
             removed += 1
         else:
             out.append(dict(w))

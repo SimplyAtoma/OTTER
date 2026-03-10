@@ -60,12 +60,12 @@ def filter_low_confidence(
             if keep_unscored:
                 out.append(dict(w))
             else:
-                dbg(f"filter_low_confidence: removing unscored '{w['word']}'", DebugLevel.VERBOSE)
+                dbg(f"filter_low_confidence: removing unscored '{w['word']}'", DebugLevel.DETAIL)
                 removed += 1
             continue
 
         if float(conf) < min_conf:
-            dbg(f"filter_low_confidence: conf={conf:.2f} < {min_conf} for '{w['word']}'", DebugLevel.VERBOSE)
+            dbg(f"filter_low_confidence: conf={conf:.2f} < {min_conf} for '{w['word']}'", DebugLevel.DETAIL)
             if replace_with is not None:
                 # Replace word text but keep timestamps
                 replacement = dict(w)
