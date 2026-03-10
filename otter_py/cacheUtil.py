@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import tempfile
+from otter_py.util import eprint
 from typing import Any, Dict, Optional
 
 def _cache_key(audio_path: str, spec: Dict[str, Any]) -> str:

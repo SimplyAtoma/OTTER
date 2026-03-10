@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 from contextlib import redirect_stdout
 from pydash import get as deep_get
 from otter_py.util import eprint
-from otter_py.cacheUtil import _cache_key, _cache_dir, _cache_path, _load_cache, _save_cache
+from otter_py.cacheUtil import _cache_key, _cache_dir,  _load_cache, _save_cache
 
 def run_with_stdout_redirect(fn):
     """

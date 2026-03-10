@@ -1,5 +1,4 @@
-
-
+"""Utility functions for OTTER."""
 import sys
 
 
