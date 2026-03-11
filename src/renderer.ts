@@ -126,6 +126,8 @@ let selectionEnd: number | null = null;
 let selectionAnchor: number | null = null;
 let playheadIndex = -1;
 
+let historyStack: TranscriptWord[][] = [];
+
 //
 // Utility Functions
 //
@@ -242,16 +244,22 @@ function setSelectionRange(start: number | null, end: number | null) {
   });
 }
 
-// Jacob (for my reference for command-f)
+// Jacob (for my reference)
 function deleteSelectedWords() {
+
+  // Exit if no selection
   if (selectionStart == null || selectionEnd == null) {
-    console.log("Delete ignored: no selection");
     return;
   } 
+
   if (words.length === 0) return;
   
   const { start, end } = normalizeRange(selectionStart, selectionEnd);
 
+  // Save current transcript state for undo
+  historyStack.push(JSON.parse(JSON.stringify(words)));
+
+  // Remove selected words
   words.splice(start, end - start + 1);
 
   // Reset interaction state
@@ -260,9 +268,30 @@ function deleteSelectedWords() {
   selectionAnchor = null;
   playheadIndex = -1;
 
+  // Re-render transcriptYes 
   renderTranscript(words);
 }
 
+// Jacob (for my reference)
+function undoDelete() {
+
+  // Exit if no history exists
+  if (historyStack.length === 0 ) {
+    return;
+  }
+
+  // Restore previous transcript
+  words = historyStack.pop()!;
+
+  // Clear selection state
+  selectionStart = null;
+  selectionEnd = null;
+  selectionAnchor = null;
+  playheadIndex = -1;
+
+  // Re-render transcripts
+  renderTranscript(words);
+}
 
 // Compute a small snippet window around a word boundary.
 // This keeps the detail waveform focused on just the selected word plus context.
@@ -426,6 +455,7 @@ function renderTranscript(words: TranscriptWord[]) {
 
 const btnPlay = mustGetEl<HTMLButtonElement>("btnPlay");
 const btnDelete = mustGetEl<HTMLButtonElement>("btnDelete");
+const btnUndo = mustGetEl<HTMLButtonElement>("btnUndo")
 const timeEl = mustGetEl<HTMLSpanElement>("time");
 const progressEl = mustGetEl<HTMLProgressElement>("transcribeProgress");
 const fnameEl = mustGetEl<HTMLSpanElement>("loadedFile");
@@ -434,6 +464,14 @@ btnDelete.addEventListener("click", (e) => {
   e.preventDefault();
   deleteSelectedWords();
 })
+
+// Restore last transcript state
+btnUndo.addEventListener("click", (e) => {
+  e.preventDefault();
+  undoDelete();
+});
+
+
 
 // Switch between play and pause icons
 function setPlayIcon(isPlaying: boolean) {
@@ -909,6 +947,14 @@ const WORD_REGION_COLOR = getCssVar(
 
 //Will delete later, just to see test highlighting some words
 
-words = [...mockWords];
-renderTranscript(words);
+window.addEventListener("DOMContentLoaded", () => {
+  
+  words = [...mockWords];   // Load test data
+  renderTranscript(words);  // Show transcript UI
+
+  setDetailPlayIcon(false);
+  btnDetailPlay.disabled = true;
+  btnRegion.disabled = true;
+
+});
 
