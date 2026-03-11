@@ -50,6 +50,7 @@ def _transcribe_chunk(
     )
     result = model.transcribe(chunk, batch_size=batch_size, language=language)
     segments = result.get("segments", []) or []
+    detected_lang = result.get("language", language)
 
     # Offset all timestamps by chunk start
     for seg in segments:
@@ -61,7 +62,7 @@ def _transcribe_chunk(
             if "end" in w:
                 w["end"] += chunk_start
 
-    return segments
+    return segments, detected_lang
 
 
 def _split_audio(
@@ -180,6 +181,7 @@ def transcribe_parallel(
     # Transcribe chunks in parallel
     all_segments: List[List[Dict]] = [None] * len(chunks)
     progress_per_chunk = 60 / len(chunks)
+    detected_lang = []
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -195,7 +197,10 @@ def transcribe_parallel(
         for future in concurrent.futures.as_completed(futures):
             i = futures[future]
             try:
-                all_segments[i] = future.result()
+                seg, lang = future.result()
+                all_segments[i] = seg
+                if lang :
+                    detected_lang.append(lang)
             except Exception as e:
                 eprint(f"ERROR:parallel chunk {i} failed: {e}")
                 all_segments[i] = []
@@ -211,8 +216,9 @@ def transcribe_parallel(
     merged_segments.sort(key=lambda s: s.get("start", 0))
 
     # Detect language from first successful chunk if not specified
+    from collections import Counter
     detected_lang = language or (
-        merged_segments[0].get("language") if merged_segments else None
+        Counter(detected_lang).most_common(1)[0][0] if detected_lang else None
     )
     if not detected_lang:
         raise RuntimeError("Could not detect language from any chunk.")
