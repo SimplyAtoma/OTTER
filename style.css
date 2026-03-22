@@ -172,6 +172,18 @@ main {
   outline-offset: 1px;
 }
 
+#transcript.dragging-words .word {
+  cursor: grabbing;
+}
+
+.word.drop-before {
+  box-shadow: inset 3px 0 0 #f4a949;
+}
+
+.word.drop-after {
+  box-shadow: inset -3px 0 0 #f4a949;
+}
+
 /* ============================================================================
    Developer Panel (bottom of left column)
    ========================================================================== */

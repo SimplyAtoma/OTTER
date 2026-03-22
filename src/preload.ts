@@ -190,4 +190,7 @@ contextBridge.exposeInMainWorld("otter", {
   exportEdlAudio: (edlJson: string): Promise<string | null> =>
     ipcRenderer.invoke("export-edl-audio", edlJson),
 
+  renderEditedPreview: (edlJson: string): Promise<string> =>
+    ipcRenderer.invoke("render-edited-preview", edlJson),
+
 });
