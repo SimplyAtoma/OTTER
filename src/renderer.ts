@@ -873,7 +873,6 @@ function setSelectionRange(start: number | null, end: number | null) {
   updateEditButtonStates();
 }
 
-
 // Compute a small snippet window around a word boundary.
 // This keeps the detail waveform focused on just the selected word plus context.
 function computeDetailWindow(start: number, end: number) {
