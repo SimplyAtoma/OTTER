@@ -62,6 +62,58 @@ type TranscribeSpec =
   | { mode: "file"; name: string }
   | { mode: "json"; jsonText: string };
 
+// ---------------------------------------------------------------------------
+// Piece Table types
+//
+// A piece table tracks edits as an ordered sequence of "pieces", each
+// referencing a span in either the original buffer (ASR transcript) or
+// an add buffer (user-added words). Deleted words remain in the table
+// with status "deleted" so they can be displayed with strikethrough
+// styling and restored via undo/redo.
+//
+// The source audio is never modified. Edits are "virtual" until the
+// user explicitly exports via "Save Edits".
+// ---------------------------------------------------------------------------
+
+type WordStatus = "active" | "deleted" | "added" | "moved";
+
+type PieceEntry = {
+  id: string;
+  word: string;
+  sourceStart: number;
+  sourceEnd: number;
+};
+
+type Piece = {
+  source: "original" | "add";
+  offset: number;          // index into source buffer
+  length: number;          // number of entries in this piece
+  status: WordStatus;      // all entries in this piece share this status
+};
+
+type PieceTableData = {
+  originalBuffer: PieceEntry[];
+  addBuffer: PieceEntry[];
+  pieces: Piece[];
+  sourceFile: string;
+  createdAt: string;
+  modifiedAt: string;
+};
+
+type ViewEntry = {
+  entry: PieceEntry;
+  status: WordStatus;
+  visualIndex: number;
+};
+
+type EdlV1Entry = {
+  id: string;
+  sourceStart: number;
+  sourceEnd: number;
+  label: string;
+  muted: boolean;
+};
+
 type OtterApi = {
   chooseAudioFile: () => Promise<string | null>;
   transcribeAudio: (audioPath: string, spec?: TranscribeSpec) => Promise<TranscriptResult>;
@@ -76,6 +128,9 @@ type OtterApi = {
   pauseTranscription: () => Promise<boolean>;
   resumeTranscription: () => Promise<boolean>;
   cancelTranscription: () => Promise<boolean>;
+  saveEdl: (edlJson: string) => Promise<string | null>;
+  loadEdl: () => Promise<{ path: string; content: string } | null>;
+  exportEdlAudio: (edlJson: string) => Promise<string | null>;
 };
 
 declare global {
@@ -105,6 +160,20 @@ let selectionStart: number | null = null;
 let selectionEnd: number | null = null;
 let selectionAnchor: number | null = null;
 let playheadIndex = -1;
+
+type UndoSnapshot = {
+  pieces: Piece[];
+  originalBuffer: PieceEntry[];
+  addBuffer: PieceEntry[];
+};
+
+let pieceTable: PieceTableData | null = null;
+let undoStack: UndoSnapshot[] = [];
+let redoStack: UndoSnapshot[] = [];
+
+let detailSelStart: number | null = null;
+let detailSelEnd: number | null = null;
+let isSkippingDeleted = false;
 
 //
 // Utility Functions
@@ -156,6 +225,431 @@ function mustGetEl<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
   if (!el) throw new Error(`Missing required element: ${id}`);
   return el as T;
+}
+
+
+// ---------------------------------------------------------------------------
+// Piece Table utility functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an initial piece table from a completed transcript.
+ *
+ * Creates the "identity" table where every word is a single active piece.
+ * Subsequent edits (remove, restore, etc.) mutate the pieces array without
+ * ever touching the original audio file.
+ */
+function buildPieceTableFromTranscript(
+  transcriptWords: TranscriptWord[],
+  sourceFile: string
+): PieceTableData {
+  const now = new Date().toISOString();
+  const originalBuffer: PieceEntry[] = transcriptWords.map((w, i) => ({
+    id: `w${i}_${crypto.randomUUID().slice(0, 8)}`,
+    word: w.word,
+    sourceStart: w.start,
+    sourceEnd: w.end,
+  }));
+
+  return {
+    originalBuffer,
+    addBuffer: [],
+    pieces: originalBuffer.length > 0
+      ? [{ source: "original" as const, offset: 0, length: originalBuffer.length, status: "active" as const }]
+      : [],
+    sourceFile,
+    createdAt: now,
+    modifiedAt: now,
+  };
+}
+
+/**
+ * Walk the piece table and produce a flat array of view entries.
+ *
+ * Each view entry pairs a PieceEntry reference with its current status
+ * and sequential visual index. Deleted entries are included (they are
+ * displayed with strikethrough styling).
+ */
+function getViewEntries(pt: PieceTableData): ViewEntry[] {
+  const result: ViewEntry[] = [];
+  let vi = 0;
+  for (const p of pt.pieces) {
+    const buf = p.source === "original" ? pt.originalBuffer : pt.addBuffer;
+    for (let j = 0; j < p.length; j++) {
+      result.push({
+        entry: buf[p.offset + j],
+        status: p.status,
+        visualIndex: vi++,
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Return only the non-deleted view entries (for export / playback).
+ */
+function getActiveEntries(pt: PieceTableData): ViewEntry[] {
+  return getViewEntries(pt).filter(v => v.status !== "deleted");
+}
+
+/**
+ * Merge adjacent pieces that reference contiguous spans in the same
+ * buffer with the same status. Keeps the piece list compact.
+ */
+function mergePieces(pieces: Piece[]): Piece[] {
+  if (pieces.length === 0) return pieces;
+  const merged: Piece[] = [{ ...pieces[0] }];
+  for (let i = 1; i < pieces.length; i++) {
+    const last = merged[merged.length - 1];
+    const p = pieces[i];
+    if (
+      last.source === p.source &&
+      last.status === p.status &&
+      last.offset + last.length === p.offset
+    ) {
+      last.length += p.length;
+    } else {
+      merged.push({ ...p });
+    }
+  }
+  return merged;
+}
+
+function snapshotState(pt: PieceTableData): UndoSnapshot {
+  return {
+    pieces: pt.pieces.map(p => ({ ...p })),
+    originalBuffer: pt.originalBuffer.map(e => ({ ...e })),
+    addBuffer: pt.addBuffer.map(e => ({ ...e })),
+  };
+}
+
+function pushUndo(): void {
+  if (!pieceTable) return;
+  undoStack.push(snapshotState(pieceTable));
+  redoStack = [];
+}
+
+function restoreSnapshot(pt: PieceTableData, snap: UndoSnapshot): void {
+  pt.pieces = snap.pieces;
+  pt.originalBuffer = snap.originalBuffer;
+  pt.addBuffer = snap.addBuffer;
+  pt.modifiedAt = new Date().toISOString();
+}
+
+function performUndo(): boolean {
+  if (!pieceTable || undoStack.length === 0) return false;
+  redoStack.push(snapshotState(pieceTable));
+  restoreSnapshot(pieceTable, undoStack.pop()!);
+  syncWordsFromPieceTable();
+  return true;
+}
+
+function performRedo(): boolean {
+  if (!pieceTable || redoStack.length === 0) return false;
+  undoStack.push(snapshotState(pieceTable));
+  restoreSnapshot(pieceTable, redoStack.pop()!);
+  syncWordsFromPieceTable();
+  return true;
+}
+
+function syncWordsFromPieceTable(): void {
+  if (!pieceTable) return;
+  const viewEntries = getViewEntries(pieceTable);
+  words = viewEntries.map(ve => ({
+    word: ve.entry.word,
+    start: ve.entry.sourceStart,
+    end: ve.entry.sourceEnd,
+  }));
+}
+
+async function refreshDetailIfActive(): Promise<void> {
+  if (detailSelStart == null || detailSelEnd == null) return;
+  if (detailSelStart >= words.length) { detailSelStart = null; detailSelEnd = null; return; }
+  const endIdx = Math.min(detailSelEnd, words.length - 1);
+  const rangeStart = Number(words[detailSelStart].start);
+  const rangeEnd = Number(words[endIdx].end);
+  try {
+    await loadDetailForRange(rangeStart, rangeEnd);
+  } catch (err: unknown) {
+    console.error("Failed to refresh detail view:", err);
+  }
+}
+
+/**
+ * Change the status of entries in the visual index range [visualStart, visualEnd]
+ * from `fromStatus` → `toStatus`. Pieces are split as needed so only matching
+ * entries are affected. Returns true if any change was made.
+ */
+function applyStatusToRange(
+  pt: PieceTableData,
+  visualStart: number,
+  visualEnd: number,
+  fromStatus: WordStatus,
+  toStatus: WordStatus
+): boolean {
+  let runningIndex = 0;
+  const newPieces: Piece[] = [];
+  let changed = false;
+
+  for (const p of pt.pieces) {
+    const pieceStart = runningIndex;
+    const pieceEnd = pieceStart + p.length - 1;
+    runningIndex += p.length;
+
+    const overlapStart = Math.max(pieceStart, visualStart);
+    const overlapEnd = Math.min(pieceEnd, visualEnd);
+
+    if (overlapStart > overlapEnd || p.status !== fromStatus) {
+      // No overlap or wrong status — keep piece as-is
+      newPieces.push({ ...p });
+      continue;
+    }
+
+    changed = true;
+
+    // Before overlap
+    if (overlapStart > pieceStart) {
+      newPieces.push({
+        source: p.source,
+        offset: p.offset,
+        length: overlapStart - pieceStart,
+        status: p.status,
+      });
+    }
+
+    // The overlap — change status
+    newPieces.push({
+      source: p.source,
+      offset: p.offset + (overlapStart - pieceStart),
+      length: overlapEnd - overlapStart + 1,
+      status: toStatus,
+    });
+
+    // After overlap
+    if (overlapEnd < pieceEnd) {
+      newPieces.push({
+        source: p.source,
+        offset: p.offset + (overlapEnd - pieceStart + 1),
+        length: pieceEnd - overlapEnd,
+        status: p.status,
+      });
+    }
+  }
+
+  if (changed) {
+    pt.pieces = mergePieces(newPieces);
+    pt.modifiedAt = new Date().toISOString();
+  }
+  return changed;
+}
+
+function moveWord(pt: PieceTableData, fromIndex: number, toIndex: number): boolean {
+  if (fromIndex === toIndex) return false;
+
+  const entries = getViewEntries(pt);
+  if (fromIndex < 0 || fromIndex >= entries.length) return false;
+  if (toIndex < 0 || toIndex >= entries.length) return false;
+
+  const moving = entries[fromIndex];
+
+  const withoutSource: ViewEntry[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (i !== fromIndex) withoutSource.push(entries[i]);
+  }
+
+  const insertAt = toIndex > fromIndex ? toIndex - 1 : toIndex;
+  const reordered: ViewEntry[] = [];
+  for (let i = 0; i <= withoutSource.length; i++) {
+    if (i === insertAt) reordered.push(moving);
+    if (i < withoutSource.length) reordered.push(withoutSource[i]);
+  }
+
+  const newPieces: Piece[] = reordered.map(ve => {
+    const buf = ve.entry.sourceStart !== undefined
+      ? (pt.originalBuffer.indexOf(ve.entry) !== -1 ? "original" as const : "add" as const)
+      : "original" as const;
+    const bufArr = buf === "original" ? pt.originalBuffer : pt.addBuffer;
+    const offset = bufArr.indexOf(ve.entry);
+    return {
+      source: buf,
+      offset,
+      length: 1,
+      status: ve.status,
+    };
+  });
+
+  pt.pieces = mergePieces(newPieces);
+  pt.modifiedAt = new Date().toISOString();
+  return true;
+}
+
+function moveRange(
+  pt: PieceTableData,
+  fromStart: number,
+  fromEnd: number,
+  toIndex: number
+): boolean {
+  return false;
+}
+
+/**
+ * Validate a parsed object as a v2 EDL (piece table format).
+ */
+function isEdlV2(obj: unknown): obj is { version: 2; pieceTable: PieceTableData } {
+  if (!obj || typeof obj !== "object") return false;
+  const o = obj as Record<string, unknown>;
+  if (o.version !== 2) return false;
+  const pt = o.pieceTable as Record<string, unknown>;
+  if (!pt || typeof pt !== "object") return false;
+  if (!Array.isArray(pt.originalBuffer)) return false;
+  if (!Array.isArray(pt.addBuffer)) return false;
+  if (!Array.isArray(pt.pieces)) return false;
+  if (typeof pt.sourceFile !== "string") return false;
+  return true;
+}
+
+/**
+ * Validate a parsed object as a v1 EDL (old mute-based format).
+ */
+function isEdlV1(obj: unknown): obj is { version: 1; sourceFile: string; entries: EdlV1Entry[]; createdAt: string; modifiedAt: string } {
+  if (!obj || typeof obj !== "object") return false;
+  const o = obj as Record<string, unknown>;
+  if (o.version !== 1) return false;
+  if (typeof o.sourceFile !== "string") return false;
+  if (!Array.isArray(o.entries)) return false;
+  return (o.entries as unknown[]).every((e) => {
+    if (!e || typeof e !== "object") return false;
+    const entry = e as Record<string, unknown>;
+    return (
+      typeof entry.id === "string" &&
+      typeof entry.sourceStart === "number" &&
+      typeof entry.sourceEnd === "number" &&
+      typeof entry.label === "string" &&
+      typeof entry.muted === "boolean"
+    );
+  });
+}
+
+/**
+ * Convert a v1 EDL (mute-based) to a v2 piece table.
+ */
+function convertV1ToV2(v1: { sourceFile: string; entries: EdlV1Entry[]; createdAt: string; modifiedAt: string }): PieceTableData {
+  const originalBuffer: PieceEntry[] = v1.entries.map(e => ({
+    id: e.id,
+    word: e.label,
+    sourceStart: e.sourceStart,
+    sourceEnd: e.sourceEnd,
+  }));
+
+    const pieces: Piece[] = [];
+  let i = 0;
+  while (i < v1.entries.length) {
+    const muted = v1.entries[i].muted;
+    let j = i;
+    while (j < v1.entries.length && v1.entries[j].muted === muted) j++;
+    pieces.push({
+      source: "original" as const,
+      offset: i,
+      length: j - i,
+      status: muted ? "deleted" as const : "active" as const,
+    });
+    i = j;
+  }
+
+  return {
+    originalBuffer,
+    addBuffer: [],
+    pieces,
+    sourceFile: v1.sourceFile,
+    createdAt: v1.createdAt,
+    modifiedAt: v1.modifiedAt,
+  };
+}
+
+/**
+ * Enable or disable editing buttons based on current piece table and selection state.
+ */
+function updateEditButtonStates() {
+  const hasPt = pieceTable != null;
+  const hasSel = selectionStart != null && selectionEnd != null;
+
+  btnRemove.disabled = !hasPt || !hasSel;
+  btnRestore.disabled = !hasPt || !hasSel;
+  btnUndo.disabled = !hasPt || undoStack.length === 0;
+  btnRedo.disabled = !hasPt || redoStack.length === 0;
+  btnSaveEdl.disabled = !hasPt;
+  btnSaveEdits.disabled = !hasPt;
+}
+
+/**
+ * Write the detail-region's current bounds back to the corresponding
+ * piece table entry (and the parallel words[] array) so that boundary
+ * adjustments are persisted.
+ */
+function writebackRegionBounds() {
+  if (!pieceTable || !detailRegion || detailSelStart == null) return;
+
+  const absStart = detailWinStartAbs + detailRegion.start;
+  const absEnd = detailWinStartAbs + detailRegion.end;
+  const viewEntries = getViewEntries(pieceTable);
+
+  if (detailSelStart === detailSelEnd) {
+    const ve = viewEntries[detailSelStart];
+    if (ve) {
+      ve.entry.sourceStart = absStart;
+      ve.entry.sourceEnd = absEnd;
+      words[detailSelStart].start = absStart;
+      words[detailSelStart].end = absEnd;
+    }
+  } else if (detailSelEnd != null) {
+    const veStart = viewEntries[detailSelStart];
+    const veEnd = viewEntries[detailSelEnd];
+    if (veStart) {
+      veStart.entry.sourceStart = absStart;
+      words[detailSelStart].start = absStart;
+    }
+    if (veEnd) {
+      veEnd.entry.sourceEnd = absEnd;
+      words[detailSelEnd].end = absEnd;
+    }
+  }
+
+  pieceTable.modifiedAt = new Date().toISOString();
+}
+
+
+const DELETED_REGION_COLOR = "rgba(180, 180, 180, 0.45)";
+
+/**
+ * Sync gray overlay regions on the main waveform with the piece table's
+ * deleted entries. Called after every edit so the waveform visually
+ * reflects which segments have been removed.
+ */
+function updateDeletedRegions() {
+  mainRegions.clearRegions();
+  if (!pieceTable) return;
+
+  const viewEntries = getViewEntries(pieceTable);
+  let i = 0;
+  while (i < viewEntries.length) {
+    if (viewEntries[i].status !== "deleted") { i++; continue; }
+    const start = viewEntries[i].entry.sourceStart;
+    let end = viewEntries[i].entry.sourceEnd;
+    let j = i + 1;
+    while (j < viewEntries.length && viewEntries[j].status === "deleted") {
+      end = Math.max(end, viewEntries[j].entry.sourceEnd);
+      j++;
+    }
+    mainRegions.addRegion({
+      start,
+      end,
+      drag: false,
+      resize: false,
+      color: DELETED_REGION_COLOR,
+    });
+    i = j;
+  }
 }
 
 
@@ -234,6 +728,8 @@ function setSelectionRange(start: number | null, end: number | null) {
       idx <= selectionEnd;
     el.classList.toggle("selected", inRange);
   });
+
+  updateEditButtonStates();
 }
 
 
@@ -312,6 +808,7 @@ async function loadDetailForRange(start: number, end: number) {
  */
 function renderTranscript(words: TranscriptWord[]) {
   transcriptEl.innerHTML = "";
+  const viewEntries = pieceTable ? getViewEntries(pieceTable) : [];
 
   for (let i = 0; i < words.length; i++) {
     const w = words[i];
@@ -320,6 +817,13 @@ function renderTranscript(words: TranscriptWord[]) {
     span.className = "word";
     span.textContent = w.word + " ";
     span.dataset.index = String(i);
+
+    const ve = viewEntries[i];
+    if (ve) {
+      if (ve.status === "deleted") span.classList.add("deleted");
+      else if (ve.status === "added") span.classList.add("added");
+      else if (ve.status === "moved") span.classList.add("moved");
+    }
 
     span.addEventListener("click", async (event: MouseEvent) => {
       // Transcript click = select word + seek main audio
@@ -337,6 +841,9 @@ function renderTranscript(words: TranscriptWord[]) {
       const rangeEndIdx = selectionEnd != null ? selectionEnd : i;
       const rangeStart = Number(words[rangeStartIdx].start);
       const rangeEnd = Number(words[rangeEndIdx].end);
+
+      detailSelStart = rangeStartIdx;
+      detailSelEnd = rangeEndIdx;
 
       try {
         await loadDetailForRange(rangeStart, rangeEnd);
@@ -362,6 +869,8 @@ function renderTranscript(words: TranscriptWord[]) {
   } else {
     setPlayheadIndex(-1);
   }
+
+  updateDeletedRegions();
 }
 
 //==============================================================================
@@ -382,11 +891,15 @@ function setPlayIcon(isPlaying: boolean) {
   btnPlay.setAttribute("aria-label", isPlaying ? "Pause" : "Play");
 }
 
+// Create a Regions plugin instance for the main waveform (deleted-region overlays)
+const mainRegions = WaveSurfer.Regions.create();
+
 // Create the waveform visualization object
 const ws = WaveSurfer.create({
   container: "#waveform",
   height: 80,
-  normalize: true
+  normalize: true,
+  plugins: [mainRegions]
 });
 
 // Keep the play/pause button icon in sync with the current status of playback
@@ -420,6 +933,25 @@ ws.on("timeupdate", (t: number) => {
   // This is a pragmatic PoC workaround; a production system will
   // use a more robust alignment strategy and allow user-adjusted
   // boundaries to override ASR timings.
+
+  if (pieceTable && ws.isPlaying() && !isSkippingDeleted) {
+    const pVE = getViewEntries(pieceTable);
+    for (let i = 0; i < pVE.length; i++) {
+      const ve = pVE[i];
+      if (ve.status === "deleted" && te >= ve.entry.sourceStart && te < ve.entry.sourceEnd) {
+        let skipTo = ve.entry.sourceEnd;
+        let j = i + 1;
+        while (j < pVE.length && pVE[j].status === "deleted") {
+          skipTo = Math.max(skipTo, pVE[j].entry.sourceEnd);
+          j++;
+        }
+        isSkippingDeleted = true;
+        ws.setTime(skipTo);
+        isSkippingDeleted = false;
+        break;
+      }
+    }
+  }
 
   // We use a simple linear scan for this PoC, but
   // a real implementation should be smarter (e.g. binary search)
@@ -500,7 +1032,21 @@ function setDetailWordRegion(localStart: number, localEnd: number) {
     color: WORD_REGION_COLOR
   });
   updateDetailBounds();
-  detailRegion.on("update", () => { updateDetailBounds(); });
+  detailRegion.on("update", () => {
+    updateDetailBounds();
+  });
+  let regionUndoPushed = false;
+  detailRegion.on("update", () => {
+    if (!regionUndoPushed) {
+      pushUndo();
+      regionUndoPushed = true;
+    }
+  });
+  detailRegion.on("update-end", () => {
+    writebackRegionBounds();
+    updateEditButtonStates();
+    regionUndoPushed = false;
+  });
 }
 
 /*
@@ -633,6 +1179,12 @@ btnTranscribe.addEventListener("click", async () => {
     const lang = Array.isArray(result) ? undefined : result.language;
     const langSuffix = lang ? `, lang=${lang}` : "";
     setStatus(`Transcript ready (${words.length} words${langSuffix})`, "success");
+
+    pieceTable = buildPieceTableFromTranscript(words, audioPath!);
+    undoStack = [];
+    redoStack = [];
+    updateEditButtonStates();
+
     renderTranscript(words);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -674,6 +1226,10 @@ btnStop.addEventListener("click", async () => {
 btnChoose.addEventListener("click", async () => {
   transcriptEl.innerHTML = "";
   logEl.textContent = "";
+  pieceTable = null;
+  undoStack = [];
+  redoStack = [];
+  updateEditButtonStates();
   setStatus("Choosing file…", "info");
 
   audioPath = await otter.chooseAudioFile();
@@ -862,6 +1418,238 @@ specSelect.addEventListener("change", async () => {
   showCustomArea(false);
 })();
 
+//==============================================================================
+//
+// BEGIN: Editing controls (Remove / Restore / Undo / Redo / Save EDL / Load EDL / Save Edits)
+//
+//==============================================================================
+
+const btnRemove = mustGetEl<HTMLButtonElement>("btnRemove");
+const btnRestore = mustGetEl<HTMLButtonElement>("btnRestore");
+const btnUndo = mustGetEl<HTMLButtonElement>("btnUndo");
+const btnRedo = mustGetEl<HTMLButtonElement>("btnRedo");
+const btnSaveEdl = mustGetEl<HTMLButtonElement>("btnSaveEdl");
+const btnLoadEdl = mustGetEl<HTMLButtonElement>("btnLoadEdl");
+const btnSaveEdits = mustGetEl<HTMLButtonElement>("btnSaveEdits");
+
+/**
+ * Remove (soft-delete) the currently selected words.
+ *
+ * Marks the selected range as "deleted" in the piece table. The words
+ * remain visible with strikethrough styling so the user can restore them.
+ */
+function removeSelection() {
+  if (!pieceTable || selectionStart == null || selectionEnd == null) return;
+  pushUndo();
+  const changed = applyStatusToRange(pieceTable, selectionStart, selectionEnd, "active", "deleted");
+  if (!changed) {
+    // Nothing was active in that range — pop the undo we just pushed
+    undoStack.pop();
+    return;
+  }
+  renderTranscript(words);
+  updateEditButtonStates();
+  refreshDetailIfActive();
+}
+
+/**
+ * Restore previously removed words in the current selection.
+ */
+function restoreSelection() {
+  if (!pieceTable || selectionStart == null || selectionEnd == null) return;
+  pushUndo();
+  const changed = applyStatusToRange(pieceTable, selectionStart, selectionEnd, "deleted", "active");
+  if (!changed) {
+    undoStack.pop();
+    return;
+  }
+  renderTranscript(words);
+  updateEditButtonStates();
+  refreshDetailIfActive();
+}
+
+btnRemove.addEventListener("click", () => removeSelection());
+btnRestore.addEventListener("click", () => restoreSelection());
+
+btnUndo.addEventListener("click", () => {
+  if (performUndo()) {
+    renderTranscript(words);
+    updateEditButtonStates();
+    refreshDetailIfActive();
+  }
+});
+
+btnRedo.addEventListener("click", () => {
+  if (performRedo()) {
+    renderTranscript(words);
+    updateEditButtonStates();
+    refreshDetailIfActive();
+  }
+});
+
+document.addEventListener("keydown", (e: KeyboardEvent) => {
+  // Don't intercept when user is typing in an input/textarea
+  const tag = (e.target as HTMLElement).tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+  const isMeta = e.metaKey || e.ctrlKey;
+
+  if (isMeta && !e.shiftKey && e.key === "z") {
+    e.preventDefault();
+    if (performUndo()) {
+      renderTranscript(words);
+      updateEditButtonStates();
+      refreshDetailIfActive();
+    }
+    return;
+  }
+
+  if (isMeta && e.shiftKey && e.key === "z") {
+    e.preventDefault();
+    if (performRedo()) {
+      renderTranscript(words);
+      updateEditButtonStates();
+      refreshDetailIfActive();
+    }
+    return;
+  }
+
+  if (isMeta && e.key === "y") {
+    e.preventDefault();
+    if (performRedo()) {
+      renderTranscript(words);
+      updateEditButtonStates();
+      refreshDetailIfActive();
+    }
+    return;
+  }
+
+  if (e.key === "Delete" || e.key === "Backspace") {
+    e.preventDefault();
+    removeSelection();
+    return;
+  }
+
+  if (e.key === "r" || e.key === "R") {
+    restoreSelection();
+    return;
+  }
+});
+
+btnSaveEdl.addEventListener("click", async () => {
+  if (!pieceTable) return;
+
+  try {
+    const payload = { version: 2, pieceTable };
+    const json = JSON.stringify(payload, null, 2);
+    const savedPath = await otter.saveEdl(json);
+    if (savedPath) {
+      const fname = savedPath.split("/").pop() ?? savedPath;
+      setStatus(`EDL saved: ${fname}`, "success");
+      appendLog(`EDL saved to ${savedPath}\n`);
+    }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setStatus("Failed to save EDL.", "error");
+    appendLog("\nERROR saving EDL:\n" + msg + "\n");
+  }
+});
+
+btnLoadEdl.addEventListener("click", async () => {
+  try {
+    const result = await otter.loadEdl();
+    if (!result) return;
+
+    const parsed = JSON.parse(result.content);
+
+    if (isEdlV2(parsed)) {
+      pieceTable = parsed.pieceTable;
+    } else if (isEdlV1(parsed)) {
+      pieceTable = convertV1ToV2(parsed);
+    } else {
+      setStatus("Invalid EDL file.", "error");
+      appendLog("\nERROR: file is not a valid OTTER EDL.\n");
+      return;
+    }
+
+    undoStack = [];
+    redoStack = [];
+    audioPath = pieceTable.sourceFile;
+
+    const viewEntries = getViewEntries(pieceTable);
+    words = viewEntries.map(ve => ({
+      word: ve.entry.word,
+      start: ve.entry.sourceStart,
+      end: ve.entry.sourceEnd,
+    }));
+
+    // Load the source audio waveform
+    const ab = await otter.readFileAsArrayBuffer(audioPath);
+    const blob = new Blob([ab]);
+    await ws.loadBlob(blob);
+
+    // Update UI state
+    const fname = audioPath.split("/").pop() ?? audioPath;
+    fnameEl.textContent = shortenFilenameMiddle(fname);
+    setStatus(`EDL loaded (${viewEntries.length} entries)`, "success");
+    appendLog(`EDL loaded from ${result.path}\n`);
+
+    btnPlay.disabled = false;
+    btnTranscribe.disabled = false;
+    updateEditButtonStates();
+    renderTranscript(words);
+    updateDeletedRegions();
+    refreshDetailIfActive();
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setStatus("Failed to load EDL.", "error");
+    appendLog("\nERROR loading EDL:\n" + msg + "\n");
+  }
+});
+
+btnSaveEdits.addEventListener("click", async () => {
+  if (!pieceTable) return;
+
+  const activeEntries = getActiveEntries(pieceTable);
+  if (activeEntries.length === 0) {
+    setStatus("Nothing to export (all words removed).", "error");
+    return;
+  }
+
+  try {
+    setStatus("Exporting audio…", "working");
+
+    const exportPayload = {
+      version: 1,
+      sourceFile: pieceTable.sourceFile,
+      entries: activeEntries.map(ve => ({
+        id: ve.entry.id,
+        sourceStart: ve.entry.sourceStart,
+        sourceEnd: ve.entry.sourceEnd,
+        label: ve.entry.word,
+        muted: false,
+      })),
+      createdAt: pieceTable.createdAt,
+      modifiedAt: pieceTable.modifiedAt,
+    };
+
+    const json = JSON.stringify(exportPayload, null, 2);
+    const outPath = await otter.exportEdlAudio(json);
+    if (outPath) {
+      const fname = outPath.split("/").pop() ?? outPath;
+      setStatus(`Exported: ${fname}`, "success");
+      appendLog(`Audio exported to ${outPath}\n`);
+    } else {
+      setStatus("Export canceled.", "info");
+    }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setStatus("Export failed.", "error");
+    appendLog("\nERROR exporting audio:\n" + msg + "\n");
+  }
+});
+
+
 export {};
 
 //
@@ -875,6 +1663,7 @@ export {};
 setDetailPlayIcon(false);
 btnDetailPlay.disabled = true;
 btnRegion.disabled = true;
+updateEditButtonStates();
 const WORD_REGION_COLOR = getCssVar(
   waveDetailPane,
   "--word-region-color",

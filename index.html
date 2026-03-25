@@ -18,6 +18,17 @@
       <label for="modeSelect">Quality:</label>
       <select id="modeSelect"></select>
 
+      <span class="headerDivider"></span>
+      <button id="btnRemove" disabled title="Remove selected words (Delete)">Remove</button>
+      <button id="btnRestore" disabled title="Restore removed words">Restore</button>
+      <span class="headerDivider"></span>
+      <button id="btnUndo" disabled title="Undo (⌘Z)">Undo</button>
+      <button id="btnRedo" disabled title="Redo (⌘⇧Z)">Redo</button>
+      <span class="headerDivider"></span>
+      <button id="btnSaveEdl" disabled title="Save EDL to file">Save EDL</button>
+      <button id="btnLoadEdl" title="Load EDL from file">Load EDL</button>
+      <button id="btnSaveEdits" disabled title="Export edited audio to new file">Save Edits</button>
+
       <div class="statusArea">
         <div id="status"></div>
         <progress id="transcribeProgress" value="0" max="100" hidden></progress>
