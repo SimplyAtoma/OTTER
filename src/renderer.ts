@@ -4,12 +4,12 @@
  * OTTER Read-Only Prototype – Renderer Process
  *
  * This file implements the user interface logic for the OTTER demonstration app.
- * It runs in Electron’s renderer process and is responsible for:
+ * It runs in Electron's renderer process and is responsible for:
  *
  *   • Displaying the main audio waveform
  *   • Displaying a transcript with word-level timing
  *   • Synchronizing transcript selection with audio playback
- *   • Rendering a secondary “detail” waveform for a selected word
+ *   • Rendering a secondary "detail" waveform for a selected word
  *   • Highlighting and playing a bounded audio region corresponding to a word
  *
  * This renderer intentionally treats the transcript as a *first-class interaction
@@ -27,7 +27,7 @@
  *
  * • Transcript word timings are approximate (derived from ASR output).
  *   The detail waveform exists specifically to demonstrate why manual
- *   boundary adjustment (“nudging”) may be required for precise editing.
+ *   boundary adjustment ("nudging") may be required for precise editing.
  *
  * Scope and Intent
  * ----------------
@@ -160,6 +160,8 @@ let selectionStart: number | null = null;
 let selectionEnd: number | null = null;
 let selectionAnchor: number | null = null;
 let playheadIndex = -1;
+let isDragging = false;
+let isDragging = false;
 
 type UndoSnapshot = {
   pieces: Piece[];
@@ -799,6 +801,15 @@ async function loadDetailForRange(start: number, end: number) {
  * The transcript is treated as a first-class interaction surface rather
  * than a passive display: text selection directly drives audio navigation.
  *
+ * This function also supports drag selection:
+ *
+ *   • mousedown on a word: starts drag, establishes anchor
+ *   • mouseover while dragging: expands/contracts selection dynamically
+ *   • mouseup (global): finalizes selection
+ *
+ * Both click and drag integration use setSelectionRange() to ensure
+ * consistent behavior and normalization of selection order.
+ *
  * This function is intentionally simple and imperative for clarity in
  * this proof-of-concept; more advanced implementations might virtualize
  * the transcript or decouple rendering from interaction logic.
@@ -852,6 +863,33 @@ function renderTranscript(words: TranscriptWord[]) {
       }
     });
 
+    // Drag Selection: mousedown
+    // When the user presses the mouse button on a word:
+    //   • Set isDragging = true to signal that drag is active
+    //   • Record selectionAnchor as the origin point (never changes during drag)
+    //   • Highlight the starting word immediately
+    span.addEventListener("mousedown", (event: MouseEvent) => {
+      event.preventDefault();
+      isDragging = true;
+      selectionAnchor = i;
+      setSelectionRange(i, i);
+    });
+
+    // Drag Selection: mouseover while dragging
+    // As the user moves the cursor across words:
+    //   • Check if drag is active (isDragging === true)
+    //   • Get the hovered word's index from the DOM
+    //   • Call setSelectionRange(anchor, hovered) to expand/contract selection
+    //   • Both forward and backward drag work because setSelectionRange()
+    //     normalizes the range order internally
+    span.addEventListener("mouseover", (event: MouseEvent) => {
+      if (!isDragging) return;
+      const hoveredIndex = Number((event.target as HTMLElement).dataset.index);
+      if (selectionAnchor != null && !isNaN(hoveredIndex)) {
+        setSelectionRange(selectionAnchor, hoveredIndex);
+      }
+    });
+
     transcriptEl.appendChild(span);
   }
 
@@ -871,6 +909,24 @@ function renderTranscript(words: TranscriptWord[]) {
   }
 
   updateDeletedRegions();
+}
+
+/**
+ * Drag Selection: Global mouseup handler
+ *
+ * Attach a global listener to window so that drag ends correctly even if
+ * the user releases the mouse button outside the transcript pane.
+ *
+ * This ensures isDragging is always set to false when the button is released,
+ * preventing a "stuck" drag state.
+ */
+function initializeDragEnd() {
+  window.addEventListener("mouseup", (_event: MouseEvent) => {
+    if (isDragging) {
+      isDragging = false;
+      // Selection remains as-is; do not modify it further
+    }
+  });
 }
 
 //==============================================================================
@@ -1255,7 +1311,6 @@ btnChoose.addEventListener("click", async () => {
 
   fnameEl.textContent = shortenFilenameMiddle(fname);
 });
-
 
 //==============================================================================
 //
@@ -1669,3 +1724,6 @@ const WORD_REGION_COLOR = getCssVar(
   "--word-region-color",
   "rgba(255, 200, 0, 0.35)"
 );
+
+// Initialize drag selection global mouseup handler
+initializeDragEnd();
