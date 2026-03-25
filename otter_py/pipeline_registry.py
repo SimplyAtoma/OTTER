@@ -68,6 +68,7 @@ class _PostEntry(TypedDict):
 
 _TRANSCIBERS: Dict[str, _TranscriberEntry] = {}
 _POSTS: Dict[str, _PostEntry] = {}
+_LOADED: bool = False  # to prevent double-loading of components
 
 
 # -----------------------------------------------------------------------------
@@ -122,8 +123,12 @@ def load_components() -> None:
     Registration happens at import time as a side effect of importing the
     component modules.
     """
+    global _LOADED
+    if _LOADED:
+        return
     import otter_py.pipelines.transcribers  # noqa: F401
     import otter_py.pipelines.postprocessors  # noqa: F401
+    _LOADED = True
 
 def list_components() -> Dict[str, Any]:
     """
@@ -215,7 +220,7 @@ def run_pipeline(
     }
 
     # --- run post-processors in order
-    for p_spec in spec.get("postprocessors") or []:
+    for p_spec in spec.get("post") or []:
         p_id = p_spec.get("id")
         p_opts = p_spec.get("opts") or {}
         if not p_id:

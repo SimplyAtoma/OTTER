@@ -49,9 +49,9 @@ def adjust_short_words(
     max_len = float(opts.get("max_len", 0.30))
     min_extend = float(opts.get("min_extend", 0.10))
 
-    if len(words) < 3:
+    if not words:
         # Nothing to do; return a shallow copy
-        dbg("adjust_short_words: Less than 3 words, returning")
+        dbg("adjust_short_words: No words to adjust, returning")
         return list(words), {"adjusted": 0}
 
     out: List[Word] = []
@@ -60,14 +60,15 @@ def adjust_short_words(
     # Copy first word unchanged
     out.append(dict(words[0]))
 
-    for i in range(1, len(words) - 1):
+    for i in range(1, len(words)):
         prev = out[i - 1]
         w = dict(words[i])  # copy
         duration = w["end"] - w["start"]
 
         if duration < max_len:
-            # dbg(f"adjust_short_words: adjusting {w['word']}")
-            extend = max(duration, min_extend)
+            dbg(f"adjust_short_words: adjusting '{w['word']}' {duration:.3f}s → {w['start']:.3f}", DebugLevel.VERBOSE)
+            target_duration = max(max_len, min_extend)
+            extend = target_duration - duration
             new_start = max(w["start"] - extend, prev["end"])
 
             if new_start < w["start"]:
@@ -75,9 +76,6 @@ def adjust_short_words(
                 adjusted += 1
 
         out.append(w)
-
-    # Copy last word unchanged
-    out.append(dict(words[-1]))
 
     return out, {
         "adjusted": adjusted,
