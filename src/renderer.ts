@@ -684,6 +684,145 @@ function normalizeRange(a: number, b: number) {
   return a <= b ? { start: a, end: b } : { start: b, end: a };
 }
 
+
+// For search function
+const findBar = document.getElementById("searchBar")!;
+const findInput = document.getElementById("searchInput") as HTMLInputElement;
+const findClose = document.getElementById("findClose")!;
+findBar.hidden = true;
+
+
+//Ctrl + F keyboard shortcut
+window.addEventListener("keydown", (event: KeyboardEvent) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    findBar.hidden = false;
+    findInput.focus();
+    findInput.select();
+  }
+
+  if (event.key === "Escape") {
+    findBar.hidden = true;
+    clearSearchHighlights();
+  }
+});
+
+findClose.addEventListener("click", () => {
+  findBar.hidden = true;
+  clearSearchHighlights();
+});
+
+
+let lastFoundIndex = -1;
+let lastSearchQuery = "";
+//Search word (Enter key)
+findInput.addEventListener("keydown", (event: KeyboardEvent) => {
+    if(event.key !== "Enter")
+    {
+      return;
+    }
+   
+    const searchQuery = findInput.value.trim().toLowerCase();
+    if(!searchQuery) 
+    {
+      return;
+    }
+
+    // If the user types in a new word, start from the beginning again
+    if (searchQuery !== lastSearchQuery) {
+        lastFoundIndex = -1;
+        lastSearchQuery = searchQuery;
+      }
+    let found = false;
+      // Go to the next word (same word)
+    for(let i = lastFoundIndex + 1; i < words.length; i++)
+    {
+      if(words[i].word.toLowerCase().includes(searchQuery))
+      {
+        lastFoundIndex=  i;
+        found = true;
+        lastSearchQuery = searchQuery;
+      const wordFound = words[i];
+      setSelectionRange(i, i); //highlights the word
+      ws.setTime(Number(wordFound.start) + SEEK_EPS); // also adjusts the word's start time
+
+      const wordElement = transcriptEl.querySelector(
+      `.word[data-index="${i}"]`
+      ) as HTMLElement | null;
+
+      wordElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+      break;
+    }
+
+    }
+
+   if(!found)
+    {
+      //Wrap around search
+      for(let i = 0; i < lastFoundIndex; i++)
+      {
+        if(words[i].word.toLowerCase().includes(searchQuery))
+        {
+          lastFoundIndex = i;
+            lastSearchQuery = searchQuery;
+      const wordFound = words[i];
+      setSelectionRange(i, i); //highlights the word
+      ws.setTime(Number(wordFound.start) + SEEK_EPS); // also adjusts the word's start time
+
+      const wordElement = transcriptEl.querySelector(
+      `.word[data-index="${i}"]`
+      ) as HTMLElement | null;
+
+      wordElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+      break;
+        }
+      }
+    }
+
+  });
+
+  //Reset function for searching
+function clearSearchHighlights() {
+
+  const transcriptWords = transcriptEl.querySelectorAll(".word");
+
+  for (let i = 0; i < transcriptWords.length; i++) {
+
+    const wordElement = transcriptWords[i] as HTMLElement;
+    const index = Number(wordElement.dataset.index);
+    const wordText = words[index].word;    
+    wordElement.innerHTML = wordText + " ";
+  }
+}
+
+  //Highlighting the user's entry in the search bar
+  findInput.addEventListener("input", () =>{
+    const searchQuery = findInput.value.trim().toLowerCase();
+    const transcriptWords = transcriptEl.querySelectorAll(".word");
+   
+    for(let i = 0; i < transcriptWords.length; i++)
+    {
+      const wordElement = transcriptWords[i] as HTMLElement;
+      const index = Number(wordElement.dataset.index);
+      const wordText = words[index].word;
+      wordElement.innerHTML = wordText + " ";
+      const matchPosition = wordText.toLowerCase().indexOf(searchQuery)
+      if(matchPosition === -1)
+      {
+        continue;
+      }
+      
+      //Slicing the highlights
+      const before = wordText.slice(0,matchPosition);
+      const matchingChar = wordText.slice(matchPosition, matchPosition + searchQuery.length);
+      const after = wordText.slice(matchPosition + searchQuery.length);
+      wordElement.innerHTML=  before +'<span class="highlight">' + matchingChar + '</span>' +after +" ";
+    }
+
+})
+
+
+
 /**
  * Update the visual "playhead" state to reflect the word currently
  * under the audio playhead. This is independent from any text selection.
@@ -1412,6 +1551,7 @@ async function populateSpecSelect() {
 }
 
 // Events
+
 
 chkCustomSpec.addEventListener("change", async () => {
   if (chkCustomSpec.checked) {
