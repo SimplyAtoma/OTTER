@@ -196,7 +196,7 @@ main {
 #searchBar {
   position: absolute;
   top: 8px;
-  right: 8px;  
+  right: 8px;
   display: flex;
   gap: 6px;
   padding: 6px;
@@ -210,13 +210,21 @@ main {
   display: none !important;
 }
 
-
-
 #searchInput {
   width: 160px;
 }
 
+#transcript.dragging-words .word {
+  cursor: grabbing;
+}
 
+.word.drop-before {
+  box-shadow: inset 3px 0 0 #f4a949;
+}
+
+.word.drop-after {
+  box-shadow: inset -3px 0 0 #f4a949;
+}
 /* ============================================================================
    Developer Panel (bottom of left column)
    ========================================================================== */

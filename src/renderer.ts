@@ -131,6 +131,7 @@ type OtterApi = {
   saveEdl: (edlJson: string) => Promise<string | null>;
   loadEdl: () => Promise<{ path: string; content: string } | null>;
   exportEdlAudio: (edlJson: string) => Promise<string | null>;
+  renderEditedPreview: (edlJson: string) => Promise<string>;
 };
 
 declare global {
@@ -159,6 +160,7 @@ let words: TranscriptWord[] = [];
 let selectionStart: number | null = null;
 let selectionEnd: number | null = null;
 let selectionAnchor: number | null = null;
+let selectedIndices: number[] = [];
 let playheadIndex = -1;
 let isDragging = false;
 let isDragging = false;
@@ -175,7 +177,13 @@ let redoStack: UndoSnapshot[] = [];
 
 let detailSelStart: number | null = null;
 let detailSelEnd: number | null = null;
-let isSkippingDeleted = false;
+let isMouseSelecting = false;
+let mouseSelectionMoved = false;
+let dragMoveSourceIndices: number[] = [];
+let isEditedPreviewMode = false;
+let previewWordTimes: Array<{ start: number; end: number }> = [];
+let previewRefreshToken = 0;
+let isRefreshingPreview = false;
 
 //
 // Utility Functions
@@ -492,7 +500,90 @@ function moveRange(
   fromEnd: number,
   toIndex: number
 ): boolean {
-  return false;
+  const entries = getViewEntries(pt);
+  if (entries.length === 0) return false;
+
+  const start = Math.min(fromStart, fromEnd);
+  const end = Math.max(fromStart, fromEnd);
+
+  if (start < 0 || end >= entries.length) return false;
+  if (toIndex < 0 || toIndex > entries.length) return false;
+
+  if (toIndex >= start && toIndex <= end + 1) return false;
+
+  const movedCount = end - start + 1;
+  const moved = entries.slice(start, end + 1);
+  const remaining = entries.slice(0, start).concat(entries.slice(end + 1));
+
+  const insertAt = toIndex > end ? toIndex - movedCount : toIndex;
+  const reordered = remaining.slice(0, insertAt).concat(moved, remaining.slice(insertAt));
+
+  const newPieces: Piece[] = [];
+  for (const ve of reordered) {
+    const inOriginal = pt.originalBuffer.indexOf(ve.entry) !== -1;
+    const source = inOriginal ? ("original" as const) : ("add" as const);
+    const buffer = source === "original" ? pt.originalBuffer : pt.addBuffer;
+    const offset = buffer.indexOf(ve.entry);
+
+    newPieces.push({
+      source,
+      offset,
+      length: 1,
+      status: ve.status,
+    });
+  }
+
+  pt.pieces = mergePieces(newPieces);
+  pt.modifiedAt = new Date().toISOString();
+  return true;
+}
+
+function moveSelectedIndices(
+  pt: PieceTableData,
+  indices: number[],
+  toIndex: number
+): boolean {
+  const entries = getViewEntries(pt);
+  if (entries.length === 0) return false;
+
+  const unique = Array.from(new Set(indices)).sort((a, b) => a - b);
+  if (unique.length === 0) return false;
+  if (toIndex < 0 || toIndex > entries.length) return false;
+
+  for (const idx of unique) {
+    if (idx < 0 || idx >= entries.length) return false;
+  }
+
+  const selectedSet = new Set(unique);
+  const selected = entries.filter((_, idx) => selectedSet.has(idx));
+  const remaining = entries.filter((_, idx) => !selectedSet.has(idx));
+
+  const selectedBefore = unique.filter((idx) => idx < toIndex).length;
+  const insertAt = toIndex - selectedBefore;
+  if (insertAt < 0 || insertAt > remaining.length) return false;
+
+  const reordered = remaining
+    .slice(0, insertAt)
+    .concat(selected, remaining.slice(insertAt));
+
+  const newPieces: Piece[] = [];
+  for (const ve of reordered) {
+    const inOriginal = pt.originalBuffer.indexOf(ve.entry) !== -1;
+    const source = inOriginal ? ("original" as const) : ("add" as const);
+    const buffer = source === "original" ? pt.originalBuffer : pt.addBuffer;
+    const offset = buffer.indexOf(ve.entry);
+
+    newPieces.push({
+      source,
+      offset,
+      length: 1,
+      status: ve.status,
+    });
+  }
+
+  pt.pieces = mergePieces(newPieces);
+  pt.modifiedAt = new Date().toISOString();
+  return true;
 }
 
 /**
@@ -574,7 +665,7 @@ function convertV1ToV2(v1: { sourceFile: string; entries: EdlV1Entry[]; createdA
  */
 function updateEditButtonStates() {
   const hasPt = pieceTable != null;
-  const hasSel = selectionStart != null && selectionEnd != null;
+  const hasSel = selectedIndices.length > 0;
 
   btnRemove.disabled = !hasPt || !hasSel;
   btnRestore.disabled = !hasPt || !hasSel;
@@ -680,10 +771,26 @@ function setTranscribingState(active: boolean) {
   }
 }
 
+transcriptEl.addEventListener("dragover", (event: DragEvent) => {
+  if (dragMoveSourceIndices.length === 0) return;
+  if ((event.target as HTMLElement).closest(".word")) return;
+  event.preventDefault();
+  clearDropIndicators();
+});
+
+transcriptEl.addEventListener("drop", (event: DragEvent) => {
+  if (dragMoveSourceIndices.length === 0) return;
+  if ((event.target as HTMLElement).closest(".word")) return;
+  event.preventDefault();
+  clearDropIndicators();
+  moveCurrentSelection(words.length);
+  dragMoveSourceIndices = [];
+  transcriptEl.classList.remove("dragging-words");
+});
+
 function normalizeRange(a: number, b: number) {
   return a <= b ? { start: a, end: b } : { start: b, end: a };
 }
-
 
 // For search function
 const findBar = document.getElementById("searchBar")!;
@@ -823,6 +930,199 @@ function clearSearchHighlights() {
 
 
 
+function uniqueSortedIndices(indices: number[]): number[] {
+  const unique = Array.from(new Set(indices));
+  unique.sort((a, b) => a - b);
+  return unique;
+}
+
+function isContiguousSelection(indices: number[]): boolean {
+  if (indices.length <= 1) return true;
+  for (let i = 1; i < indices.length; i++) {
+    if (indices[i] !== indices[i - 1] + 1) return false;
+  }
+  return true;
+}
+
+function getSelectedRanges(indices: number[]): Array<{ start: number; end: number }> {
+  if (indices.length === 0) return [];
+  const ranges: Array<{ start: number; end: number }> = [];
+  let start = indices[0];
+  let end = indices[0];
+
+  for (let i = 1; i < indices.length; i++) {
+    const idx = indices[i];
+    if (idx === end + 1) {
+      end = idx;
+    } else {
+      ranges.push({ start, end });
+      start = idx;
+      end = idx;
+    }
+  }
+  ranges.push({ start, end });
+  return ranges;
+}
+
+function setSelectedIndices(indices: number[], anchor: number | null = selectionAnchor) {
+  const next = uniqueSortedIndices(indices).filter((idx) => idx >= 0 && idx < words.length);
+  selectedIndices = next;
+  selectionAnchor = anchor;
+
+  if (next.length > 0 && isContiguousSelection(next)) {
+    selectionStart = next[0];
+    selectionEnd = next[next.length - 1];
+  } else {
+    selectionStart = null;
+    selectionEnd = null;
+  }
+
+  const selectedSet = new Set(next);
+  const nodes = transcriptEl.querySelectorAll<HTMLElement>(".word");
+  nodes.forEach((el) => {
+    const idx = Number(el.dataset.index);
+    el.classList.toggle("selected", selectedSet.has(idx));
+  });
+
+  updateEditButtonStates();
+}
+
+function clearDropIndicators() {
+  const nodes = transcriptEl.querySelectorAll<HTMLElement>(".word.drop-before, .word.drop-after");
+  nodes.forEach((n) => {
+    n.classList.remove("drop-before");
+    n.classList.remove("drop-after");
+  });
+}
+
+function moveCurrentSelection(toIndex: number) {
+  if (!pieceTable || selectedIndices.length === 0) return;
+
+  const sorted = uniqueSortedIndices(selectedIndices);
+  const selectedCount = sorted.length;
+  const selectedBefore = sorted.filter((idx) => idx < toIndex).length;
+  const insertAt = toIndex - selectedBefore;
+
+  pushUndo();
+
+  let changed = false;
+  if (sorted.length === 1 && toIndex < words.length) {
+    changed = moveWord(pieceTable, sorted[0], toIndex);
+  } else if (isContiguousSelection(sorted)) {
+    changed = moveRange(pieceTable, sorted[0], sorted[sorted.length - 1], toIndex);
+  } else {
+    changed = moveSelectedIndices(pieceTable, sorted, toIndex);
+  }
+
+  if (!changed) {
+    undoStack.pop();
+    return;
+  }
+
+  syncWordsFromPieceTable();
+
+  const movedSelection: number[] = [];
+  for (let i = 0; i < selectedCount; i++) {
+    movedSelection.push(insertAt + i);
+  }
+
+  setSelectedIndices(movedSelection, movedSelection.length > 0 ? movedSelection[0] : null);
+
+  if (movedSelection.length === 1) {
+    detailSelStart = movedSelection[0];
+    detailSelEnd = movedSelection[0];
+  } else if (isContiguousSelection(movedSelection)) {
+    detailSelStart = movedSelection[0];
+    detailSelEnd = movedSelection[movedSelection.length - 1];
+  } else {
+    detailSelStart = movedSelection[0];
+    detailSelEnd = movedSelection[0];
+  }
+
+  renderTranscript(words);
+  void refreshMainWavePreviewFromEdits();
+  refreshDetailIfActive();
+}
+
+function resetEditedPreviewState() {
+  isEditedPreviewMode = false;
+  previewWordTimes = [];
+}
+
+function buildPreviewWordTimesFromActiveEntries(activeEntries: ViewEntry[]): Array<{ start: number; end: number }> {
+  const out: Array<{ start: number; end: number }> = [];
+  let t = 0;
+  for (const ve of activeEntries) {
+    const dur = Math.max(0, Number(ve.entry.sourceEnd) - Number(ve.entry.sourceStart));
+    out.push({ start: t, end: t + dur });
+    t += dur;
+  }
+  return out;
+}
+
+async function loadMainWaveFromPath(filePath: string) {
+  const ab = await otter.readFileAsArrayBuffer(filePath);
+  const blob = new Blob([ab]);
+  await ws.loadBlob(blob);
+}
+
+async function refreshMainWavePreviewFromEdits() {
+  if (!audioPath) return;
+
+  const token = ++previewRefreshToken;
+  isRefreshingPreview = true;
+
+  try {
+    if (!pieceTable) {
+      resetEditedPreviewState();
+      await loadMainWaveFromPath(audioPath);
+      return;
+    }
+
+    const activeEntries = getActiveEntries(pieceTable);
+    if (activeEntries.length === 0) {
+      resetEditedPreviewState();
+      await loadMainWaveFromPath(audioPath);
+      return;
+    }
+
+    const payload = {
+      version: 1,
+      sourceFile: pieceTable.sourceFile,
+      entries: activeEntries.map((ve) => ({
+        id: ve.entry.id,
+        sourceStart: ve.entry.sourceStart,
+        sourceEnd: ve.entry.sourceEnd,
+        label: ve.entry.word,
+        muted: false,
+      })),
+      createdAt: pieceTable.createdAt,
+      modifiedAt: pieceTable.modifiedAt,
+    };
+
+    const json = JSON.stringify(payload);
+    const previewPath = await otter.renderEditedPreview(json);
+    if (token !== previewRefreshToken) return;
+
+    await loadMainWaveFromPath(previewPath);
+    if (token !== previewRefreshToken) return;
+
+    previewWordTimes = buildPreviewWordTimesFromActiveEntries(activeEntries);
+    isEditedPreviewMode = true;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    appendLog(`\nWARN: Failed to refresh edited preview: ${msg}\n`);
+    if (token === previewRefreshToken && audioPath) {
+      resetEditedPreviewState();
+      await loadMainWaveFromPath(audioPath);
+    }
+  } finally {
+    if (token === previewRefreshToken) {
+      isRefreshingPreview = false;
+    }
+  }
+}
+
 /**
  * Update the visual "playhead" state to reflect the word currently
  * under the audio playhead. This is independent from any text selection.
@@ -850,27 +1150,13 @@ function setPlayheadIndex(idx: number) {
  */
 function setSelectionRange(start: number | null, end: number | null) {
   if (start == null || end == null) {
-    selectionStart = null;
-    selectionEnd = null;
-    selectionAnchor = null;
+    setSelectedIndices([], null);
   } else {
     const range = normalizeRange(start, end);
-    selectionStart = range.start;
-    selectionEnd = range.end;
+    const indices: number[] = [];
+    for (let i = range.start; i <= range.end; i++) indices.push(i);
+    setSelectedIndices(indices, selectionAnchor);
   }
-
-  const nodes = transcriptEl.querySelectorAll<HTMLElement>(".word");
-  nodes.forEach((el) => {
-    const idx = Number(el.dataset.index);
-    const inRange =
-      selectionStart != null &&
-      selectionEnd != null &&
-      idx >= selectionStart &&
-      idx <= selectionEnd;
-    el.classList.toggle("selected", inRange);
-  });
-
-  updateEditButtonStates();
 }
 
 // Compute a small snippet window around a word boundary.
@@ -966,6 +1252,7 @@ function renderTranscript(words: TranscriptWord[]) {
     span.className = "word";
     span.textContent = w.word + " ";
     span.dataset.index = String(i);
+    span.draggable = true;
 
     const ve = viewEntries[i];
     if (ve) {
@@ -974,20 +1261,113 @@ function renderTranscript(words: TranscriptWord[]) {
       else if (ve.status === "moved") span.classList.add("moved");
     }
 
+    span.addEventListener("mousedown", (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      if (event.ctrlKey || event.metaKey) return;
+
+      const alreadySelected = selectedIndices.includes(i);
+      if (alreadySelected && selectedIndices.length > 0) {
+        mouseSelectionMoved = false;
+        return;
+      }
+
+      selectionAnchor = i;
+      setSelectionRange(i, i);
+      isMouseSelecting = true;
+      mouseSelectionMoved = false;
+      event.preventDefault();
+    });
+
+    span.addEventListener("mouseenter", () => {
+      if (!isMouseSelecting || selectionAnchor == null) return;
+      if (selectionEnd !== i || selectionStart !== selectionAnchor) {
+        mouseSelectionMoved = true;
+      }
+      setSelectionRange(selectionAnchor, i);
+    });
+
+    span.addEventListener("dragstart", (event: DragEvent) => {
+      if (selectedIndices.includes(i) && selectedIndices.length > 0) {
+        dragMoveSourceIndices = selectedIndices.slice();
+      } else {
+        setSelectedIndices([i], i);
+        dragMoveSourceIndices = [i];
+      }
+
+      transcriptEl.classList.add("dragging-words");
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", "move");
+      }
+    });
+
+    span.addEventListener("dragover", (event: DragEvent) => {
+      if (dragMoveSourceIndices.length === 0) return;
+      event.preventDefault();
+
+      const rect = span.getBoundingClientRect();
+      const before = event.clientX < rect.left + rect.width / 2;
+
+      clearDropIndicators();
+      span.classList.add(before ? "drop-before" : "drop-after");
+    });
+
+    span.addEventListener("drop", (event: DragEvent) => {
+      if (dragMoveSourceIndices.length === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const rect = span.getBoundingClientRect();
+      const before = event.clientX < rect.left + rect.width / 2;
+      const targetIndex = before ? i : i + 1;
+
+      clearDropIndicators();
+      moveCurrentSelection(targetIndex);
+      dragMoveSourceIndices = [];
+      transcriptEl.classList.remove("dragging-words");
+    });
+
+    span.addEventListener("dragend", () => {
+      clearDropIndicators();
+      dragMoveSourceIndices = [];
+      transcriptEl.classList.remove("dragging-words");
+    });
+
     span.addEventListener("click", async (event: MouseEvent) => {
+      if (mouseSelectionMoved) {
+        mouseSelectionMoved = false;
+        return;
+      }
+
       // Transcript click = select word + seek main audio
-      if (event.shiftKey && selectionAnchor != null) {
+      if (event.ctrlKey || event.metaKey) {
+        if (selectedIndices.includes(i)) {
+          setSelectedIndices(selectedIndices.filter((idx) => idx !== i), selectionAnchor);
+        } else {
+          setSelectedIndices(selectedIndices.concat(i), i);
+        }
+      } else if (event.shiftKey && selectionAnchor != null) {
         setSelectionRange(selectionAnchor, i);
       } else {
         selectionAnchor = i;
         setSelectionRange(i, i);
       }
-      ws.setTime(Number(w.start) + SEEK_EPS);
+
+      if (!selectedIndices.includes(i)) return;
+
+      const seekTime = isEditedPreviewMode && previewWordTimes[i]
+        ? previewWordTimes[i].start
+        : Number(w.start);
+      ws.setTime(seekTime + SEEK_EPS);
       setPlayheadIndex(i);
 
       // Load the detail waveform snippet centered on the selected range
-      const rangeStartIdx = selectionStart != null ? selectionStart : i;
-      const rangeEndIdx = selectionEnd != null ? selectionEnd : i;
+      let rangeStartIdx = i;
+      let rangeEndIdx = i;
+      if (selectedIndices.length > 1 && isContiguousSelection(selectedIndices)) {
+        rangeStartIdx = selectedIndices[0];
+        rangeEndIdx = selectedIndices[selectedIndices.length - 1];
+      }
       const rangeStart = Number(words[rangeStartIdx].start);
       const rangeEnd = Number(words[rangeEndIdx].end);
 
@@ -1032,14 +1412,9 @@ function renderTranscript(words: TranscriptWord[]) {
   }
 
   // Re-apply selection and playhead after re-render (e.g., new transcript)
-  if (selectionStart != null && selectionEnd != null) {
-    const maxIdx = words.length - 1;
-    if (selectionStart > maxIdx || selectionEnd > maxIdx) {
-      setSelectionRange(null, null);
-    } else {
-      setSelectionRange(selectionStart, selectionEnd);
-    }
-  }
+  const keptSelection = selectedIndices.filter((idx) => idx >= 0 && idx < words.length);
+  setSelectedIndices(keptSelection, selectionAnchor);
+
   if (playheadIndex >= 0 && playheadIndex < words.length) {
     setPlayheadIndex(playheadIndex);
   } else {
@@ -1099,7 +1474,9 @@ const ws = WaveSurfer.create({
 // Keep the play/pause button icon in sync with the current status of playback
 ws.on("play", () => setPlayIcon(true));
 ws.on("pause", () => setPlayIcon(false));
-ws.on("finish", () => setPlayIcon(false));
+ws.on("finish", () => {
+  setPlayIcon(false);
+});
 
 // Handle the "Play" button
 btnPlay.addEventListener("click", () => {
@@ -1128,30 +1505,17 @@ ws.on("timeupdate", (t: number) => {
   // use a more robust alignment strategy and allow user-adjusted
   // boundaries to override ASR timings.
 
-  if (pieceTable && ws.isPlaying() && !isSkippingDeleted) {
-    const pVE = getViewEntries(pieceTable);
-    for (let i = 0; i < pVE.length; i++) {
-      const ve = pVE[i];
-      if (ve.status === "deleted" && te >= ve.entry.sourceStart && te < ve.entry.sourceEnd) {
-        let skipTo = ve.entry.sourceEnd;
-        let j = i + 1;
-        while (j < pVE.length && pVE[j].status === "deleted") {
-          skipTo = Math.max(skipTo, pVE[j].entry.sourceEnd);
-          j++;
-        }
-        isSkippingDeleted = true;
-        ws.setTime(skipTo);
-        isSkippingDeleted = false;
-        break;
-      }
-    }
-  }
-
   // We use a simple linear scan for this PoC, but
   // a real implementation should be smarter (e.g. binary search)
   let idx = -1;
   for (let i = 0; i < words.length; i++) {
-    if (te >= words[i].start && te < words[i].end) { idx = i; break; }
+    const start = isEditedPreviewMode && previewWordTimes[i]
+      ? previewWordTimes[i].start
+      : words[i].start;
+    const end = isEditedPreviewMode && previewWordTimes[i]
+      ? previewWordTimes[i].end
+      : words[i].end;
+    if (te >= start && te < end) { idx = i; break; }
   }
   setPlayheadIndex(idx);
 });
@@ -1238,6 +1602,7 @@ function setDetailWordRegion(localStart: number, localEnd: number) {
   });
   detailRegion.on("update-end", () => {
     writebackRegionBounds();
+    void refreshMainWavePreviewFromEdits();
     updateEditButtonStates();
     regionUndoPushed = false;
   });
@@ -1358,6 +1723,7 @@ function setDetailPlayIcon(isPlaying: boolean) {
 // Handle the "Transcribe" button
 btnTranscribe.addEventListener("click", async () => {
   if (!audioPath) return;
+  resetEditedPreviewState();
   btnTranscribe.disabled = true;
   setStatus("Preparing to transcribe...", "info");
   appendLog("\n=== Transcription started ===\n");
@@ -1380,6 +1746,9 @@ btnTranscribe.addEventListener("click", async () => {
     updateEditButtonStates();
 
     renderTranscript(words);
+    if (!isRefreshingPreview) {
+      await refreshMainWavePreviewFromEdits();
+    }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes("cancelled")) {
@@ -1418,21 +1787,29 @@ btnStop.addEventListener("click", async () => {
 
 // Handle the "Choose File" button
 btnChoose.addEventListener("click", async () => {
+  resetEditedPreviewState();
+  setStatus("Choosing file…", "info");
+
+  const selectedPath = await otter.chooseAudioFile();
+  if (!selectedPath) {
+    setStatus("File selection canceled.", "info");
+    return;
+  }
+
+  audioPath = selectedPath;
+
   transcriptEl.innerHTML = "";
   logEl.textContent = "";
   pieceTable = null;
   undoStack = [];
   redoStack = [];
+  selectedIndices = [];
+  selectionStart = null;
+  selectionEnd = null;
+  selectionAnchor = null;
+  detailSelStart = null;
+  detailSelEnd = null;
   updateEditButtonStates();
-  setStatus("Choosing file…", "info");
-
-  audioPath = await otter.chooseAudioFile();
-  if (!audioPath) {
-    setStatus("No file selected.", "error");
-    btnTranscribe.disabled = true;
-    btnPlay.disabled = true;
-    return;
-  }
 
   btnPlay.disabled = true;
   let fname = audioPath.split("/").pop() ?? audioPath;
@@ -1633,15 +2010,21 @@ const btnSaveEdits = mustGetEl<HTMLButtonElement>("btnSaveEdits");
  * remain visible with strikethrough styling so the user can restore them.
  */
 function removeSelection() {
-  if (!pieceTable || selectionStart == null || selectionEnd == null) return;
+  if (!pieceTable || selectedIndices.length === 0) return;
   pushUndo();
-  const changed = applyStatusToRange(pieceTable, selectionStart, selectionEnd, "active", "deleted");
-  if (!changed) {
+  let changedAny = false;
+  const ranges = getSelectedRanges(uniqueSortedIndices(selectedIndices));
+  for (const r of ranges) {
+    const changed = applyStatusToRange(pieceTable, r.start, r.end, "active", "deleted");
+    if (changed) changedAny = true;
+  }
+  if (!changedAny) {
     // Nothing was active in that range — pop the undo we just pushed
     undoStack.pop();
     return;
   }
   renderTranscript(words);
+  void refreshMainWavePreviewFromEdits();
   updateEditButtonStates();
   refreshDetailIfActive();
 }
@@ -1650,14 +2033,20 @@ function removeSelection() {
  * Restore previously removed words in the current selection.
  */
 function restoreSelection() {
-  if (!pieceTable || selectionStart == null || selectionEnd == null) return;
+  if (!pieceTable || selectedIndices.length === 0) return;
   pushUndo();
-  const changed = applyStatusToRange(pieceTable, selectionStart, selectionEnd, "deleted", "active");
-  if (!changed) {
+  let changedAny = false;
+  const ranges = getSelectedRanges(uniqueSortedIndices(selectedIndices));
+  for (const r of ranges) {
+    const changed = applyStatusToRange(pieceTable, r.start, r.end, "deleted", "active");
+    if (changed) changedAny = true;
+  }
+  if (!changedAny) {
     undoStack.pop();
     return;
   }
   renderTranscript(words);
+  void refreshMainWavePreviewFromEdits();
   updateEditButtonStates();
   refreshDetailIfActive();
 }
@@ -1665,9 +2054,14 @@ function restoreSelection() {
 btnRemove.addEventListener("click", () => removeSelection());
 btnRestore.addEventListener("click", () => restoreSelection());
 
+window.addEventListener("mouseup", () => {
+  isMouseSelecting = false;
+});
+
 btnUndo.addEventListener("click", () => {
   if (performUndo()) {
     renderTranscript(words);
+    void refreshMainWavePreviewFromEdits();
     updateEditButtonStates();
     refreshDetailIfActive();
   }
@@ -1676,6 +2070,7 @@ btnUndo.addEventListener("click", () => {
 btnRedo.addEventListener("click", () => {
   if (performRedo()) {
     renderTranscript(words);
+    void refreshMainWavePreviewFromEdits();
     updateEditButtonStates();
     refreshDetailIfActive();
   }
@@ -1751,6 +2146,7 @@ btnSaveEdl.addEventListener("click", async () => {
 
 btnLoadEdl.addEventListener("click", async () => {
   try {
+    resetEditedPreviewState();
     const result = await otter.loadEdl();
     if (!result) return;
 
@@ -1794,6 +2190,7 @@ btnLoadEdl.addEventListener("click", async () => {
     renderTranscript(words);
     updateDeletedRegions();
     refreshDetailIfActive();
+    await refreshMainWavePreviewFromEdits();
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     setStatus("Failed to load EDL.", "error");

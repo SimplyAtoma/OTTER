@@ -480,6 +480,53 @@ ipcMain.handle("load-edl", async () => {
   return { path: filePath, content };
 });
 
+ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJson: string) => {
+  const edl: Edl = JSON.parse(edlJson);
+  const entries = (edl.entries || []).filter((e) => !e.muted);
+
+  if (entries.length === 0) {
+    throw new Error("No non-muted segments to preview.");
+  }
+
+  const sourceFile = edl.sourceFile;
+  const filterParts: string[] = [];
+  const concatInputs: string[] = [];
+
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    filterParts.push(
+      `[0]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
+    );
+    concatInputs.push(`[a${i}]`);
+  }
+
+  const filterComplex =
+    filterParts.join("; ") +
+    "; " +
+    concatInputs.join("") +
+    `concat=n=${entries.length}:v=0:a=1[out]`;
+
+  const outDir = path.join(app.getPath("userData"), "preview_audio");
+  fs.mkdirSync(outDir, { recursive: true });
+  const outPath = path.join(
+    outDir,
+    `preview_${Date.now()}_${Math.floor(Math.random() * 1e6)}.wav`
+  );
+
+  const args = [
+    "-hide_banner",
+    "-y",
+    "-i", sourceFile,
+    "-filter_complex", filterComplex,
+    "-map", "[out]",
+    "-c:a", "pcm_s16le",
+    outPath,
+  ];
+
+  await runFfmpeg(args);
+  return outPath;
+});
+
 /**
  * IPC: Export audio from an EDL by concatenating non-muted segments.
  *
