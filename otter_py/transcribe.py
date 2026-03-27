@@ -15,6 +15,8 @@ Examples:
   python3 -m otter_py.transcribe list
   python3 -m otter_py.transcribe run --audio /path/to.wav --spec-file spec.json
   python3 -m otter_py.transcribe run --audio /path/to.wav --spec-json '{"transcriber": {...}, "post": [...]}'
+
+The pipeline JSON uses a top-level "post" array for post-processors (each entry: id + opts).
 """
 
 from __future__ import annotations
@@ -41,6 +43,19 @@ def run_with_stdout_redirect(fn):
     with redirect_stdout(sys.stderr):
         return fn()
 
+def _coerce_pipeline_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Canonical pipeline spec uses `post` for the ordered list of post-processors.
+    Legacy alias `postprocessors` is accepted and normalized to `post`.
+    """
+    if "postprocessors" in spec:
+        if "post" in spec:
+            raise ValueError("Provide only one of 'post' or 'postprocessors'")
+        spec = dict(spec)
+        spec["post"] = spec.pop("postprocessors")
+    return spec
+
+
 def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, Any]:
     """Load the pipeline spec from a JSON string or file."""
     if spec_json and spec_file:
@@ -48,10 +63,10 @@ def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, A
 
     if spec_file:
         with open(spec_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return _coerce_pipeline_spec(json.load(f))
 
     if spec_json:
-        return json.loads(spec_json)
+        return _coerce_pipeline_spec(json.loads(spec_json))
 
     raise ValueError("Missing pipeline spec. Provide --spec-json or --spec-file")
 

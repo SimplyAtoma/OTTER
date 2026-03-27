@@ -170,6 +170,7 @@ def list_components() -> Dict[str, Any]:
 
 class PipelineSpec(TypedDict, total=False):
     transcriber: Dict[str, Any]  # {"id": "...", "opts": {...}}
+    # Ordered post-processing steps (not "postprocessors"; see otter_py.transcribe.read_spec)
     post: List[Dict[str, Any]]   # [{"id": "...", "opts": {...}}, ...]
 
 

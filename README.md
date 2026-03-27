@@ -1,7 +1,8 @@
 # OTTER Read-Only Proof of Concept
 ***Open Text Transcription Editing Resource***
 
-<image src="assets/icon.png" width="35%"> <image src="assets/Screenshot1.png" width="50%" align="right">
+Optional header images: place `assets/icon.png` and `assets/Screenshot1.png` in the repo root if you want screenshots in this document; the app also uses `assets/icon.png` for the window icon when present.
+
 ## Overview
 
 This repository contains a Proof of Concept (PoC) for OTTER, the **O**pen **T**ext **T**ranscription **E**diting **R**esource. It is for use with CSUMB Computer Science Capstone Program.
@@ -31,9 +32,9 @@ The purpose of this application is to demonstrate:
 
 + Transcription
 	+ Transcription runs locally; no cloud services are required.
-	+ Transcription  generates word-level timestamps
+	+ Transcription generates word-level timestamps
 	+ Transcription uses a Whisper-family model to produce word timings.
-	+ Transcription progress is streamed from whisper wrapper back to front end.
+	+ Transcription progress is streamed on stderr as lines like `PROGRESS:NN` (0–100) from the Python runner to the front end.
 + UI Concepts
 	+ Transcript-driven navigation
 	+ Clicking a word in the transcript seeks the audio to that word.
@@ -60,7 +61,7 @@ To keep the focus clear, this prototype does not attempt to:
 + Package into a self-contained application
 + Provide a polished end-user experience
 
-These are deliberate omissions and are appropriate topics for the full capstone project. The Capstone Proposal can be found here: [OTTER Proposal v1](doc/OTTER\ Proposal \v1.pdf). 
+These are deliberate omissions and are appropriate topics for the full capstone project. The capstone proposal document is distributed with the course materials (it is not stored in this repository).
 
 ### Languages
 
@@ -101,6 +102,7 @@ In this example we converted a format commonly produced by Apple devices into a 
 + [faster-whisper](https://pypi.org/project/faster-whisper/) for text transcription
 + [whisperx](https://pypi.org/project/whisperx/) for text transcription
 + [pydash](https://pypi.org/project/pydash/)
++ [soundfile](https://pypi.org/project/soundfile/) (used for audio duration and cache logic in the runner)
 + [FFmpeg](https://ffmpeg.org):
 	+ Used for audio inspection and (optionally) format normalization
 	+ Also used indirectly by waveform rendering and audio decoding
@@ -118,32 +120,40 @@ In this example we converted a format commonly produced by Apple devices into a 
 	cd OTTER
 	```
 
-1. Install Node dependencies
+2. Install Node dependencies
 
 	```
 	npm install
 	```
 
-2. Set up Python environment
+3. Set up Python environment
+
+	On macOS / Linux:
 
 	```
 	python3 -m venv .venv
 	source .venv/bin/activate
-	pip install pydash
-	pip install faster-whisper
-	pip install whisperx
+	pip install pydash soundfile faster-whisper whisperx
 	```
 
-3. Install `ffmpeg`
+	On Windows (PowerShell or Command Prompt):
+
+	```
+	py -3 -m venv .venv
+	.venv\Scripts\activate
+	pip install pydash soundfile faster-whisper whisperx
+	```
+
+4. Install `ffmpeg`
 
    ```
-   # This is system dependent. For example, on the mac you can use homebrew:
+   # This is system dependent. For example, on macOS you can use Homebrew:
    brew install ffmpeg
    ```
-   
-4. Run the app
 
-    **NOTE**: This PoC is not a cleanly packaged app, you must run it in a context where your python virtul environment is already active. Using the steps above in a shell/terminal will have that effect.
+5. Run the app
+
+    **NOTE:** This PoC is not a cleanly packaged app; you must run it in a context where your Python virtual environment is already active. Using the steps above in a shell or terminal will have that effect.
 
 	```
 	npm start
@@ -154,16 +164,16 @@ In this example we converted a format commonly produced by Apple devices into a 
 
 ### Using the PoC
 
-1.	Click Choose Audio… and select a WAV file.
-1.	Click Transcribe to generate a transcript.
-1. Press Play in the main waveform area to hear audio starting at the cursor.
-1.	Clicking a word in the transcript will:
+1. Click Choose Audio… and select a WAV file.
+2. Click Transcribe to generate a transcript.
+3. Press Play in the main waveform area to hear audio starting at the cursor.
+4. Clicking a word in the transcript will:
   + Move the cursor in the main audio waveform
   + Display a detail view of the audio around the selected range (a single word by default)
-1. Shift-click extends the selection to create a range of words.
-1. Use the detail view to fine-tune the mapping to the selected range
-1. During playback, a separate playhead highlight moves word-by-word and does not change the selection.
-1. Developer Tools
+5. Shift-click extends the selection to create a range of words.
+6. Use the detail view to fine-tune the mapping to the selected range
+7. During playback, a separate playhead highlight moves word-by-word and does not change the selection.
+8. Developer Tools
     + Use the Developer Tools to look at the log from the transcription pipeline
 	+ Select a pre-configured transcription pipeline or enter a custom specification.
 	+ If no explicit selection is made, a default pipeline will be used.
@@ -171,7 +181,7 @@ In this example we converted a format commonly produced by Apple devices into a 
 
 ## Architectural Notes
 
-The system is broken into two primary components: the app and the thranscription pipeline. As discussed, the app uses Electron as its basis. Please see [Understanding Electron](doc/UnderstandingElectron.md) for more details on how the app is organized.
+The system is broken into two primary components: the app and the transcription pipeline. As discussed, the app uses Electron as its basis. Please see [Understanding Electron](doc/UnderstandingElectron.md) for more details on how the app is organized.
 
 The Electron sources are written in TypeScript under `src/` and compiled to `dist/` during `npm start`.
 Main and preload compile to CommonJS (Node context), while the renderer compiles to ES modules (browser context). This avoids `exports`/`require` issues in the renderer.
@@ -184,16 +194,27 @@ Even with good transcription and post-processing, transcript timing is treated a
 
 ### Transcription Pipeline
 
-The transcription pipleline consists of a primary transcription step followed by zero or more post-processing steps which may improve accuracy of the transcript and / or alignment of the transcript to the audio. There is a collection of different transcribers and post-processors available and more will be added as part of the Capstone project. For a given run of the process, the transcription pipleline accepts a JSON structure that describes which transcription component to use and which post-processors to apply in which order. It also allows parameters for each to be specified.
+The transcription pipeline consists of a primary transcription step followed by zero or more post-processing steps which may improve accuracy of the transcript and / or alignment of the transcript to the audio. There is a collection of different transcribers and post-processors available and more will be added as part of the Capstone project. For a given run of the process, the transcription pipeline accepts a JSON structure that describes which transcription component to use and which post-processors to apply in which order. It also allows parameters for each to be specified.
 
 The following components are provided as part of the PoC:
 
 + Transcription
-	+ **faster_whisper**: An implementation using the `faster-whisper` package. quite a few parameters may be set using the pipeline configuration with no code changes needed. For example, the model size may be changed.
+	+ **faster_whisper**: An implementation using the `faster-whisper` package. Quite a few parameters may be set using the pipeline configuration with no code changes needed. For example, the model size may be changed.
 	+ **whisperx_vad**: An implementation using the `whisperx` package along with the `Silero` aligner. Again, many options may be specified including model size.
 + Post-processing
-	+ **clean_word\_timings**:  Normalizes adjacent word boundaries to remove small overlaps and close tiny gaps.This improves selection/playback behavior by ensuring word boundaries are "tight" and consistent.
-	+ **adjust_short\_words**: Heuristic pass that expands very short words by extending their start time leftward, without overlapping the previous word.
+	+ **clean_word_timings**: Normalizes adjacent word boundaries to remove small overlaps and close tiny gaps. This improves selection/playback behavior by ensuring word boundaries are "tight" and consistent.
+	+ **adjust_short_words**: Heuristic pass that expands very short words by extending their start time leftward, without overlapping the previous word.
+	+ **filter_fillers**: Removes common filler words (e.g. uh, um) with optional confidence gating.
+	+ **filter_low_confidence**: Drops or replaces words with confidence below a threshold (when the transcriber supplies scores).
+
+**Pipeline spec format (for `run` and for JSON under `otter_py/sample_specs/`):**
+
++ Top-level **`transcriber`**: `{ "id": "<transcriber_id>", "opts": { ... } }`
++ Top-level **`post`**: ordered array of `{ "id": "<post_processor_id>", "opts": { ... } }` steps
+
+The `python -m otter_py.transcribe list` command prints a discovery document whose top-level keys are **`transcribers`** and **`postprocessors`** (each entry describes one available component and its options). That is different from the **run** spec: runs use **`post`**, not `postprocessors`, for the ordered list.
+
+Legacy specs may use **`postprocessors`** instead of **`post`**; the runner normalizes that to **`post`**. Do not specify both keys.
 
 The following JSON structure illustrates a pipeline configuration that uses the `faster_whisper` transcriber followed by the `adjust_short_words` and `clean_word_timings` post-processors.
 
@@ -207,7 +228,7 @@ The following JSON structure illustrates a pipeline configuration that uses the 
       "compute_type": "int8"
     }
   },
-  "postprocessors": [
+  "post": [
     {
       "id": "adjust_short_words",
       "opts": {
