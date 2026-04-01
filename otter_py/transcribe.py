@@ -142,9 +142,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub.add_parser("clear-cache", help="Delete all cached results (for testing/debugging)")
 
 
-    # Optional: let Electron ask for meta too (debug)
-    p_run.add_argument("--emit-meta", action="store_true", help="Emit {words, meta} instead of just words[]")
-
     args = parser.parse_args(argv)
 
     # Ensure repo root is on sys.path when invoked as a script (not as -m).
