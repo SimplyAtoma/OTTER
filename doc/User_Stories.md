@@ -91,7 +91,7 @@
 
 ## Story 10: App Remains Responsive
 
-As a user, I want the application to remain responsive during long-running operations (such as transcription or export), and I want to be able to pause or cancel those operations, so that I stay in control of my work and my time.
+**As a user**, I want the application to remain responsive during long-running operations (such as transcription or export), and I want to be able to pause or cancel those operations, so that I stay in control of my work and my time.
 
 ### Acceptance Criteria
 - The user interface remains responsive while long-running operations are in progress.
@@ -102,7 +102,7 @@ As a user, I want the application to remain responsive during long-running opera
 
 ## Story 11: Transcript Search (Find / Ctrl + F)
 
-As a user, I want to search for words or phrases in the transcript using a find bar (Ctrl + F), so that I can quickly navigate large transcripts without scrolling manually.
+**As a user**, I want to search for words or phrases in the transcript using a find bar (Ctrl + F), so that I can quickly navigate large transcripts without scrolling manually.
 
 ### Acceptance Criteria
 

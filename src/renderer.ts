@@ -163,7 +163,6 @@ let selectionAnchor: number | null = null;
 let selectedIndices: number[] = [];
 let playheadIndex = -1;
 let isDragging = false;
-let isDragging = false;
 
 type UndoSnapshot = {
   pieces: Piece[];

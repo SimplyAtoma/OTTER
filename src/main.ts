@@ -33,7 +33,7 @@
 import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
 import path from "path";
 import fs from "fs";
-import { spawn } from "child_process";
+import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 
 type TranscribeSpec =
   | { mode: "file"; name: string }
@@ -55,8 +55,25 @@ type Edl = {
   modifiedAt: string;
 };
 
+/**
+ * 
+ */
+type TranscriptionControlCommand =
+  | { type: "pause" }
+  | { type: "resume" }
+  | { type: "cancel" }
+  | { type: "ping" };
+
+/**
+ * 
+ */
+type ManagedTranscriptionProcess = ChildProcessWithoutNullStreams & {
+  otterState?: "running" | "paused" | "cancelling";
+  otterCancelled?: boolean;
+};
+
 let win: BrowserWindow | null = null;
-let activeProcess: ReturnType<typeof spawn> | null = null;
+let activeProcess: ManagedTranscriptionProcess | null = null;
 const repoRoot = path.join(__dirname, "..");
 
 /**
@@ -156,7 +173,10 @@ ipcMain.handle("probe-audio", async (_event: IpcMainInvokeEvent, inputPath: stri
     child.stderr.on("data", d => err += d.toString());
     child.on("error", reject);
     child.on("close", (code) => {
-      if (code !== 0) return reject(new Error(`ffprobe failed (${code})\n${err}`));
+      if (code !== 0) {
+         reject(new Error(`ffprobe failed (${code})\n${err}`));
+        return;
+      }
       try {
         const json = JSON.parse(out);
         const s = json.streams?.[0] || {};
@@ -170,6 +190,50 @@ ipcMain.handle("probe-audio", async (_event: IpcMainInvokeEvent, inputPath: stri
     });
   });
 });
+
+/**
+ * 
+ */
+function getPythonPath() {
+      const venvPython = process.platform === "win32"
+      ? path.join(repoRoot, ".venv", "Scripts", "python.exe")
+      : path.join(repoRoot, ".venv", "bin", "python3");
+  
+      if (fs.existsSync(venvPython)) return venvPython;
+      return process.platform === "win32" ? "python" : "python3";
+}
+
+/**
+ * 
+ */
+function sendControlCommand(
+  proc: ManagedTranscriptionProcess,
+  cmd: TranscriptionControlCommand
+): boolean {
+  if (!proc.stdin || proc.stdin.destroyed || !proc.pid) return false;
+
+  try {
+    const payload = JSON.stringify(cmd) + "\n";
+    proc.stdin.write(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 
+ */
+function terminateProcess(proc: ManagedTranscriptionProcess): boolean {
+  try {
+    const ok = proc.kill();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+
 
 /**
  * IPC: Transcribe an audio file by spawning a local Python script (Whisper-based).
@@ -194,15 +258,10 @@ ipcMain.handle(
     event: IpcMainInvokeEvent,
     audioPath: string,
     spec?: TranscribeSpec
-  ) => {
-    function getPythonPath() {
-      const venvPython = process.platform === "win32"
-      ? path.join(repoRoot, ".venv", "Scripts", "python.exe")
-      : path.join(repoRoot, ".venv", "bin", "python3");
-  
-      if (fs.existsSync(venvPython)) return venvPython;
-      return process.platform === "win32" ? "python" : "python3";
-}
+  ) => { 
+    if( activeProcess){
+      throw new Error("A transcription is already running.");
+    }
 
     // Run from the repo root so "python -m otter_py.transcribe" works.
     const cwd = repoRoot;
@@ -214,7 +273,11 @@ ipcMain.handle(
     // Choose spec source
     if (spec?.mode === "file") {
       // All presets live here; only pass a filename from renderer for safety.
-      const specPath = path.join(repoRoot, "otter_py", "sample_specs", spec.name);
+      const safeName = path.basename(spec.name);
+      if (safeName !== spec.name){
+        throw new Error("IKnvalid spec file name");
+      }
+      const specPath = path.join(repoRoot, "otter_py", "sample_specs", safeName);
       argv.push("--spec-file", specPath);
     } else if (spec?.mode === "json") {
       argv.push("--spec-json", spec.jsonText);
@@ -228,52 +291,104 @@ ipcMain.handle(
     // argv.push("--emit-meta");
 
     return await new Promise((resolve, reject) => {
-      const child = spawn(python, argv, { cwd });
+      const child = spawn(python, argv, { 
+        cwd,
+        stdio: ["pipe","pipe","pipe"] 
+    }) as ManagedTranscriptionProcess;
+
       activeProcess = child;
+      child.otterState = "running";
+      child.otterCancelled= false;
 
       let stdout = "";
       let stderr = "";
+      let settled = false;
+
+      const cleanup = ()=> {
+        if(activeProcess === child){
+          activeProcess = null;
+        }
+      }
+
+      const failOnce = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+
+      const resolveOnce = (value: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
 
       child.stdout.on("data", (d: Buffer) => {
-        const s = d.toString();
-        stdout += s;
+        stdout += d.toString();
       });
 
       child.stderr.on("data", (d: Buffer) => {
-        const s = d.toString();
-        stderr += s;
+        const chunk = d.toString();
+        stderr += chunk;
 
         // Parse progress lines of the form "PROGRESS:NN"
         // (Allow multiple lines in a single chunk.)
-        for (const line of s.split(/\r?\n/)) {
-          const m = line.match(/^PROGRESS:(\d{1,3})\s*$/);
-          if (m) event.sender.send("transcribe-progress", Number(m[1]));
-          else if (line.trim()) event.sender.send("transcribe-log", line + "\n");
+        for (const rawLine of chunk.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+
+          const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
+          if (progressMatch){
+            event.sender.send("transcribe-progress", Number(progressMatch[1]));
+            continue;
+          }
+          if (line === "CONTROL:PAUSED") {
+            child.otterState = "paused";
+            event.sender.send("transcribe-state", { state: "paused" });
+            continue;
+          }
+
+          if (line === "CONTROL:RESUMED") {
+            child.otterState = "running";
+            event.sender.send("transcribe-state", { state: "running" });
+            continue;
+          }
+
+          if (line === "CONTROL:CANCELLING") {
+            child.otterState = "cancelling";
+            event.sender.send("transcribe-state", { state: "cancelling" });
+            continue;
+          } 
+
+          event.sender.send("transcribe-log", line + "\n");
         }
       });
 
-      child.on("error", reject);
+      child.on("error", (err) => {
+        failOnce(err instanceof Error ? err : new Error(String(err)));
+      });
 
       child.on("close", (code, signal) => {
-        activeProcess = null;
+        cleanup();
 
-        switch(signal) {
-          case('SIGKILL'):
-            reject(new Error("transcription cancelled."));
-            break;
-          case 'SIGTSTP':
-            reject(new Error("transcription paused."));
-            break;
+        if(child.otterCancelled){
+          failOnce(new Error("transcription cancelled."));
+          return;
+        }
+        if (signal) {
+          failOnce(new Error(`transcription exited due to signal: ${signal}`));
+          return;
         }
 
 
         if (code !== 0) {
-          reject(new Error(`transcribe exited with ${code}\n${stderr}`));
+          failOnce(new Error(`transcribe exited with ${code}\n${stderr}`));
           return;
         }
         try {
           const parsed = JSON.parse(stdout);
-          resolve(parsed);
+          resolveOnce(parsed);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           reject(new Error(`Failed to parse JSON from transcribe:\n${stdout}\n\n${stderr}\n${msg}`));
@@ -282,31 +397,52 @@ ipcMain.handle(
     });
   });
 
-ipcMain.handle("cancel-transcription", async () => {
-  // Send SIGKILL (not SIGTERM) so cancellation works even when the process
-  // is paused via SIGSTOP — a stopped process ignores SIGTERM.
-  if (activeProcess) {
-    // Resume first if stopped, then kill
-    activeProcess.kill("SIGCONT");
-    return activeProcess.kill("SIGKILL");
-  }
-  return false;
-});
-
 ipcMain.handle("pause-transcription", async () => {
-  if (activeProcess) {
-    // Send SIGSTOP to the active process
-    return activeProcess.kill("SIGSTOP");
-  }
-  return false;
+  if (!activeProcess) return false;
+  if (activeProcess.otterState === "paused") return true;
+  if (activeProcess.otterState === "cancelling") return false;
+
+  const ok = sendControlCommand(activeProcess, { type: "pause" });
+  return ok;
 });
 
 ipcMain.handle("resume-transcription", async () => {
-  if (activeProcess) {
-    // Send SIGCONT to the active process
-    return activeProcess.kill("SIGCONT");
-  }
-  return false;
+  if (!activeProcess) return false;
+  if (activeProcess.otterState === "running") return true;
+  if (activeProcess.otterState === "cancelling") return false;
+
+  const ok = sendControlCommand(activeProcess, { type: "resume" });
+  return ok;
+});
+
+/**
+ * 
+ */
+ipcMain.handle("cancel-transcription", async () => {
+  if (!activeProcess) return false;
+
+  activeProcess.otterCancelled = true;
+  activeProcess.otterState = "cancelling";
+
+  // First ask Python to shut itself down cleanly.
+  const sent = sendControlCommand(activeProcess, { type: "cancel" });
+
+  // Fallback: hard terminate if it does not exit.
+  setTimeout(() => {
+    if (activeProcess && activeProcess.otterCancelled) {
+      terminateProcess(activeProcess);
+    }
+  }, 1000);
+
+  return sent || terminateProcess(activeProcess);
+});
+
+ipcMain.handle("get-transcription-state", async () => {
+  if (!activeProcess) return { active: false, state: "idle" };
+  return {
+    active: true,
+    state: activeProcess.otterState ?? "running"
+  };
 });
 
 ipcMain.handle("list-spec-files", async () => {
@@ -404,18 +540,7 @@ ipcMain.handle(
       outPath
     ];
 
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn("ffmpeg", args);
-
-      let err = "";
-      child.stderr.on("data", (d: Buffer) => err += d.toString());
-      child.on("error", reject);
-      child.on("close", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg failed (${code}): ${err}`));
-      });
-    });
-
+    await runFfmpeg(args);
     return outPath;
   });
 
@@ -591,16 +716,6 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
     result.filePath,
   ];
 
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn("ffmpeg", args);
-    let err = "";
-    child.stderr.on("data", (d: Buffer) => (err += d.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg export failed (${code}): ${err}`));
-    });
-  });
-
+  await runFfmpeg(args);
   return result.filePath;
 });
