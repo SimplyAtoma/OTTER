@@ -65,6 +65,8 @@ def clean_word_timings(
             w["end"] = mid
             n["start"] = mid
             overlaps_fixed += 1
+            w_end = float(w["end"])
+            n_start = float(n["start"])
 
         # 2) Close tiny positive gaps
         gap = n_start - w_end

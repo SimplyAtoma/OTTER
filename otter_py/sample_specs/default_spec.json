@@ -17,13 +17,13 @@
     {
       "id": "filter_fillers",
       "opts": {
-        "min_duration": 0.10
+        "min_conf": 0.10
       }
     },
     {
       "id": "filter_low_confidence_words",
       "opts": {
-        "min_confidence": 0.4
+        "min_conf": 0.4
       }
     },
     {

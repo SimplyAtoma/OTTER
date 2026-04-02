@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import whisperx
 
-from otter_py.util import eprint
+from otter_py.otter_debug import DebugLevel, dbg
+from otter_py.util import call_ctx_checkpoint, eprint, validate_audio_input_path
 
 Word = Dict[str, Any]
 
@@ -158,24 +159,35 @@ def transcribe_parallel(
     progress_cb = ctx.get("progress") if callable(ctx.get("progress")) else None
 
     def emit(p: int) -> None:
-        if progress_cb:
+        if not progress_cb:
+            return
+        try:
             progress_cb(max(0, min(100, int(p))))
+        except Exception as ex:
+            dbg(f"progress callback failed: {ex}", DebugLevel.WARN)
 
     model_name = str(opts.get("model", "base"))
     device = str(opts.get("device", "cpu"))
     compute_type = str(opts.get("compute_type", "int8"))
     language: Optional[str] = opts.get("language", None)
-    batch_size = int(opts.get("batch_size", 4))
+    try:
+        batch_size = int(opts.get("batch_size", 4))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"transcriber opts['batch_size'] must be an integer, got {opts.get('batch_size')!r}"
+        ) from e
     align_model_override: Optional[str] = opts.get("align_model", None)
     # Use fewer workers on CPU to avoid memory exhaustion
     max_workers = int(opts.get("max_workers", 2 if device == "cpu" else 4))
 
     emit(0)
+    validate_audio_input_path(audio_path)
     audio = whisperx.load_audio(audio_path)
     emit(5)
 
     chunks = _split_audio(audio, chunk_s, overlap_s)
     eprint(f"INFO:parallel: splitting into {len(chunks)} chunks")
+    call_ctx_checkpoint(ctx)
 
     # Transcribe chunks in parallel
     all_segments: List[List[Dict]] = [None] * len(chunks)
@@ -200,6 +212,7 @@ def transcribe_parallel(
                 eprint(f"ERROR:parallel chunk {i} failed: {e}")
                 all_segments[i] = []
             completed += 1
+            call_ctx_checkpoint(ctx)
             emit(5 + int(completed * progress_per_chunk))
 
     emit(65)
@@ -220,6 +233,7 @@ def transcribe_parallel(
     emit(70)
 
     # Align merged segments
+    call_ctx_checkpoint(ctx)
     try:
         words = _align_segments(
             merged_segments, audio, detected_lang,

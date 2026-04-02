@@ -74,7 +74,7 @@ contextBridge.exposeInMainWorld("otter", {
    *   - { mode: "file", name: "default_spec.json" }
    *   - { mode: "json", jsonText: "{...}" }
    *
-   * @returns {Promise<Object>} Transcript data including word-level timings
+   * @returns {Promise<Object>} Transcript data including word-level timings, or `{ cancelled: true }` if stopped
    */
   transcribeAudio: (audioPath: string, spec?: { mode: "file"; name: string } | { mode: "json"; jsonText: string }) =>
     ipcRenderer.invoke("transcribe-audio", audioPath, spec),

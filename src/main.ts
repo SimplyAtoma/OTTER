@@ -275,7 +275,7 @@ ipcMain.handle(
       // All presets live here; only pass a filename from renderer for safety.
       const safeName = path.basename(spec.name);
       if (safeName !== spec.name){
-        throw new Error("IKnvalid spec file name");
+        throw new Error("Invalid spec file name");
       }
       const specPath = path.join(repoRoot, "otter_py", "sample_specs", safeName);
       argv.push("--spec-file", specPath);
@@ -293,12 +293,15 @@ ipcMain.handle(
     return await new Promise((resolve, reject) => {
       const child = spawn(python, argv, { 
         cwd,
-        stdio: ["pipe","pipe","pipe"] 
+        stdio: ["pipe","pipe","pipe"],
+        env: {...process.env, PYTHONUNBUFFERED: "1"}
     }) as ManagedTranscriptionProcess;
 
       activeProcess = child;
       child.otterState = "running";
       child.otterCancelled= false;
+
+      event.sender.send("transcribe-progress", 0);
 
       let stdout = "";
       let stderr = "";
@@ -372,8 +375,10 @@ ipcMain.handle(
       child.on("close", (code, signal) => {
         cleanup();
 
-        if(child.otterCancelled){
-          failOnce(new Error("transcription cancelled."));
+        // User clicked Stop (or cancel IPC). Resolve — do not reject — so Electron
+        // does not log this as an IPC handler error in the main process console.
+        if (child.otterCancelled) {
+          resolveOnce({ cancelled: true as const });
           return;
         }
         if (signal) {
@@ -381,6 +386,18 @@ ipcMain.handle(
           return;
         }
 
+        // Cooperative cancel from Python (exit 2 + error JSON) without Node flag
+        if (code === 2) {
+          try {
+            const parsed = JSON.parse(stdout) as { error?: string };
+            if (parsed?.error === "Cancelled") {
+              resolveOnce({ cancelled: true as const });
+              return;
+            }
+          } catch {
+            // fall through to generic non-zero handling
+          }
+        }
 
         if (code !== 0) {
           failOnce(new Error(`transcribe exited with ${code}\n${stderr}`));

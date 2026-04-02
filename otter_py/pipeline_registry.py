@@ -171,6 +171,7 @@ def list_components() -> Dict[str, Any]:
 class PipelineSpec(TypedDict, total=False):
     transcriber: Dict[str, Any]  # {"id": "...", "opts": {...}}
     post: List[Dict[str, Any]]   # [{"id": "...", "opts": {...}}, ...]
+    postprocessors: List[Dict[str, Any]]  # backward-compatible alias for post
 
 
 def run_pipeline(
@@ -220,7 +221,13 @@ def run_pipeline(
     }
 
     # --- run post-processors in order
-    for p_spec in spec.get("post") or []:
+    # Support both keys:
+    # - "post" (internal canonical key)
+    # - "postprocessors" (spec file key used by sample JSON specs)
+    post_specs = spec.get("post")
+    if post_specs is None:
+        post_specs = spec.get("postprocessors") or []
+    for p_spec in post_specs:
         p_id = p_spec.get("id")
         p_opts = p_spec.get("opts") or {}
         if not p_id:

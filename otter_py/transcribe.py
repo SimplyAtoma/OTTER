@@ -160,6 +160,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "run":
+        eprint(f"PROGRESS:0")
+        eprint("INFO:Initializing pipeline components...")
         from otter_py.pipeline_registry import load_components, run_pipeline
         load_components()  # ensure components are loaded before running
         try:
@@ -205,7 +207,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 duration = 0
             PARALLEL_THRESHOLD =  20 * 60 # seconds; if audio is longer than this, warn about potential parallel execution
             use_parallel = duration > PARALLEL_THRESHOLD
-            timer = _start_elapsed_timer()
+            #timer = _start_elapsed_timer()
 
             try:
                 controller.checkpoint()
@@ -224,7 +226,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     )
 
                     post_meta = []
-                    for post_spec in spec.get("post") or []:
+                    post_specs = spec.get("post")
+                    if post_specs is None:
+                        post_specs = spec.get("postprocessors") or []
+                    for post_spec in post_specs:
                         p_id = post_spec.get("id")
                         p_opts = post_spec.get("opts") or {}
                         if p_id and p_id in _POSTS:
@@ -265,7 +270,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 sys.stdout.write("\n")
                 return 1
             finally:
-                timer.set()  # stop the elapsed timer thread
+                #timer.set()  # stop the elapsed timer thread
+                pass
             controller.checkpoint()
             _save_cache(cache_key, result)
 

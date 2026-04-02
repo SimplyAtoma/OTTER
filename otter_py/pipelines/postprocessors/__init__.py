@@ -20,3 +20,4 @@ the registry and cannot be selected by the application.
 from . import adjust_short_words     # noqa: F401
 from . import clean_word_timings     # noqa: F401
 from . import filter_fillers         # noqa: F401
+from . import filter_low_confidence_words  # noqa: F401
