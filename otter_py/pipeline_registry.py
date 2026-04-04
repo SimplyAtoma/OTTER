@@ -66,7 +66,7 @@ class _PostEntry(TypedDict):
     fn: PostProcessorFn
 
 
-_TRANSCIBERS: Dict[str, _TranscriberEntry] = {}
+_TRANSCRIBERS: Dict[str, _TranscriberEntry] = {}
 _POSTS: Dict[str, _PostEntry] = {}
 _LOADED: bool = False  # to prevent double-loading of components
 
@@ -84,11 +84,11 @@ def register_transcriber(
 ) -> Callable[[TranscriberFn], TranscriberFn]:
     """Decorator to register a transcriber function."""
     def _decorator(fn: TranscriberFn) -> TranscriberFn:
-        if id in _TRANSCIBERS:
+        if id in _TRANSCRIBERS:
             raise KeyError(f"Transcriber '{id}' already registered")
         info = ComponentInfo(id=id, label=label, kind="transcriber",
                              options_schema=options_schema, description=description)
-        _TRANSCIBERS[id] = {"info": info, "fn": fn}
+        _TRANSCRIBERS[id] = {"info": info, "fn": fn}
         return fn
     return _decorator
 
@@ -144,7 +144,7 @@ def list_components() -> Dict[str, Any]:
             "description": e["info"].description,
             "options_schema": e["info"].options_schema,
         }
-        for e in _TRANSCIBERS.values()
+        for e in _TRANSCRIBERS.values()
     ]
     posts = [
         {
@@ -201,11 +201,11 @@ def run_pipeline(
     t_opts = t_spec.get("opts") or {}
     if not t_id:
         raise ValueError("Pipeline spec missing transcriber.id")
-    if t_id not in _TRANSCIBERS:
+    if t_id not in _TRANSCRIBERS:
         raise KeyError(f"Unknown transcriber '{t_id}'")
 
     # --- run transcriber
-    t_entry = _TRANSCIBERS[t_id]
+    t_entry = _TRANSCRIBERS[t_id]
     t0 = time.time()
     words, t_meta = t_entry["fn"](audio_path, t_opts, ctx)
     t_runtime = time.time() - t0

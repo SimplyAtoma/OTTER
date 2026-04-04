@@ -33,7 +33,7 @@
 import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
 import path from "path";
 import fs from "fs";
-import { spawn, ChildProcessWithoutNullStreams } from "child_process";
+import { spawn, spawnSync, ChildProcessWithoutNullStreams } from "child_process";
 
 type TranscribeSpec =
   | { mode: "file"; name: string }
@@ -195,12 +195,62 @@ ipcMain.handle("probe-audio", async (_event: IpcMainInvokeEvent, inputPath: stri
  * 
  */
 function getPythonPath() {
-      const venvPython = process.platform === "win32"
+  // Allow explicit override (recommended) so Electron uses the same interpreter
+  // as your working CLI setup.
+  const override =
+    process.env.OTTER_PYTHON ??
+    process.env.OTTER_PYTHON_PATH ??
+    process.env.PYTHON_EXECUTABLE;
+  if (override) return override;
+
+  const candidates: string[] = [];
+
+  // If Electron was launched from an activated venv, use it.
+  const activeVenv = process.env.VIRTUAL_ENV;
+  if (activeVenv) {
+    const venvPython = process.platform === "win32"
+      ? path.join(activeVenv, "Scripts", "python.exe")
+      : path.join(activeVenv, "bin", "python3");
+    if (fs.existsSync(venvPython)) candidates.push(venvPython);
+  }
+
+  // Prefer repo-local venv if present.
+  const repoVenvPython =
+    process.platform === "win32"
       ? path.join(repoRoot, ".venv", "Scripts", "python.exe")
       : path.join(repoRoot, ".venv", "bin", "python3");
-  
-      if (fs.existsSync(venvPython)) return venvPython;
-      return process.platform === "win32" ? "python" : "python3";
+  if (fs.existsSync(repoVenvPython)) candidates.push(repoVenvPython);
+
+  // Fallback: try common commands on PATH.
+  if (process.platform === "win32") {
+    candidates.push("python3", "python");
+  } else {
+    candidates.push("python3", "python");
+  }
+
+  // Pick the first interpreter that can import our module.
+  for (const candidate of candidates) {
+    try {
+      // Skip invalid absolute paths early.
+      if (path.isAbsolute(candidate) && !fs.existsSync(candidate)) continue;
+
+      const res = spawnSync(
+        candidate,
+        [
+          "-c",
+          'import importlib; importlib.import_module("otter_py.transcribe")',
+        ],
+        { cwd: repoRoot, stdio: "ignore", timeout: 3000 }
+      );
+
+      if (res.status === 0) return candidate;
+    } catch {
+      // ignore and try next candidate
+    }
+  }
+
+  // Final fallback (will likely fail with a clear error in transcribe-audio).
+  return candidates[candidates.length - 1] ?? "python3";
 }
 
 /**
@@ -269,6 +319,7 @@ ipcMain.handle(
     // Build argv for: python -m otter_py.transcribe run --audio ... --spec-...
     const python = getPythonPath();
     const argv = ["-m", "otter_py.transcribe", "run", "--audio", audioPath];
+    event.sender.send("transcribe-log", `INFO:Python=${python} | CWD=${cwd} | ARGS=${argv.join(" ")}\n`);
 
     // Choose spec source
     if (spec?.mode === "file") {
@@ -305,6 +356,8 @@ ipcMain.handle(
 
       let stdout = "";
       let stderr = "";
+      /** Incomplete stderr line from last chunk (avoids losing PROGRESS:NN split across reads). */
+      let stderrLineBuf = "";
       let settled = false;
 
       const cleanup = ()=> {
@@ -331,40 +384,46 @@ ipcMain.handle(
         stdout += d.toString();
       });
 
+      const handleStderrLine = (rawLine: string) => {
+        const line = rawLine.replace(/\r$/, "").trim();
+        if (!line) return;
+
+        const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
+        if (progressMatch) {
+          event.sender.send("transcribe-progress", Number(progressMatch[1]));
+          return;
+        }
+        if (line === "CONTROL:PAUSED") {
+          child.otterState = "paused";
+          event.sender.send("transcribe-state", { state: "paused" });
+          return;
+        }
+        if (line === "CONTROL:RESUMED") {
+          child.otterState = "running";
+          event.sender.send("transcribe-state", { state: "running" });
+          return;
+        }
+        if (line === "CONTROL:CANCELLING") {
+          child.otterState = "cancelling";
+          event.sender.send("transcribe-state", { state: "cancelling" });
+          return;
+        }
+        event.sender.send("transcribe-log", line + "\n");
+      };
+
       child.stderr.on("data", (d: Buffer) => {
         const chunk = d.toString();
         stderr += chunk;
+        stderrLineBuf += chunk;
 
-        // Parse progress lines of the form "PROGRESS:NN"
-        // (Allow multiple lines in a single chunk.)
-        for (const rawLine of chunk.split(/\r?\n/)) {
-          const line = rawLine.trim();
-          if (!line) continue;
-
-          const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
-          if (progressMatch){
-            event.sender.send("transcribe-progress", Number(progressMatch[1]));
-            continue;
-          }
-          if (line === "CONTROL:PAUSED") {
-            child.otterState = "paused";
-            event.sender.send("transcribe-state", { state: "paused" });
-            continue;
-          }
-
-          if (line === "CONTROL:RESUMED") {
-            child.otterState = "running";
-            event.sender.send("transcribe-state", { state: "running" });
-            continue;
-          }
-
-          if (line === "CONTROL:CANCELLING") {
-            child.otterState = "cancelling";
-            event.sender.send("transcribe-state", { state: "cancelling" });
-            continue;
-          } 
-
-          event.sender.send("transcribe-log", line + "\n");
+        let nl: number;
+        while ((nl = stderrLineBuf.indexOf("\n")) >= 0) {
+          const line = stderrLineBuf.slice(0, nl);
+          stderrLineBuf = stderrLineBuf.slice(nl + 1);
+          handleStderrLine(line);
+        }
+        if (stderrLineBuf.length > 256 * 1024) {
+          stderrLineBuf = stderrLineBuf.slice(-64 * 1024);
         }
       });
 
@@ -373,6 +432,11 @@ ipcMain.handle(
       });
 
       child.on("close", (code, signal) => {
+        if (stderrLineBuf.trim()) {
+          handleStderrLine(stderrLineBuf);
+          stderrLineBuf = "";
+        }
+
         cleanup();
 
         // User clicked Stop (or cancel IPC). Resolve — do not reject — so Electron

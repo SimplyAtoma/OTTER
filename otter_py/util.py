@@ -72,13 +72,26 @@ def run_in_thread_with_timeout(
     timeout_sec: float,
     timeout_message: str,
 ) -> T:
-    """Run fn() in a single-worker pool and enforce a wall-clock timeout."""
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(fn)
-        try:
-            return fut.result(timeout=timeout_sec)
-        except FuturesTimeout:
-            raise RuntimeError(timeout_message) from None
+    """
+    Run fn() in a single-worker pool and enforce a wall-clock timeout.
+
+    On timeout, shutdown the pool with wait=False so we do not block forever
+    waiting for a non-interruptible worker (e.g. WhisperX transcribe/align).
+    The worker thread may still run until the process exits; callers should treat
+    timeout as best-effort cancellation of the *waiting* thread only.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(fn)
+    timed_out = False
+    try:
+        return fut.result(timeout=timeout_sec)
+    except FuturesTimeout:
+        timed_out = True
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise RuntimeError(timeout_message) from None
+    finally:
+        if not timed_out:
+            pool.shutdown(wait=True)
 
 
 def _start_elapsed_timer() -> threading.Event:

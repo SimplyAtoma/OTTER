@@ -40,6 +40,16 @@ from otter_py.util import (
 Word = Dict[str, Any]
 
 
+def _optional_env_path(*names: str) -> Optional[str]:
+    """First non-empty env var among `names`, expanded (~user); else None."""
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        return os.path.expanduser(str(raw).strip())
+    return None
+
+
 def _safe_int(opts: Dict[str, Any], key: str, default: int, lo: int, hi: int) -> int:
     raw = opts.get(key, default)
     try:
@@ -59,13 +69,77 @@ def _asr_progress_bridge(emit: Any, stop: threading.Event) -> None:
     """While ASR runs, nudge progress from ~16% toward ~69% so the bar does not look stuck."""
     start = time.time()
     max_s = float(os.environ.get("OTTER_WHISPERX_ASR_PROGRESS_BRIDGE_SEC", "1800"))
-    interval = float(os.environ.get("OTTER_WHISPERX_ASR_PROGRESS_TICK_SEC", "8"))
+    interval = float(os.environ.get("OTTER_WHISPERX_ASR_PROGRESS_TICK_SEC", "3"))
     lo, hi = 16, 69
+    tick = 0
     while not stop.wait(timeout=interval):
         elapsed = time.time() - start
         frac = min(1.0, elapsed / max_s) if max_s > 0 else 1.0
         pct = lo + int(frac * (hi - lo))
-        emit(min(pct, hi))
+        pct = min(pct, hi)
+        if pct >= hi - 1:
+            pct = hi - 1 + (tick % 2)
+        tick += 1
+        emit(pct)
+
+
+def _model_load_progress_bridge(emit: Any, stop: threading.Event) -> None:
+    """
+    While WhisperX ASR weights load (first run may download for a long time),
+    creep progress from ~2% toward ~9% so the UI does not sit at 0%.
+    Once saturated at 9%, alternate 8/9 each tick — repeating PROGRESS:9 does not
+    move a <progress> element, so the bar looked frozen during long load_model().
+    """
+    lo, hi = 2, 9
+    interval = float(os.environ.get("OTTER_WHISPERX_MODEL_LOAD_TICK_SEC", "3"))
+    max_s = float(os.environ.get("OTTER_WHISPERX_MODEL_LOAD_BRIDGE_SEC", "3600"))
+    start = time.time()
+    tick = 0
+    while not stop.wait(timeout=interval):
+        elapsed = time.time() - start
+        frac = min(1.0, elapsed / max_s) if max_s > 0 else 1.0
+        pct = lo + int(frac * (hi - lo))
+        pct = min(pct, hi)
+        if pct >= hi:
+            pct = hi - 1 + (tick % 2)
+        tick += 1
+        emit(pct)
+
+
+def _align_load_progress_bridge(emit: Any, stop: threading.Event) -> None:
+    """While the alignment model loads, creep ~71% toward ~74%."""
+    lo, hi = 71, 74
+    interval = float(os.environ.get("OTTER_WHISPERX_ALIGN_LOAD_TICK_SEC", "3"))
+    max_s = float(os.environ.get("OTTER_WHISPERX_ALIGN_LOAD_BRIDGE_SEC", "600"))
+    start = time.time()
+    tick = 0
+    while not stop.wait(timeout=interval):
+        elapsed = time.time() - start
+        frac = min(1.0, elapsed / max_s) if max_s > 0 else 1.0
+        pct = lo + int(frac * (hi - lo))
+        pct = min(pct, hi)
+        if pct >= hi:
+            pct = hi - 1 + (tick % 2)
+        tick += 1
+        emit(pct)
+
+
+def _align_run_progress_bridge(emit: Any, stop: threading.Event) -> None:
+    """While whisperx.align() runs (can be slow), creep ~76% toward ~94%."""
+    lo, hi = 76, 94
+    interval = float(os.environ.get("OTTER_WHISPERX_ALIGN_RUN_TICK_SEC", "3"))
+    max_s = float(os.environ.get("OTTER_WHISPERX_ALIGN_RUN_BRIDGE_SEC", "600"))
+    start = time.time()
+    tick = 0
+    while not stop.wait(timeout=interval):
+        elapsed = time.time() - start
+        frac = min(1.0, elapsed / max_s) if max_s > 0 else 1.0
+        pct = lo + int(frac * (hi - lo))
+        pct = min(pct, hi)
+        if pct >= hi:
+            pct = hi - 1 + (tick % 2)
+        tick += 1
+        emit(pct)
 
 
 @register_transcriber(
@@ -124,6 +198,8 @@ def transcribe_whisperx_vad(
       - ctx["checkpoint"] (callable): optional; pause/cancel between heavy steps
 
     Models are cached at module scope (LRU, see otter_py.model_cache), not on ctx.
+    That cache is in-memory for this Python process only. On-disk weights are shared
+    via WhisperX/HF when OTTER_WHISPERX_DOWNLOAD_ROOT / HF_HOME / OTTER_ALIGN_MODEL_DIR match the CLI.
     """
 
     dbg("Entered transcribe_whisperx_vad")
@@ -168,18 +244,47 @@ def transcribe_whisperx_vad(
 
     emit(0)
 
-    asr_key = ("whisperx_asr", model_name, device, compute_type, "silero")
+    # Same env vars WhisperX / faster-whisper respect — keeps disk cache aligned with CLI.
+    download_root = _optional_env_path(
+        "OTTER_WHISPERX_DOWNLOAD_ROOT",
+        "WHISPERX_DOWNLOAD_ROOT",
+    )
+    asr_key = (
+        "whisperx_asr",
+        model_name,
+        device,
+        compute_type,
+        "silero",
+        download_root,
+    )
 
     def load_asr():
-        return whisperx.load_model(
-            model_name,
-            device=device,
-            compute_type=compute_type,
-            vad_method="silero",
-        )
+        kw: Dict[str, Any] = {
+            "device": device,
+            "compute_type": compute_type,
+            "vad_method": "silero",
+        }
+        if download_root:
+            kw["download_root"] = download_root
+        return whisperx.load_model(model_name, **kw)
 
-    asr_model = get_or_create(asr_key, load_asr)
+    dbg(
+        "Loading WhisperX ASR model (first run may download weights; this can take several minutes).",
+        DebugLevel.WARNING,
+    )
+    model_load_stop = threading.Event()
+    model_load_thread = threading.Thread(
+        target=_model_load_progress_bridge,
+        args=(emit, model_load_stop),
+        daemon=True,
+    )
+    model_load_thread.start()
+    try:
+        asr_model = get_or_create(asr_key, load_asr)
+    finally:
+        model_load_stop.set()
 
+    dbg("WhisperX ASR model ready (in-memory LRU may reuse it in this process).", DebugLevel.TRACE)
     emit(10)
 
     call_ctx_checkpoint(ctx)
@@ -219,32 +324,63 @@ def transcribe_whisperx_vad(
             "Provide opts.language (e.g., 'en') or use audio with detectable speech."
         )
 
-    align_key = ("whisperx_align", lang_for_align, device, align_model_override)
+    align_model_dir = _optional_env_path("OTTER_ALIGN_MODEL_DIR", "HF_HOME")
+    align_key = (
+        "whisperx_align",
+        lang_for_align,
+        device,
+        align_model_override,
+        align_model_dir,
+    )
 
     def load_align():
-        return whisperx.load_align_model(
-            language_code=lang_for_align,
-            device=device,
-            model_name=align_model_override,
-        )
+        kw: Dict[str, Any] = {
+            "language_code": lang_for_align,
+            "device": device,
+            "model_name": align_model_override,
+        }
+        if align_model_dir:
+            kw["model_dir"] = align_model_dir
+        return whisperx.load_align_model(**kw)
 
-    align_model, align_metadata = get_or_create(align_key, load_align)
+    dbg("Loading alignment model for word-level timestamps...", DebugLevel.TRACE)
+    align_load_stop = threading.Event()
+    align_load_thread = threading.Thread(
+        target=_align_load_progress_bridge,
+        args=(emit, align_load_stop),
+        daemon=True,
+    )
+    align_load_thread.start()
+    try:
+        align_model, align_metadata = get_or_create(align_key, load_align)
+    finally:
+        align_load_stop.set()
 
     emit(75)
 
     call_ctx_checkpoint(ctx)
-    aligned = run_in_thread_with_timeout(
-        lambda: whisperx.align(
-            asr_segments,
-            align_model,
-            align_metadata,
-            audio,
-            device,
-            return_char_alignments=False,
-        ),
-        timeout_sec=align_timeout,
-        timeout_message=f"WhisperX alignment timed out after {align_timeout:g}s",
+    align_run_stop = threading.Event()
+    align_run_thread = threading.Thread(
+        target=_align_run_progress_bridge,
+        args=(emit, align_run_stop),
+        daemon=True,
     )
+    align_run_thread.start()
+    try:
+        aligned = run_in_thread_with_timeout(
+            lambda: whisperx.align(
+                asr_segments,
+                align_model,
+                align_metadata,
+                audio,
+                device,
+                return_char_alignments=False,
+            ),
+            timeout_sec=align_timeout,
+            timeout_message=f"WhisperX alignment timed out after {align_timeout:g}s",
+        )
+    finally:
+        align_run_stop.set()
 
     emit(95)
 

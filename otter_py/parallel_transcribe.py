@@ -11,13 +11,13 @@ Only used when audio exceeds a minimum duration threshold (default: 20 min).
 from __future__ import annotations
 
 import concurrent.futures
-import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import whisperx
 
+from otter_py.exceptions import TranscriptionCancelled
 from otter_py.otter_debug import DebugLevel, dbg
 from otter_py.util import call_ctx_checkpoint, eprint, validate_audio_input_path
 
@@ -37,11 +37,11 @@ def _transcribe_chunk(
     compute_type: str,
     language: Optional[str],
     batch_size: int,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     Worker function: runs in a separate process.
     Loads its own model instance and transcribes one chunk.
-    Returns segments with times offset by chunk_start.
+    Returns segments with times offset by chunk_start, plus ASR-detected language (if any).
     """
     model = whisperx.load_model(
         model_name,
@@ -51,6 +51,7 @@ def _transcribe_chunk(
     )
     result = model.transcribe(chunk, batch_size=batch_size, language=language)
     segments = result.get("segments", []) or []
+    detected_lang = result.get("language")
 
     # Offset all timestamps by chunk start
     for seg in segments:
@@ -62,7 +63,7 @@ def _transcribe_chunk(
             if "end" in w:
                 w["end"] += chunk_start
 
-    return segments
+    return segments, detected_lang
 
 
 def _split_audio(
@@ -164,7 +165,7 @@ def transcribe_parallel(
         try:
             progress_cb(max(0, min(100, int(p))))
         except Exception as ex:
-            dbg(f"progress callback failed: {ex}", DebugLevel.WARN)
+            dbg(f"progress callback failed: {ex}", DebugLevel.WARNING)
 
     model_name = str(opts.get("model", "base"))
     device = str(opts.get("device", "cpu"))
@@ -190,10 +191,9 @@ def transcribe_parallel(
     call_ctx_checkpoint(ctx)
 
     # Transcribe chunks in parallel
-    all_segments: List[List[Dict]] = [None] * len(chunks)
-    progress_per_chunk = 60 / len(chunks)
-
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+    cancel_fast = False
+    try:
         futures = {
             executor.submit(
                 _transcribe_chunk,
@@ -203,30 +203,44 @@ def transcribe_parallel(
             ): i
             for i, (chunk, start) in enumerate(chunks)
         }
+        chunk_results: List[
+            Optional[Tuple[List[Dict[str, Any]], Optional[str]]]
+        ] = [None] * len(chunks)
         completed = 0
+        progress_per_chunk = 60 / max(len(chunks), 1)
         for future in concurrent.futures.as_completed(futures):
             i = futures[future]
             try:
-                all_segments[i] = future.result()
+                chunk_results[i] = future.result()
             except Exception as e:
                 eprint(f"ERROR:parallel chunk {i} failed: {e}")
-                all_segments[i] = []
+                chunk_results[i] = ([], None)
             completed += 1
             call_ctx_checkpoint(ctx)
             emit(5 + int(completed * progress_per_chunk))
+    except TranscriptionCancelled:
+        cancel_fast = True
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if not cancel_fast:
+            executor.shutdown(wait=True)
 
     emit(65)
 
-    # Merge all segments in order
-    merged_segments = []
-    for segs in all_segments:
+    # Merge all segments in order; collect ASR language from chunk results (not segment dicts)
+    merged_segments: List[Dict[str, Any]] = []
+    detected_lang_from_chunks: Optional[str] = None
+    for data in chunk_results:
+        if not data:
+            continue
+        segs, lang = data
         merged_segments.extend(segs or [])
+        if detected_lang_from_chunks is None and lang:
+            detected_lang_from_chunks = lang
     merged_segments.sort(key=lambda s: s.get("start", 0))
 
-    # Detect language from first successful chunk if not specified
-    detected_lang = language or (
-        merged_segments[0].get("language") if merged_segments else None
-    )
+    detected_lang = language or detected_lang_from_chunks
     if not detected_lang:
         raise RuntimeError("Could not detect language from any chunk.")
 

@@ -28,11 +28,9 @@ import time
 from typing import Any, Dict, Optional
 
 from pydash import get as deep_get
-from otter_py.util import eprint, _start_elapsed_timer, run_with_stdout_redirect
+from otter_py.exceptions import TranscriptionCancelled
+from otter_py.util import eprint, run_with_stdout_redirect
 from otter_py.cacheUtil import _cache_key, _cache_dir, _load_cache, _save_cache
-
-class TranscriptionCancelled(Exception):
-    """Raised when the main process requests cancellation."""
 
 
 class ControlManager:
@@ -53,7 +51,6 @@ class ControlManager:
     def __init__(self) -> None:
         self._paused = threading.Event()
         self._cancelled = threading.Event()
-        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
 
@@ -72,22 +69,21 @@ class ControlManager:
 
                 kind = msg.get("type")
 
-                with self._lock:
-                    if kind == "pause":
-                        self._paused.set()
-                        eprint("CONTROL:PAUSED")
-                    elif kind == "resume":
-                        self._paused.clear()
-                        eprint("CONTROL:RESUMED")
-                    elif kind == "cancel":
-                        self._cancelled.set()
-                        self._paused.clear()
-                        eprint("CONTROL:CANCELLING")
-                        return
-                    elif kind == "ping":
-                        eprint("CONTROL:PONG")
-                    else:
-                        eprint(f"WARN:unknown control type: {kind}")
+                if kind == "pause":
+                    self._paused.set()
+                    eprint("CONTROL:PAUSED")
+                elif kind == "resume":
+                    self._paused.clear()
+                    eprint("CONTROL:RESUMED")
+                elif kind == "cancel":
+                    self._cancelled.set()
+                    self._paused.clear()
+                    eprint("CONTROL:CANCELLING")
+                    return
+                elif kind == "ping":
+                    eprint("CONTROL:PONG")
+                else:
+                    eprint(f"WARN:unknown control type: {kind}")
         except Exception as ex:
             eprint(f"WARN:control loop ended unexpectedly: {type(ex).__name__}:{ex}")
 
@@ -107,9 +103,11 @@ class ControlManager:
         self.throw_if_cancelled()
 
     def progress_wrapper(self, fn):
+        """Emit progress without checkpointing — avoids TranscriptionCancelled in bridge threads."""
+
         def wrapped(pct: int) -> None:
-            self.checkpoint()
             fn(pct)
+
         return wrapped
 
 def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, Any]:
@@ -178,6 +176,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # Progress callback for Electron:
         # - emit "PROGRESS:NN" lines to stderr (easy to parse, keeps stdout clean)
+        # - may be invoked from worker threads inside transcribers; must stay fast.
+        # - repeating the same NN does not update HTML <progress> in Chromium; bridges
+        #   in whisperx_vad oscillate slightly when saturated so the bar still repaints.
         def progress(pct: int) -> None:
             eprint(f"PROGRESS:{pct}")
 
@@ -205,9 +206,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 eprint(f"INFO:audio duration is {duration:.2f} seconds")
             except Exception:
                 duration = 0
-            PARALLEL_THRESHOLD =  20 * 60 # seconds; if audio is longer than this, warn about potential parallel execution
+            PARALLEL_THRESHOLD = 20 * 60  # seconds; if audio is longer than this, may use parallel path
             use_parallel = duration > PARALLEL_THRESHOLD
-            #timer = _start_elapsed_timer()
+            t_id = (spec.get("transcriber") or {}).get("id")
+            if use_parallel and t_id != "whisperx_vad":
+                eprint(
+                    f"WARN: parallel transcription is only implemented for transcriber "
+                    f"'whisperx_vad'; got {t_id!r}. Using single-process pipeline."
+                )
+                use_parallel = False
 
             try:
                 controller.checkpoint()
@@ -236,7 +243,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                             eprint(f"INFO:running post-processor {p_id} with opts {p_opts}")
                             p0 = time.time()
                             words, p_meta = run_with_stdout_redirect(
-                                lambda: _POSTS[p_id]["fn"](words,p_opts,ctx))
+                                lambda w=words, pid=p_id, opts=p_opts: _POSTS[pid]["fn"](
+                                    w, opts, ctx
+                                )
+                            )
                             post_meta.append({
                                 "id": p_id, 
                                 "opts": p_opts, 
@@ -269,9 +279,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
                 sys.stdout.write("\n")
                 return 1
-            finally:
-                #timer.set()  # stop the elapsed timer thread
-                pass
             controller.checkpoint()
             _save_cache(cache_key, result)
 

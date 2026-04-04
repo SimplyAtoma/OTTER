@@ -1,5 +1,5 @@
 """
-cache.py
+cacheUtil.py
 
 Filesystem cache for OTTER pipeline results.
 Keyed by SHA-256 of audio file contents + spec JSON.
@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 from otter_py.util import eprint
 from typing import Any, Dict, Optional
 
@@ -39,8 +40,18 @@ def _load_cache(key: str) -> Optional[Dict[str, Any]]:
         return None
 
 def _save_cache(key: str, result: Dict[str, Any]) -> None:
+    final_path = _cache_path(key)
+    cache_dir = _cache_dir()
+    tmp_name = os.path.join(cache_dir, f".{key}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        with open(_cache_path(key), "w", encoding="utf-8") as f:
+        with open(tmp_name, "w", encoding="utf-8") as f:
             json.dump(result, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, final_path)
     except OSError as e:
         eprint(f"WARN: failed to write cache: {e}")
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
