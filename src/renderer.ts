@@ -48,6 +48,7 @@ type TranscriptWord = {
   start: number;
   end: number;
   [key: string]: unknown;
+  breakAfter?: number;
 };
 
 type TranscriptResult =
@@ -161,12 +162,13 @@ let selectionEnd: number | null = null;
 let selectionAnchor: number | null = null;
 let playheadIndex = -1;
 let isDragging = false;
-let isDragging = false;
+// let isDragging = false;
 
 type UndoSnapshot = {
   pieces: Piece[];
   originalBuffer: PieceEntry[];
   addBuffer: PieceEntry[];
+  words: TranscriptWord[];
 };
 
 let pieceTable: PieceTableData | null = null;
@@ -323,6 +325,7 @@ function snapshotState(pt: PieceTableData): UndoSnapshot {
     pieces: pt.pieces.map(p => ({ ...p })),
     originalBuffer: pt.originalBuffer.map(e => ({ ...e })),
     addBuffer: pt.addBuffer.map(e => ({ ...e })),
+    words: words.map(w => ({ ...w })),
   };
 }
 
@@ -333,9 +336,10 @@ function pushUndo(): void {
 }
 
 function restoreSnapshot(pt: PieceTableData, snap: UndoSnapshot): void {
-  pt.pieces = snap.pieces;
-  pt.originalBuffer = snap.originalBuffer;
-  pt.addBuffer = snap.addBuffer;
+  pt.pieces = snap.pieces.map(p => ({ ...p }));
+  pt.originalBuffer = snap.originalBuffer.map(e => ({ ...e }));
+  pt.addBuffer = snap.addBuffer.map(e => ({ ...e }));
+  words = snap.words.map(w => ({ ...w }));
   pt.modifiedAt = new Date().toISOString();
 }
 
@@ -357,12 +361,23 @@ function performRedo(): boolean {
 
 function syncWordsFromPieceTable(): void {
   if (!pieceTable) return;
+
+  const oldWords = words;
   const viewEntries = getViewEntries(pieceTable);
-  words = viewEntries.map(ve => ({
+
+  const newWords: TranscriptWord[] = viewEntries.map(ve => ({
     word: ve.entry.word,
     start: ve.entry.sourceStart,
     end: ve.entry.sourceEnd,
   }));
+
+  for (let i = 0; i < newWords.length; i++) {
+    if (oldWords[i]?.breakAfter) {
+      newWords[i].breakAfter = oldWords[i].breakAfter;
+    }
+  }
+
+  words = newWords;
 }
 
 async function refreshDetailIfActive(): Promise<void> {
@@ -1029,6 +1044,12 @@ function renderTranscript(words: TranscriptWord[]) {
     });
 
     transcriptEl.appendChild(span);
+
+    const breakCount = words[i].breakAfter ?? 0;
+    for (let j = 0; j < breakCount; j++) 
+    {
+      transcriptEl.appendChild(document.createElement("br"));
+    }
   }
 
   // Re-apply selection and playhead after re-render (e.g., new transcript)
@@ -1626,6 +1647,22 @@ const btnSaveEdl = mustGetEl<HTMLButtonElement>("btnSaveEdl");
 const btnLoadEdl = mustGetEl<HTMLButtonElement>("btnLoadEdl");
 const btnSaveEdits = mustGetEl<HTMLButtonElement>("btnSaveEdits");
 
+
+
+function removeOneBreakline(): boolean {
+  if (selectionEnd == null) return false;
+
+  const currentBreaks = words[selectionEnd].breakAfter ?? 0;
+  if (currentBreaks <= 0) return false;
+
+  pushUndo();
+  words[selectionEnd].breakAfter = currentBreaks - 1;
+  renderTranscript(words);
+  updateEditButtonStates();
+  return true;
+}
+
+
 /**
  * Remove (soft-delete) the currently selected words.
  *
@@ -1718,16 +1755,41 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
     return;
   }
 
-  if (e.key === "Delete" || e.key === "Backspace") {
-    e.preventDefault();
+  if (e.key === "Backspace") {
+  e.preventDefault();
+
+  const removedBreakline = removeOneBreakline();
+  if (!removedBreakline) {
     removeSelection();
-    return;
   }
+  return;
+}
+
+if (e.key === "Delete") {
+  e.preventDefault();
+  removeSelection();
+  return;
+}
 
   if (e.key === "r" || e.key === "R") {
     restoreSelection();
     return;
   }
+
+  if (e.key === "Enter") {
+  e.preventDefault();
+
+  if (selectionEnd !== null) {
+    pushUndo();
+    words[selectionEnd].breakAfter = (words[selectionEnd].breakAfter ?? 0) + 1;
+    renderTranscript(words);
+    updateEditButtonStates();
+  }
+  return;
+}
+
+
+
 });
 
 btnSaveEdl.addEventListener("click", async () => {
