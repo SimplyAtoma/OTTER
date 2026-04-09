@@ -15,6 +15,8 @@ Examples:
   python3 -m otter_py.transcribe list
   python3 -m otter_py.transcribe run --audio /path/to.wav --spec-file spec.json
   python3 -m otter_py.transcribe run --audio /path/to.wav --spec-json '{"transcriber": {...}, "post": [...]}'
+
+The pipeline JSON uses a top-level "post" array for post-processors (each entry: id + opts).
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import sys
 from typing import Any, Dict, Optional
 from contextlib import redirect_stdout
 from pydash import get as deep_get
-from otter_py.util import eprint
+from otter_py.util import eprint, _start_elapsed_timer
 from otter_py.cacheUtil import _cache_key, _cache_dir,  _load_cache, _save_cache
 
 def run_with_stdout_redirect(fn):
@@ -41,6 +43,19 @@ def run_with_stdout_redirect(fn):
     with redirect_stdout(sys.stderr):
         return fn()
 
+def _coerce_pipeline_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Canonical pipeline spec uses `post` for the ordered list of post-processors.
+    Legacy alias `postprocessors` is accepted and normalized to `post`.
+    """
+    if "postprocessors" in spec:
+        if "post" in spec:
+            raise ValueError("Provide only one of 'post' or 'postprocessors'")
+        spec = dict(spec)
+        spec["post"] = spec.pop("postprocessors")
+    return spec
+
+
 def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, Any]:
     """Load the pipeline spec from a JSON string or file."""
     if spec_json and spec_file:
@@ -48,10 +63,10 @@ def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, A
 
     if spec_file:
         with open(spec_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return _coerce_pipeline_spec(json.load(f))
 
     if spec_json:
-        return json.loads(spec_json)
+        return _coerce_pipeline_spec(json.loads(spec_json))
 
     raise ValueError("Missing pipeline spec. Provide --spec-json or --spec-file")
 
@@ -118,14 +133,64 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             eprint("INFO:cache miss, running pipeline")
             try:
-                result = run_with_stdout_redirect(
-                    lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
-                )
+                import soundfile as sf
+                duration = sf.info(audio_path).duration
+                eprint(f"INFO:audio duration is {duration:.2f} seconds")
+            except Exception:
+                duration = 0
+            PARALLEL_THRESHOLD =  20 * 60 # seconds; if audio is longer than this, warn about potential parallel execution
+            use_parallel = duration > PARALLEL_THRESHOLD
+            timer = _start_elapsed_timer()
+
+            try:
+                if use_parallel:
+                    from otter_py.parallel_transcribe import transcribe_parallel
+                    eprint(f"INFO:audio duration exceeds {PARALLEL_THRESHOLD/60:.0f} minutes, enabling parallel execution (if supported by transcriber)")
+                    from otter_py.pipeline_registry import _POSTS
+                    import time
+
+                    t_opts =(spec.get("transcriber") or {}).get("opts") or {}
+                    words, t_meta = run_with_stdout_redirect(
+                        lambda: transcribe_parallel(audio_path=audio_path, opts=t_opts, ctx=ctx)
+                    )
+
+                    post_meta = []
+                    for post_spec in spec.get("post") or []:
+                        p_id = post_spec.get("id")
+                        p_opts = post_spec.get("opts") or {}
+                        if p_id and p_id in _POSTS:
+                            eprint(f"INFO:running post-processor {p_id} with opts {p_opts}")
+                            p0 = time.time()
+                            words, p_meta = run_with_stdout_redirect(
+                                lambda: _POSTS[p_id]["fn"](words,p_opts,ctx))
+                            post_meta.append({
+                                "id": p_id, 
+                                "opts": p_opts, 
+                                "runtime": round(time.time() - p0, 3),
+                                "meta": p_meta or {}
+                                })
+                    result = {
+                        "words": words,
+                        "meta": {
+                            "transcriber": {
+                                "id": "whisperx_parallel",
+                                "opts": t_opts,
+                                "meta": t_meta
+                            },
+                            "post": post_meta
+                        }
+                    }
+                else:
+                    result = run_with_stdout_redirect(
+                        lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
+                    )
             except Exception as e:
                 eprint(f"ERROR:{type(e).__name__}:{e}")
                 json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
                 sys.stdout.write("\n")
                 return 1
+            finally:
+                timer.set()  # stop the elapsed timer thread
             _save_cache(cache_key, result)
 
         # Emit machine-readable JSON ONLY on stdout (no extra logs, progress, or library chatter).
