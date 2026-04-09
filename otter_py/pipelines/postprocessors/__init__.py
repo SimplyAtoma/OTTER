@@ -19,3 +19,4 @@ the registry and cannot be selected by the application.
 # Import modules for side effects (registration)
 from . import adjust_short_words     # noqa: F401
 from . import clean_word_timings     # noqa: F401
+from . import filter_fillers         # noqa: F401

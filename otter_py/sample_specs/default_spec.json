@@ -9,16 +9,28 @@
   },
   "postprocessors": [
     {
+      "id": "clean_word_timings",
+      "opts": {
+        "tiny_gap_ms": 300.0
+      }
+    },
+    {
+      "id": "filter_fillers",
+      "opts": {
+        "min_duration": 0.10
+      }
+    },
+    {
+      "id": "filter_low_confidence_words",
+      "opts": {
+        "min_confidence": 0.4
+      }
+    },
+    {
       "id": "adjust_short_words",
       "opts": {
         "max_len": 0.30,
         "min_extend": 0.10
-      }
-    },
-    {
-      "id": "clean_word_timings",
-      "opts": {
-        "tiny_gap_ms": 300.0
       }
     }
   ]

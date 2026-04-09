@@ -25,8 +25,9 @@ import os
 import sys
 from typing import Any, Dict, Optional
 from contextlib import redirect_stdout
-import sys
 from pydash import get as deep_get
+from otter_py.util import eprint
+from otter_py.cacheUtil import _cache_key, _cache_dir,  _load_cache, _save_cache
 
 def run_with_stdout_redirect(fn):
     """
@@ -39,11 +40,6 @@ def run_with_stdout_redirect(fn):
     """
     with redirect_stdout(sys.stderr):
         return fn()
-
-def eprint(*args: Any, **kwargs: Any) -> None:
-    """Print to stderr (keeps stdout reserved for machine-readable JSON)."""
-    print(*args, file=sys.stderr, **kwargs)
-
 
 def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, Any]:
     """Load the pipeline spec from a JSON string or file."""
@@ -59,7 +55,6 @@ def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, A
 
     raise ValueError("Missing pipeline spec. Provide --spec-json or --spec-file")
 
-
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="OTTER PoC transcription pipeline runner")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -70,6 +65,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_run.add_argument("--audio", required=True, help="Path to input audio file")
     p_run.add_argument("--spec-json", help="Pipeline spec as JSON string")
     p_run.add_argument("--spec-file", help="Path to pipeline spec JSON file")
+    p_run.add_argument("--no-cache", action="store_true", help="Skip cache and overwrite cached result")
+    p_clear = sub.add_parser("clear-cache", help="Delete all cached results (for testing/debugging)") 
 
     # Optional: let Electron ask for meta too (debug)
     p_run.add_argument("--emit-meta", action="store_true", help="Emit {words, meta} instead of just words[]")
@@ -83,21 +80,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
-    from otter_py.pipeline_registry import load_components, list_components, run_pipeline
-    load_components()
-
     if args.cmd == "list":
+        from otter_py.pipeline_registry import load_components, list_components
+        load_components()  # ensure components are loaded before listing
         data = list_components()
-        json.dump(data, sys.stderr, indent=2)
-        sys.stderr.write("\n")
+        json.dump(data, sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return 0
 
     if args.cmd == "run":
-        spec = read_spec(args.spec_json, args.spec_file)
+        from otter_py.pipeline_registry import load_components, run_pipeline
+        load_components()  # ensure components are loaded before running
+        try:
+            spec = read_spec(args.spec_json, args.spec_file)
+        except (ValueError, json.JSONDecodeError) as e:
+            eprint(f"ERROR:SpecError:{e}")
+            return 1
 
         audio_path = args.audio
         if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            eprint(f"ERROR:FileNotFoundError:Audio file not found: {audio_path}")
+            return 1
 
         # Progress callback for Electron:
         # - emit "PROGRESS:NN" lines to stderr (easy to parse, keeps stdout clean)
@@ -105,25 +108,53 @@ def main(argv: Optional[list[str]] = None) -> int:
             eprint(f"PROGRESS:{pct}")
 
         ctx: Dict[str, Any] = {"progress": progress}
-
+        cache_key = _cache_key(audio_path, spec)
+        cached = None if args.no_cache else _load_cache(cache_key)
         # Run the pipeline with stdout redirected to stderr so that any library
         # chatter (e.g. WhisperX notices) can't corrupt our JSON output channel.
-        result = run_with_stdout_redirect(
-            lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
-        )
+        if cached is not None:
+            eprint("INFO:cache hit, skipping pipeline execution")
+            result = cached
+        else:
+            eprint("INFO:cache miss, running pipeline")
+            try:
+                result = run_with_stdout_redirect(
+                    lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
+                )
+            except Exception as e:
+                eprint(f"ERROR:{type(e).__name__}:{e}")
+                json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
+                sys.stdout.write("\n")
+                return 1
+            _save_cache(cache_key, result)
 
-        # Emit machine-readable JSON ONLY on stdout.
+        # Emit machine-readable JSON ONLY on stdout (no extra logs, progress, or library chatter).
         if not args.emit_meta:
-            language = deep_get(result, "meta.transcriber.meta.language", default="unknown")
+            language = deep_get(result, "meta.transcriber.meta.language", default=None)
+            if language is None:
+                eprint("WARN: could not extract language from meta, defaulting to 'unknown'")
+                language = "unknown"
             result.pop("meta", None)
             result["language"] = language
-        
         json.dump(result, sys.stdout)
 
         sys.stdout.write("\n")
         return 0
 
-
+    if args.cmd == "clear-cache":
+        # For testing/debugging: clear the cache directory
+        cache = _cache_dir()
+        deleted = 0
+        for f in os.listdir(cache):
+            if f.endswith(".json"):
+                try:
+                    os.remove(os.path.join(cache, f))
+                    deleted += 1
+                except OSError as e:
+                    eprint(f"WARN: failed to remove cache file {f}: {e}")
+        json.dump({"deleted": deleted, "cache_dir": cache}, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
     parser.error("Unhandled command")
     return 2
 
@@ -131,7 +162,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except SystemExit:
+        raise  # let normal exits through
     except Exception as ex:
-        # Emit a structured error to stderr so Electron can show it / log it.
-        eprint(f"ERROR:{type(ex).__name__}:{ex}")
-        raise
+        json.dump({"error": type(ex).__name__, "message": str(ex)}, sys.stdout)
+        sys.stdout.write("\n")
+        sys.exit(1)  # clean exit, no traceback

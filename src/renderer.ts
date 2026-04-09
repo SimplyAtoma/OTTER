@@ -4,12 +4,12 @@
  * OTTER Read-Only Prototype – Renderer Process
  *
  * This file implements the user interface logic for the OTTER demonstration app.
- * It runs in Electron’s renderer process and is responsible for:
+ * It runs in Electron's renderer process and is responsible for:
  *
  *   • Displaying the main audio waveform
  *   • Displaying a transcript with word-level timing
  *   • Synchronizing transcript selection with audio playback
- *   • Rendering a secondary “detail” waveform for a selected word
+ *   • Rendering a secondary "detail" waveform for a selected word
  *   • Highlighting and playing a bounded audio region corresponding to a word
  *
  * This renderer intentionally treats the transcript as a *first-class interaction
@@ -27,7 +27,7 @@
  *
  * • Transcript word timings are approximate (derived from ASR output).
  *   The detail waveform exists specifically to demonstrate why manual
- *   boundary adjustment (“nudging”) may be required for precise editing.
+ *   boundary adjustment ("nudging") may be required for precise editing.
  *
  * Scope and Intent
  * ----------------
@@ -48,6 +48,7 @@ type TranscriptWord = {
   start: number;
   end: number;
   [key: string]: unknown;
+  breakAfter?: number;
 };
 
 type TranscriptResult =
@@ -162,11 +163,13 @@ let selectionEnd: number | null = null;
 let selectionAnchor: number | null = null;
 let selectedIndices: number[] = [];
 let playheadIndex = -1;
+let isDragging = false;
 
 type UndoSnapshot = {
   pieces: Piece[];
   originalBuffer: PieceEntry[];
   addBuffer: PieceEntry[];
+  words: TranscriptWord[];
 };
 
 let pieceTable: PieceTableData | null = null;
@@ -329,6 +332,7 @@ function snapshotState(pt: PieceTableData): UndoSnapshot {
     pieces: pt.pieces.map(p => ({ ...p })),
     originalBuffer: pt.originalBuffer.map(e => ({ ...e })),
     addBuffer: pt.addBuffer.map(e => ({ ...e })),
+    words: words.map(w => ({ ...w })),
   };
 }
 
@@ -339,9 +343,10 @@ function pushUndo(): void {
 }
 
 function restoreSnapshot(pt: PieceTableData, snap: UndoSnapshot): void {
-  pt.pieces = snap.pieces;
-  pt.originalBuffer = snap.originalBuffer;
-  pt.addBuffer = snap.addBuffer;
+  pt.pieces = snap.pieces.map(p => ({ ...p }));
+  pt.originalBuffer = snap.originalBuffer.map(e => ({ ...e }));
+  pt.addBuffer = snap.addBuffer.map(e => ({ ...e }));
+  words = snap.words.map(w => ({ ...w }));
   pt.modifiedAt = new Date().toISOString();
 }
 
@@ -349,7 +354,6 @@ function performUndo(): boolean {
   if (!pieceTable || undoStack.length === 0) return false;
   redoStack.push(snapshotState(pieceTable));
   restoreSnapshot(pieceTable, undoStack.pop()!);
-  syncWordsFromPieceTable();
   return true;
 }
 
@@ -357,18 +361,28 @@ function performRedo(): boolean {
   if (!pieceTable || redoStack.length === 0) return false;
   undoStack.push(snapshotState(pieceTable));
   restoreSnapshot(pieceTable, redoStack.pop()!);
-  syncWordsFromPieceTable();
   return true;
 }
 
 function syncWordsFromPieceTable(): void {
   if (!pieceTable) return;
+
+  const oldWords = words;
   const viewEntries = getViewEntries(pieceTable);
-  words = viewEntries.map(ve => ({
+
+  const newWords: TranscriptWord[] = viewEntries.map(ve => ({
     word: ve.entry.word,
     start: ve.entry.sourceStart,
     end: ve.entry.sourceEnd,
   }));
+
+  for (let i = 0; i < newWords.length; i++) {
+    if (oldWords[i]?.breakAfter) {
+      newWords[i].breakAfter = oldWords[i].breakAfter;
+    }
+  }
+
+  words = newWords;
 }
 
 async function refreshDetailIfActive(): Promise<void> {
@@ -383,6 +397,7 @@ async function refreshDetailIfActive(): Promise<void> {
     console.error("Failed to refresh detail view:", err);
   }
 }
+
 
 /**
  * Change the status of entries in the visual index range [visualStart, visualEnd]
@@ -786,10 +801,150 @@ function setTranscribingState(active: boolean) {
   }
 }
 
+transcriptEl.addEventListener("dragover", (event: DragEvent) => {
+  if (dragMoveSourceIndices.length === 0) return;
+  if ((event.target as HTMLElement).closest(".word")) return;
+  event.preventDefault();
+  clearDropIndicators();
+});
+
+transcriptEl.addEventListener("drop", (event: DragEvent) => {
+  if (dragMoveSourceIndices.length === 0) return;
+  if ((event.target as HTMLElement).closest(".word")) return;
+  event.preventDefault();
+  clearDropIndicators();
+  moveCurrentSelection(words.length);
+  dragMoveSourceIndices = [];
+  transcriptEl.classList.remove("dragging-words");
+});
+
 function normalizeRange(a: number, b: number) {
   return a <= b ? { start: a, end: b } : { start: b, end: a };
 }
 
+const findBar = document.getElementById("searchBar")!;
+const findInput = document.getElementById("searchInput") as HTMLInputElement;
+const findClose = document.getElementById("findClose")!;
+findBar.hidden = true;
+
+window.addEventListener("keydown", (event: KeyboardEvent) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    findBar.hidden = false;
+    findInput.focus();
+    findInput.select();
+  }
+
+  if (event.key === "Escape") {
+    findBar.hidden = true;
+    clearSearchHighlights();
+  }
+});
+
+findClose.addEventListener("click", () => {
+  findBar.hidden = true;
+  clearSearchHighlights();
+});
+
+let lastFoundIndex = -1;
+let lastSearchQuery = "";
+
+findInput.addEventListener("keydown", (event: KeyboardEvent) => {
+    if(event.key !== "Enter")
+    {
+      return;
+    }
+   
+    const searchQuery = findInput.value.trim().toLowerCase();
+    if(!searchQuery) 
+    {
+      return;
+    }
+
+    if (searchQuery !== lastSearchQuery) {
+        lastFoundIndex = -1;
+        lastSearchQuery = searchQuery;
+      }
+    let found = false;
+    for(let i = lastFoundIndex + 1; i < words.length; i++)
+    {
+      if(words[i].word.toLowerCase().includes(searchQuery))
+      {
+        lastFoundIndex=  i;
+        found = true;
+        lastSearchQuery = searchQuery;
+      const wordFound = words[i];
+      setSelectionRange(i, i);
+      ws.setTime(Number(wordFound.start) + SEEK_EPS);
+
+      const wordElement = transcriptEl.querySelector(
+      `.word[data-index="${i}"]`
+      ) as HTMLElement | null;
+
+      wordElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+      break;
+    }
+
+    }
+
+   if(!found)
+    {
+      for(let i = 0; i < lastFoundIndex; i++)
+      {
+        if(words[i].word.toLowerCase().includes(searchQuery))
+        {
+          lastFoundIndex = i;
+            lastSearchQuery = searchQuery;
+      const wordFound = words[i];
+      setSelectionRange(i, i);
+      ws.setTime(Number(wordFound.start) + SEEK_EPS);
+
+      const wordElement = transcriptEl.querySelector(
+      `.word[data-index="${i}"]`
+      ) as HTMLElement | null;
+
+      wordElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+      break;
+        }
+      }
+    }
+
+  });
+
+function clearSearchHighlights() {
+  const transcriptWords = transcriptEl.querySelectorAll(".word");
+
+  for (let i = 0; i < transcriptWords.length; i++) {
+    const wordElement = transcriptWords[i] as HTMLElement;
+    const index = Number(wordElement.dataset.index);
+    const wordText = words[index].word;    
+    wordElement.innerHTML = wordText + " ";
+  }
+}
+
+  findInput.addEventListener("input", () =>{
+    const searchQuery = findInput.value.trim().toLowerCase();
+    const transcriptWords = transcriptEl.querySelectorAll(".word");
+   
+    for(let i = 0; i < transcriptWords.length; i++)
+    {
+      const wordElement = transcriptWords[i] as HTMLElement;
+      const index = Number(wordElement.dataset.index);
+      const wordText = words[index].word;
+      wordElement.innerHTML = wordText + " ";
+      const matchPosition = wordText.toLowerCase().indexOf(searchQuery)
+      if(matchPosition === -1)
+      {
+        continue;
+      }
+      
+      const before = wordText.slice(0,matchPosition);
+      const matchingChar = wordText.slice(matchPosition, matchPosition + searchQuery.length);
+      const after = wordText.slice(matchPosition + searchQuery.length);
+      wordElement.innerHTML=  before +'<span class="highlight">' + matchingChar + '</span>' +after +" ";
+    }
+
+})
 function uniqueSortedIndices(indices: number[]): number[] {
   const unique = Array.from(new Set(indices));
   unique.sort((a, b) => a - b);
@@ -1019,7 +1174,6 @@ function setSelectionRange(start: number | null, end: number | null) {
   }
 }
 
-
 // Compute a small snippet window around a word boundary.
 // This keeps the detail waveform focused on just the selected word plus context.
 function computeDetailWindow(start: number, end: number) {
@@ -1085,6 +1239,15 @@ async function loadDetailForRange(start: number, end: number) {
  *
  * The transcript is treated as a first-class interaction surface rather
  * than a passive display: text selection directly drives audio navigation.
+ *
+ * This function also supports drag selection:
+ *
+ *   • mousedown on a word: starts drag, establishes anchor
+ *   • mouseover while dragging: expands/contracts selection dynamically
+ *   • mouseup (global): finalizes selection
+ *
+ * Both click and drag integration use setSelectionRange() to ensure
+ * consistent behavior and normalization of selection order.
  *
  * This function is intentionally simple and imperative for clarity in
  * this proof-of-concept; more advanced implementations might virtualize
@@ -1233,7 +1396,42 @@ function renderTranscript(words: TranscriptWord[]) {
       }
     });
 
+    // Drag Selection: mousedown
+    // When the user presses the mouse button on a word:
+    //   • Set isDragging = true to signal that drag is active
+    //   • Record selectionAnchor as the origin point (never changes during drag)
+    //   • Highlight the starting word immediately
+    span.addEventListener("mousedown", (event: MouseEvent) => {
+      event.preventDefault();
+      isDragging = true;
+      selectionAnchor = i;
+      setSelectionRange(i, i);
+    });
+
+    // Drag Selection: mouseover while dragging
+    // As the user moves the cursor across words:
+    //   • Check if drag is active (isDragging === true)
+    //   • Get the hovered word's index from the DOM
+    //   • Call setSelectionRange(anchor, hovered) to expand/contract selection
+    //   • Both forward and backward drag work because setSelectionRange()
+    //     normalizes the range order internally
+    span.addEventListener("mouseover", (event: MouseEvent) => {
+      if (!isDragging) return;
+      const hoveredIndex = Number((event.target as HTMLElement).dataset.index);
+      if (selectionAnchor != null && !isNaN(hoveredIndex)) {
+        setSelectionRange(selectionAnchor, hoveredIndex);
+      }
+    });
+
     transcriptEl.appendChild(span);
+
+    const breakCount = words[i].breakAfter ?? 0;
+    for (let j = 0; j < breakCount; j++) 
+    {
+      transcriptEl.appendChild(document.createElement("br"));
+    }
+
+    
   }
 
   // Re-apply selection and playhead after re-render (e.g., new transcript)
@@ -1247,6 +1445,24 @@ function renderTranscript(words: TranscriptWord[]) {
   }
 
   updateDeletedRegions();
+}
+
+/**
+ * Drag Selection: Global mouseup handler
+ *
+ * Attach a global listener to window so that drag ends correctly even if
+ * the user releases the mouse button outside the transcript pane.
+ *
+ * This ensures isDragging is always set to false when the button is released,
+ * preventing a "stuck" drag state.
+ */
+function initializeDragEnd() {
+  window.addEventListener("mouseup", (_event: MouseEvent) => {
+    if (isDragging) {
+      isDragging = false;
+      // Selection remains as-is; do not modify it further
+    }
+  });
 }
 
 //==============================================================================
@@ -1634,7 +1850,6 @@ btnChoose.addEventListener("click", async () => {
   fnameEl.textContent = shortenFilenameMiddle(fname);
 });
 
-
 //==============================================================================
 //
 // BEGIN: Objects and code related to Logging
@@ -1751,6 +1966,7 @@ async function populateSpecSelect() {
 
 // Events
 
+
 chkCustomSpec.addEventListener("change", async () => {
   if (chkCustomSpec.checked) {
     // Enter customize mode: show textarea and seed it from selected file
@@ -1824,6 +2040,23 @@ const btnRedo = mustGetEl<HTMLButtonElement>("btnRedo");
 const btnSaveEdl = mustGetEl<HTMLButtonElement>("btnSaveEdl");
 const btnLoadEdl = mustGetEl<HTMLButtonElement>("btnLoadEdl");
 const btnSaveEdits = mustGetEl<HTMLButtonElement>("btnSaveEdits");
+
+//helper function for removing one breakline
+function removeOneBreakline(): boolean {
+  if (selectedIndices.length === 0) return false;
+
+  const lastSelected = selectedIndices[selectedIndices.length - 1];
+  const currentBreaks = words[lastSelected]?.breakAfter ?? 0;
+
+  if (currentBreaks <= 0) return false;
+
+  pushUndo();
+  words[lastSelected].breakAfter = currentBreaks - 1;
+  renderTranscript(words);
+  updateEditButtonStates();
+  return true;
+}
+
 
 /**
  * Remove (soft-delete) the currently selected words.
@@ -1935,16 +2168,39 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
     return;
   }
 
-  if (e.key === "Delete" || e.key === "Backspace") {
-    e.preventDefault();
-    removeSelection();
-    return;
-  }
+  if (e.key === "Backspace") {
+  e.preventDefault();
 
-  if (e.key === "r" || e.key === "R") {
-    restoreSelection();
-    return;
+  const removedBreakline = removeOneBreakline();
+  if (!removedBreakline) {
+    removeSelection();
   }
+  return;
+}
+
+if (e.key === "Delete") {
+  e.preventDefault();
+  removeSelection();
+  return;
+}
+
+if (e.key === "r" || e.key === "R") {
+  restoreSelection();
+  return;
+}
+
+if (e.key === "Enter") {
+  e.preventDefault();
+
+  if (selectedIndices.length > 0) {
+    const lastSelected = selectedIndices[selectedIndices.length - 1];
+    pushUndo();
+    words[lastSelected].breakAfter = (words[lastSelected].breakAfter ?? 0) + 1;
+    renderTranscript(words);
+    updateEditButtonStates();
+  }
+  return;
+}
 });
 
 btnSaveEdl.addEventListener("click", async () => {
@@ -2082,3 +2338,6 @@ const WORD_REGION_COLOR = getCssVar(
   "--word-region-color",
   "rgba(255, 200, 0, 0.35)"
 );
+
+// Initialize drag selection global mouseup handler
+initializeDragEnd();

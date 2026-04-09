@@ -196,10 +196,13 @@ ipcMain.handle(
     spec?: TranscribeSpec
   ) => {
     function getPythonPath() {
-      const venvPython = path.join(repoRoot, ".venv", "bin", "python3");
+      const venvPython = process.platform === "win32"
+      ? path.join(repoRoot, ".venv", "Scripts", "python.exe")
+      : path.join(repoRoot, ".venv", "bin", "python3");
+  
       if (fs.existsSync(venvPython)) return venvPython;
-      return "python3";
-    }
+      return process.platform === "win32" ? "python" : "python3";
+}
 
     // Run from the repo root so "python -m otter_py.transcribe" works.
     const cwd = repoRoot;
