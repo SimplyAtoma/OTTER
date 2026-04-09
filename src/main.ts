@@ -557,6 +557,10 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
 
   if (result.canceled || !result.filePath) return null;
 
+  // Build ffmpeg filter_complex:
+  //   [0]atrim=start=S0:end=E0,asetpts=PTS-STARTPTS[a0];
+  //   [0]atrim=start=S1:end=E1,asetpts=PTS-STARTPTS[a1];
+  //   [a0][a1]concat=n=2:v=0:a=1[out]
   const sourceFile = edl.sourceFile;
   const filterParts: string[] = [];
   const concatInputs: string[] = [];

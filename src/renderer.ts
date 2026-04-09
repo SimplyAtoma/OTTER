@@ -753,6 +753,7 @@ function updateDeletedRegions() {
 const transcriptEl = mustGetEl<HTMLDivElement>("transcript");
 const btnChoose = mustGetEl<HTMLButtonElement>("btnChoose");
 const btnTranscribe = mustGetEl<HTMLButtonElement>("btnTranscribe");
+const chkFastMode = mustGetEl<HTMLInputElement>("chkFastMode");
 const btnPause = mustGetEl<HTMLButtonElement>("btnPause");
 const btnStop = mustGetEl<HTMLButtonElement>("btnStop");
 const statusEl = mustGetEl<HTMLDivElement>("status");
@@ -1541,7 +1542,12 @@ btnTranscribe.addEventListener("click", async () => {
     progressEl.hidden = false;
     setTranscribingState(true);
 
-    const result = await otter.transcribeAudio(audioPath, getActiveSpecArg());
+    let specArg = getActiveSpecArg();
+    if (chkFastMode.checked && !chkCustomSpec.checked) {
+      specArg = { mode: "file", name: "fast_spec.json" };
+    }
+
+    const result = await otter.transcribeAudio(audioPath, specArg);
     words = Array.isArray(result) ? result : (result.words || []);
     const lang = Array.isArray(result) ? undefined : result.language;
     const langSuffix = lang ? `, lang=${lang}` : "";

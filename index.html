@@ -29,6 +29,12 @@
       <button id="btnLoadEdl" title="Load EDL from file">Load EDL</button>
       <button id="btnSaveEdits" disabled title="Export edited audio to new file">Save Edits</button>
 
+      <label class="fastModeLabel" title="Use a smaller, faster model for quicker results (less accurate)">
+        <input type="checkbox" id="chkFastMode" />
+        Fast Mode
+        <span class="fastModeWarning" title="Fast mode uses a smaller model and may produce less accurate results">⚠</span>
+      </label>
+
       <div class="statusArea">
         <div id="status"></div>
         <progress id="transcribeProgress" value="0" max="100" hidden></progress>
