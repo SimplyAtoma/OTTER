@@ -753,7 +753,6 @@ function updateDeletedRegions() {
 const transcriptEl = mustGetEl<HTMLDivElement>("transcript");
 const btnChoose = mustGetEl<HTMLButtonElement>("btnChoose");
 const btnTranscribe = mustGetEl<HTMLButtonElement>("btnTranscribe");
-const chkFastMode = mustGetEl<HTMLInputElement>("chkFastMode");
 const btnPause = mustGetEl<HTMLButtonElement>("btnPause");
 const btnStop = mustGetEl<HTMLButtonElement>("btnStop");
 const statusEl = mustGetEl<HTMLDivElement>("status");
@@ -1542,12 +1541,7 @@ btnTranscribe.addEventListener("click", async () => {
     progressEl.hidden = false;
     setTranscribingState(true);
 
-    let specArg = getActiveSpecArg();
-    if (chkFastMode.checked && !chkCustomSpec.checked) {
-      specArg = { mode: "file", name: "fast_spec.json" };
-    }
-
-    const result = await otter.transcribeAudio(audioPath, specArg);
+    const result = await otter.transcribeAudio(audioPath, getActiveSpecArg());
     words = Array.isArray(result) ? result : (result.words || []);
     const lang = Array.isArray(result) ? undefined : result.language;
     const langSuffix = lang ? `, lang=${lang}` : "";
@@ -1674,12 +1668,22 @@ otter.onTranscribeProgress((pct: number) => {
 
 // Friendly display names for known spec files; unknown files fall back to their filename.
 const SPEC_FRIENDLY_LABELS: Record<string, string> = {
-  "fw.json":          "Quick",
-  "fw_cwt.json":      "Standard",
-  "fw_asw_cwt.json":  "Accurate",
-  "default_spec.json":"Best Quality",
-  "wx_asw_cwt.json":  "Best Quality (alt)",
+  "fast_spec.json":   "Fastest (tiny model)",
+  "fw.json":          "Fast (no cleanup)",
+  "fw_cwt.json":      "Balanced",
+  "fw_asw_cwt.json":  "Refined",
+  "default_spec.json":"Best (WhisperX)",
+  "wx_asw_cwt.json":  "Best (WhisperX alt)",
 };
+
+const SPEC_ORDER: string[] = [
+  "fast_spec.json",
+  "fw.json",
+  "fw_cwt.json",
+  "fw_asw_cwt.json",
+  "default_spec.json",
+  "wx_asw_cwt.json",
+];
 
 const specSelect = mustGetEl<HTMLSelectElement>("modeSelect");
 const chkCustomSpec = mustGetEl<HTMLInputElement>("chkCustomSpec");
@@ -1723,7 +1727,12 @@ async function populateSpecSelect() {
   const files = await otter.listSpecFiles();
 
   specSelect.innerHTML = "";
-  for (const f of files) {
+  const sorted = [...files].sort((a, b) => {
+    const ai = SPEC_ORDER.indexOf(a);
+    const bi = SPEC_ORDER.indexOf(b);
+    return (ai === -1 ? Infinity : ai) - (bi === -1 ? Infinity : bi);
+  });
+  for (const f of sorted) {
     const opt = document.createElement("option");
     opt.value = f;
     opt.textContent = SPEC_FRIENDLY_LABELS[f] ?? f;
