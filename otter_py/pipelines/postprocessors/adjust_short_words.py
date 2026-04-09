@@ -66,7 +66,7 @@ def adjust_short_words(
         duration = w["end"] - w["start"]
 
         if duration < max_len:
-            dbg(f"adjust_short_words: adjusting '{w['word']}' {duration:.3f}s → {w['start']:.3f}", DebugLevel.VERBOSE)
+            dbg(f"adjust_short_words: adjusting '{w['word']}' {duration:.3f}s → {w['start']:.3f}", DebugLevel.DETAIL)
             target_duration = max(max_len, min_extend)
             extend = target_duration - duration
             new_start = max(w["start"] - extend, prev["end"])
