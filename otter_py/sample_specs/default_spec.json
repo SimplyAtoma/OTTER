@@ -7,7 +7,7 @@
       "compute_type": "int8"
     }
   },
-  "post": [
+  "postprocessors": [
     {
       "id": "clean_word_timings",
       "opts": {
@@ -16,10 +16,12 @@
     },
     {
       "id": "filter_fillers",
-      "opts": {}
+      "opts": {
+        "min_conf": 0.10
+      }
     },
     {
-      "id": "filter_low_confidence",
+      "id": "filter_low_confidence_words",
       "opts": {
         "min_conf": 0.4
       }

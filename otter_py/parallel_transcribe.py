@@ -11,15 +11,15 @@ Only used when audio exceeds a minimum duration threshold (default: 20 min).
 from __future__ import annotations
 
 import concurrent.futures
-import math
 import os
-import sys
 from typing import Any, Dict, List, Optional, Tuple
-from contextlib import redirect_stdout
+
 import numpy as np
 import whisperx
 
-from otter_py.util import eprint
+from otter_py.exceptions import TranscriptionCancelled
+from otter_py.otter_debug import DebugLevel, dbg
+from otter_py.util import call_ctx_checkpoint, eprint, validate_audio_input_path
 
 Word = Dict[str, Any]
 
@@ -37,11 +37,11 @@ def _transcribe_chunk(
     compute_type: str,
     language: Optional[str],
     batch_size: int,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     Worker function: runs in a separate process.
     Loads its own model instance and transcribes one chunk.
-    Returns segments with times offset by chunk_start.
+    Returns segments with times offset by chunk_start, plus ASR-detected language (if any).
     """
     model = whisperx.load_model(
         model_name,
@@ -49,11 +49,9 @@ def _transcribe_chunk(
         compute_type=compute_type,
         vad_method="silero",
     )
-    import sys, os 
-    sys.stdout = open(os.devnull, 'w')  # suppress model loading logs
     result = model.transcribe(chunk, batch_size=batch_size, language=language)
     segments = result.get("segments", []) or []
-    detected_lang = result.get("language", language)
+    detected_lang = result.get("language")
 
     # Offset all timestamps by chunk start
     for seg in segments:
@@ -159,113 +157,133 @@ def transcribe_parallel(
 
     Splits audio into chunks, transcribes in parallel, merges and aligns.
     """
-    with redirect_stdout(sys.stderr):
-        progress_cb = ctx.get("progress") if callable(ctx.get("progress")) else None
+    progress_cb = ctx.get("progress") if callable(ctx.get("progress")) else None
 
-        def emit(p: int) -> None:
-            if progress_cb:
-                progress_cb(max(0, min(100, int(p))))
-
-        model_name = str(opts.get("model", "base"))
-        device = str(opts.get("device", "cpu"))
-        compute_type = str(opts.get("compute_type", "int8"))
-        language: Optional[str] = opts.get("language", None)
-        batch_size = int(opts.get("batch_size", 4))
-        align_model_override: Optional[str] = opts.get("align_model", None)
-        # Use fewer workers on CPU to avoid memory exhaustion
-        max_workers = int(opts.get("max_workers", 2 if device == "cpu" else 4))
-
-        emit(0)
-        audio = whisperx.load_audio(audio_path)
-        emit(5)
-
-        chunks = _split_audio(audio, chunk_s, overlap_s)
-        eprint(f"INFO:parallel: splitting into {len(chunks)} chunks")
-
-        # Transcribe chunks in parallel
-        all_segments: List[List[Dict]] = [None] * len(chunks)
-        progress_per_chunk = 60 / len(chunks)
-        detected_lang = []
-
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    _transcribe_chunk,
-                    chunk, start,
-                    model_name, device, compute_type,
-                    language, batch_size,
-                ): i
-                for i, (chunk, start) in enumerate(chunks)
-            }
-            completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                i = futures[future]
-                try:
-                    seg, lang = future.result()
-                    all_segments[i] = seg
-                    if lang :
-                        detected_lang.append(lang)
-                except Exception as e:
-                    eprint(f"ERROR:parallel chunk {i} failed: {e}")
-                    all_segments[i] = []
-                completed += 1
-                emit(5 + int(completed * progress_per_chunk))
-
-        emit(65)
-
-        # Merge all segments in order
-        merged_segments = []
-        for segs in all_segments:
-            merged_segments.extend(segs or [])
-        merged_segments.sort(key=lambda s: s.get("start", 0))
-
-        # Detect language from first successful chunk if not specified
-        from collections import Counter
-        detected_lang = language or (
-            Counter(detected_lang).most_common(1)[0][0] if detected_lang else None
-        )
-        if not detected_lang:
-            raise RuntimeError("Could not detect language from any chunk.")
-
-        emit(70)
-
-        # Align merged segments
+    def emit(p: int) -> None:
+        if not progress_cb:
+            return
         try:
-            words = _align_segments(
-                merged_segments, audio, detected_lang,
-                device, align_model_override,
-            )
-        except Exception as e:
-            eprint(f"WARN:alignment failed ({e}), using segment-level words")
-            words = []
-            for seg in merged_segments:
-                for w in seg.get("words", []):
-                    if "word" in w:
-                        words.append({
-                            "word": w["word"],
-                            "start": float(w.get("start", seg["start"])),
-                            "end": float(w.get("end", seg["end"])),
-                        })
+            progress_cb(max(0, min(100, int(p))))
+        except Exception as ex:
+            dbg(f"progress callback failed: {ex}", DebugLevel.WARNING)
 
-        emit(90)
+    model_name = str(opts.get("model", "base"))
+    device = str(opts.get("device", "cpu"))
+    compute_type = str(opts.get("compute_type", "int8"))
+    language: Optional[str] = opts.get("language", None)
+    try:
+        batch_size = int(opts.get("batch_size", 4))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"transcriber opts['batch_size'] must be an integer, got {opts.get('batch_size')!r}"
+        ) from e
+    align_model_override: Optional[str] = opts.get("align_model", None)
+    # Use fewer workers on CPU to avoid memory exhaustion
+    max_workers = int(opts.get("max_workers", 2 if device == "cpu" else 4))
 
-        # Deduplicate words from overlapping regions
-        words.sort(key=lambda w: w.get("start", 0))
-        words = _deduplicate_words(words, overlap_s)
+    emit(0)
+    validate_audio_input_path(audio_path)
+    audio = whisperx.load_audio(audio_path)
+    emit(5)
 
-        emit(100)
+    chunks = _split_audio(audio, chunk_s, overlap_s)
+    eprint(f"INFO:parallel: splitting into {len(chunks)} chunks")
+    call_ctx_checkpoint(ctx)
 
-        meta = {
-            "engine": "whisperx_parallel",
-            "model": model_name,
-            "device": device,
-            "compute_type": compute_type,
-            "language": detected_lang,
-            "chunks": len(chunks),
-            "chunk_s": chunk_s,
-            "overlap_s": overlap_s,
-            "max_workers": max_workers,
-            "words": len(words),
+    # Transcribe chunks in parallel
+    executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+    cancel_fast = False
+    try:
+        futures = {
+            executor.submit(
+                _transcribe_chunk,
+                chunk, start,
+                model_name, device, compute_type,
+                language, batch_size,
+            ): i
+            for i, (chunk, start) in enumerate(chunks)
         }
+        chunk_results: List[
+            Optional[Tuple[List[Dict[str, Any]], Optional[str]]]
+        ] = [None] * len(chunks)
+        completed = 0
+        progress_per_chunk = 60 / max(len(chunks), 1)
+        for future in concurrent.futures.as_completed(futures):
+            i = futures[future]
+            try:
+                chunk_results[i] = future.result()
+            except Exception as e:
+                eprint(f"ERROR:parallel chunk {i} failed: {e}")
+                chunk_results[i] = ([], None)
+            completed += 1
+            call_ctx_checkpoint(ctx)
+            emit(5 + int(completed * progress_per_chunk))
+    except TranscriptionCancelled:
+        cancel_fast = True
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if not cancel_fast:
+            executor.shutdown(wait=True)
 
-        return words, meta
+    emit(65)
+
+    # Merge all segments in order; collect ASR language from chunk results (not segment dicts)
+    merged_segments: List[Dict[str, Any]] = []
+    detected_lang_from_chunks: Optional[str] = None
+    for data in chunk_results:
+        if not data:
+            continue
+        segs, lang = data
+        merged_segments.extend(segs or [])
+        if detected_lang_from_chunks is None and lang:
+            detected_lang_from_chunks = lang
+    merged_segments.sort(key=lambda s: s.get("start", 0))
+
+    detected_lang = language or detected_lang_from_chunks
+    if not detected_lang:
+        raise RuntimeError("Could not detect language from any chunk.")
+
+    emit(70)
+
+    # Align merged segments
+    call_ctx_checkpoint(ctx)
+    try:
+        words = _align_segments(
+            merged_segments, audio, detected_lang,
+            device, align_model_override,
+        )
+    except Exception as e:
+        eprint(f"WARN:alignment failed ({e}), using segment-level words")
+        words = []
+        for seg in merged_segments:
+            for w in seg.get("words", []):
+                if "word" in w:
+                    words.append({
+                        "word": w["word"],
+                        "start": float(w.get("start", seg["start"])),
+                        "end": float(w.get("end", seg["end"])),
+                    })
+
+    emit(90)
+
+    # Deduplicate words from overlapping regions
+    words.sort(key=lambda w: w.get("start", 0))
+    words = _deduplicate_words(words, overlap_s)
+
+    emit(100)
+
+    meta = {
+        "engine": "whisperx_parallel",
+        "model": model_name,
+        "device": device,
+        "compute_type": compute_type,
+        "language": detected_lang,
+        "chunks": len(chunks),
+        "chunk_s": chunk_s,
+        "overlap_s": overlap_s,
+        "max_workers": max_workers,
+        "words": len(words),
+    }
+
+    return words, meta

@@ -59,6 +59,11 @@ type TranscriptResult =
       [key: string]: unknown;
     };
 
+/** Returned when the user stops transcription or the engine reports cancellation. */
+type TranscribeCancelled = { cancelled: true };
+
+type TranscribeAudioResult = TranscriptResult | TranscribeCancelled;
+
 type TranscribeSpec =
   | { mode: "file"; name: string }
   | { mode: "json"; jsonText: string };
@@ -117,7 +122,7 @@ type EdlV1Entry = {
 
 type OtterApi = {
   chooseAudioFile: () => Promise<string | null>;
-  transcribeAudio: (audioPath: string, spec?: TranscribeSpec) => Promise<TranscriptResult>;
+  transcribeAudio: (audioPath: string, spec?: TranscribeSpec) => Promise<TranscribeAudioResult>;
   onTranscribeLog: (cb: (msg: string) => void) => void;
   probeAudio: (audioPath: string) => Promise<{ start_time: number; sample_rate: number | null }>;
   onTranscribeProgress: (cb: (pct: number) => void) => void;
@@ -800,23 +805,6 @@ function setTranscribingState(active: boolean) {
     btnPause.textContent = "⏸ Pause";
   }
 }
-
-transcriptEl.addEventListener("dragover", (event: DragEvent) => {
-  if (dragMoveSourceIndices.length === 0) return;
-  if ((event.target as HTMLElement).closest(".word")) return;
-  event.preventDefault();
-  clearDropIndicators();
-});
-
-transcriptEl.addEventListener("drop", (event: DragEvent) => {
-  if (dragMoveSourceIndices.length === 0) return;
-  if ((event.target as HTMLElement).closest(".word")) return;
-  event.preventDefault();
-  clearDropIndicators();
-  moveCurrentSelection(words.length);
-  dragMoveSourceIndices = [];
-  transcriptEl.classList.remove("dragging-words");
-});
 
 function normalizeRange(a: number, b: number) {
   return a <= b ? { start: a, end: b } : { start: b, end: a };
@@ -1748,7 +1736,7 @@ btnTranscribe.addEventListener("click", async () => {
   if (!audioPath) return;
   resetEditedPreviewState();
   btnTranscribe.disabled = true;
-  setStatus("Preparing to transcribe...", "info");
+  setStatus("Starting transcription...", "working");
   appendLog("\n=== Transcription started ===\n");
 
   try {
@@ -1758,8 +1746,13 @@ btnTranscribe.addEventListener("click", async () => {
     setTranscribingState(true);
 
     const result = await otter.transcribeAudio(audioPath, getActiveSpecArg());
-    words = Array.isArray(result) ? result : (result.words || []);
-    const lang = Array.isArray(result) ? undefined : result.language;
+    if (result && typeof result === "object" && "cancelled" in result && result.cancelled) {
+      setStatus("Transcription cancelled.", "info");
+      return;
+    }
+    const transcript: TranscriptResult = result as TranscriptResult;
+    words = Array.isArray(transcript) ? transcript : (transcript.words || []);
+    const lang = Array.isArray(transcript) ? undefined : transcript.language;
     const langSuffix = lang ? `, lang=${lang}` : "";
     setStatus(`Transcript ready (${words.length} words${langSuffix})`, "success");
 
@@ -1774,7 +1767,7 @@ btnTranscribe.addEventListener("click", async () => {
     }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("cancelled")) {
+    if (msg.toLowerCase().includes("cancelled")) {
       setStatus("Transcription cancelled.", "info");
     } else {
       setStatus("Transcription failed (see logs).", "error");

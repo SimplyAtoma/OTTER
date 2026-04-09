@@ -7,15 +7,17 @@ Key behaviors:
 - Returns a word list: [{"word": str, "start": float, "end": float}, ...]
 - Emits progress updates (0..100) if ctx contains a callable: ctx["progress"](pct:int)
 - Supports VAD filtering and configurable model/device/compute_type
-- Optionally caches WhisperModel instances in ctx to avoid reloading between runs
+- Caches WhisperModel instances in a module-level LRU (see otter_py.model_cache)
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple, Optional
 
-from otter_py.pipeline_registry import register_transcriber
+from otter_py.model_cache import get_or_create
 from otter_py.otter_debug import dbg, DebugLevel
+from otter_py.pipeline_registry import register_transcriber
+from otter_py.util import call_ctx_checkpoint, validate_audio_input_path
 
 Word = Dict[str, Any]
 
@@ -69,7 +71,8 @@ def transcribe_faster_whisper(
     Args:
       audio_path: Path to audio on disk.
       opts: Transcriber options (validated by UI/schema ideally).
-      ctx: Context dict. If ctx["progress"] exists and is callable, it receives integer percent updates.
+      ctx: Context dict. ctx["progress"] receives percent updates (wraps checkpoint).
+           ctx["checkpoint"] is optional; also invoked explicitly around long-running work.
 
     Returns:
       (words, meta)
@@ -83,22 +86,46 @@ def transcribe_faster_whisper(
     device = str(opts.get("device", "cpu"))
     compute_type = str(opts.get("compute_type", "int8"))
     vad_filter = bool(opts.get("vad_filter", True))
-    beam_size = int(opts.get("beam_size", 5))
+    try:
+        beam_size = int(opts.get("beam_size", 5))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"transcriber opts['beam_size'] must be an integer, got {opts.get('beam_size')!r}"
+        ) from e
+    if not (1 <= beam_size <= 10):
+        raise ValueError(
+            f"transcriber opts['beam_size'] must be between 1 and 10, got {beam_size}"
+        )
 
     progress_cb = ctx.get("progress")
     if not callable(progress_cb):
         progress_cb = None
 
-    # Cache WhisperModel instances to avoid re-loading on each invocation (handy for experimentation).
-    # Cache is keyed by (model_name, device, compute_type).
-    cache = ctx.setdefault("_model_cache", {})
-    cache_key = (model_name, device, compute_type)
+    last_pct = -1
 
-    if cache_key in cache:
-        model = cache[cache_key]
-    else:
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        cache[cache_key] = model
+    def emit_pct(pct: int) -> None:
+        nonlocal last_pct
+        if progress_cb is None:
+            return
+        pct = max(0, min(100, int(pct)))
+        if pct == last_pct:
+            return
+        try:
+            progress_cb(pct)
+            last_pct = pct
+        except Exception as ex:
+            dbg(f"progress callback failed: {ex}", DebugLevel.WARN)
+
+    cache_key = ("faster_whisper", model_name, device, compute_type)
+
+    def load_model():
+        return WhisperModel(model_name, device=device, compute_type=compute_type)
+
+    model = get_or_create(cache_key, load_model)
+
+    validate_audio_input_path(audio_path)
+
+    call_ctx_checkpoint(ctx)
 
     # Run transcription with word timestamps enabled.
     segments, info = model.transcribe(
@@ -110,22 +137,13 @@ def transcribe_faster_whisper(
 
     total: Optional[float] = float(info.duration) if getattr(info, "duration", None) else None
     words_out: List[Word] = []
-    last_pct = -1
-
-    def emit_pct(pct: int) -> None:
-        nonlocal last_pct
-        if progress_cb is None:
-            return
-        pct = max(0, min(100, int(pct)))
-        if pct != last_pct:
-            progress_cb(pct)
-            last_pct = pct
 
     # Progress semantics:
     # - faster-whisper gives segment end-times; we approximate progress as seg.end / total duration.
     emit_pct(0)
 
     for seg in segments:
+        call_ctx_checkpoint(ctx)
         if total and getattr(seg, "end", None) is not None:
             pct = int(min(99, (float(seg.end) / total) * 100))
             emit_pct(pct)

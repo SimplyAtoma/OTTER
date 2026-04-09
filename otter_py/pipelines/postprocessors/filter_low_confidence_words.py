@@ -11,7 +11,7 @@ from otter_py.pipeline_registry import register_postprocessor, Word
 from otter_py.otter_debug import dbg, DebugLevel
 
 @register_postprocessor(
-    id="filter_low_confidence",
+    id="filter_low_confidence_words",
     label="Filter low confidence words",
     description="Removes or replaces words below a confidence threshold.",
     options_schema={

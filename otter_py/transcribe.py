@@ -15,8 +15,6 @@ Examples:
   python3 -m otter_py.transcribe list
   python3 -m otter_py.transcribe run --audio /path/to.wav --spec-file spec.json
   python3 -m otter_py.transcribe run --audio /path/to.wav --spec-json '{"transcriber": {...}, "post": [...]}'
-
-The pipeline JSON uses a top-level "post" array for post-processors (each entry: id + opts).
 """
 
 from __future__ import annotations
@@ -25,36 +23,92 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 from typing import Any, Dict, Optional
-from contextlib import redirect_stdout
+
 from pydash import get as deep_get
-from otter_py.util import eprint, _start_elapsed_timer
-from otter_py.cacheUtil import _cache_key, _cache_dir,  _load_cache, _save_cache
+from otter_py.exceptions import TranscriptionCancelled
+from otter_py.util import eprint, run_with_stdout_redirect
+from otter_py.cacheUtil import _cache_key, _cache_dir, _load_cache, _save_cache
 
-def run_with_stdout_redirect(fn):
-    """
-    Run `fn()` with stdout redirected to stderr.
 
-    Rationale:
-      Many ML/audio libraries print informational messages to stdout.
-      Our contract is that stdout is reserved for machine-readable JSON.
-      Redirecting stdout to stderr prevents accidental corruption of JSON output.
+class ControlManager:
     """
-    with redirect_stdout(sys.stderr):
-        return fn()
+    Reads JSON control messages from stdin.
 
-def _coerce_pipeline_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Canonical pipeline spec uses `post` for the ordered list of post-processors.
-    Legacy alias `postprocessors` is accepted and normalized to `post`.
-    """
-    if "postprocessors" in spec:
-        if "post" in spec:
-            raise ValueError("Provide only one of 'post' or 'postprocessors'")
-        spec = dict(spec)
-        spec["post"] = spec.pop("postprocessors")
-    return spec
+    Supported commands:
+      {"type":"pause"}
+      {"type":"resume"}
+      {"type":"cancel"}
 
+    Exposes cooperative control methods:
+      - wait_if_paused()
+      - throw_if_cancelled()
+      - checkpoint()
+    """
+
+    def __init__(self) -> None:
+        self._paused = threading.Event()
+        self._cancelled = threading.Event()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+
+    def _reader_loop(self) -> None:
+        try:
+            for raw in sys.stdin:
+                line = raw.strip()
+                if not line:
+                    continue
+
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    eprint(f"WARN:invalid control message: {line}")
+                    continue
+
+                kind = msg.get("type")
+
+                if kind == "pause":
+                    self._paused.set()
+                    eprint("CONTROL:PAUSED")
+                elif kind == "resume":
+                    self._paused.clear()
+                    eprint("CONTROL:RESUMED")
+                elif kind == "cancel":
+                    self._cancelled.set()
+                    self._paused.clear()
+                    eprint("CONTROL:CANCELLING")
+                    return
+                elif kind == "ping":
+                    eprint("CONTROL:PONG")
+                else:
+                    eprint(f"WARN:unknown control type: {kind}")
+        except Exception as ex:
+            eprint(f"WARN:control loop ended unexpectedly: {type(ex).__name__}:{ex}")
+
+    def wait_if_paused(self) -> None:
+        while self._paused.is_set():
+            if self._cancelled.is_set():
+                raise TranscriptionCancelled("Transcription cancelled while paused")
+            time.sleep(0.1)
+
+    def throw_if_cancelled(self) -> None:
+        if self._cancelled.is_set():
+            raise TranscriptionCancelled("Transcription cancelled")
+
+    def checkpoint(self) -> None:
+        self.throw_if_cancelled()
+        self.wait_if_paused()
+        self.throw_if_cancelled()
+
+    def progress_wrapper(self, fn):
+        """Emit progress without checkpointing — avoids TranscriptionCancelled in bridge threads."""
+
+        def wrapped(pct: int) -> None:
+            fn(pct)
+
+        return wrapped
 
 def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, Any]:
     """Load the pipeline spec from a JSON string or file."""
@@ -63,10 +117,10 @@ def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, A
 
     if spec_file:
         with open(spec_file, "r", encoding="utf-8") as f:
-            return _coerce_pipeline_spec(json.load(f))
+            return json.load(f)
 
     if spec_json:
-        return _coerce_pipeline_spec(json.loads(spec_json))
+        return json.loads(spec_json)
 
     raise ValueError("Missing pipeline spec. Provide --spec-json or --spec-file")
 
@@ -74,17 +128,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="OTTER PoC transcription pipeline runner")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_list = sub.add_parser("list", help="List available transcribers and post-processors")
+    sub.add_parser("list", help="List available transcribers and post-processors")
 
     p_run = sub.add_parser("run", help="Run a pipeline spec on an audio file")
     p_run.add_argument("--audio", required=True, help="Path to input audio file")
     p_run.add_argument("--spec-json", help="Pipeline spec as JSON string")
     p_run.add_argument("--spec-file", help="Path to pipeline spec JSON file")
     p_run.add_argument("--no-cache", action="store_true", help="Skip cache and overwrite cached result")
-    p_clear = sub.add_parser("clear-cache", help="Delete all cached results (for testing/debugging)") 
-
-    # Optional: let Electron ask for meta too (debug)
     p_run.add_argument("--emit-meta", action="store_true", help="Emit {words, meta} instead of just words[]")
+
+    sub.add_parser("clear-cache", help="Delete all cached results (for testing/debugging)")
+
 
     args = parser.parse_args(argv)
 
@@ -104,6 +158,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "run":
+        eprint(f"PROGRESS:0")
+        eprint("INFO:Initializing pipeline components...")
         from otter_py.pipeline_registry import load_components, run_pipeline
         load_components()  # ensure components are loaded before running
         try:
@@ -116,18 +172,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not os.path.exists(audio_path):
             eprint(f"ERROR:FileNotFoundError:Audio file not found: {audio_path}")
             return 1
+        controller = ControlManager()
 
         # Progress callback for Electron:
         # - emit "PROGRESS:NN" lines to stderr (easy to parse, keeps stdout clean)
+        # - may be invoked from worker threads inside transcribers; must stay fast.
+        # - repeating the same NN does not update HTML <progress> in Chromium; bridges
+        #   in whisperx_vad oscillate slightly when saturated so the bar still repaints.
         def progress(pct: int) -> None:
             eprint(f"PROGRESS:{pct}")
 
-        ctx: Dict[str, Any] = {"progress": progress}
+        ctx: Dict[str, Any] = {
+            "progress": controller.progress_wrapper(progress),
+            "control": controller,
+            "checkpoint": controller.checkpoint,
+            "wait_if_paused": controller.wait_if_paused,
+            "throw_if_cancelled": controller.throw_if_cancelled,
+        }
+
         cache_key = _cache_key(audio_path, spec)
         cached = None if args.no_cache else _load_cache(cache_key)
         # Run the pipeline with stdout redirected to stderr so that any library
         # chatter (e.g. WhisperX notices) can't corrupt our JSON output channel.
         if cached is not None:
+            controller.checkpoint()
             eprint("INFO:cache hit, skipping pipeline execution")
             result = cached
         else:
@@ -138,11 +206,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 eprint(f"INFO:audio duration is {duration:.2f} seconds")
             except Exception:
                 duration = 0
-            PARALLEL_THRESHOLD =  20 * 60 # seconds; if audio is longer than this, warn about potential parallel execution
+            PARALLEL_THRESHOLD = 20 * 60  # seconds; if audio is longer than this, may use parallel path
             use_parallel = duration > PARALLEL_THRESHOLD
-            timer = _start_elapsed_timer()
+            t_id = (spec.get("transcriber") or {}).get("id")
+            if use_parallel and t_id != "whisperx_vad":
+                eprint(
+                    f"WARN: parallel transcription is only implemented for transcriber "
+                    f"'whisperx_vad'; got {t_id!r}. Using single-process pipeline."
+                )
+                use_parallel = False
 
             try:
+                controller.checkpoint()
+
                 if use_parallel:
                     from otter_py.parallel_transcribe import transcribe_parallel
                     eprint(f"INFO:audio duration exceeds {PARALLEL_THRESHOLD/60:.0f} minutes, enabling parallel execution (if supported by transcriber)")
@@ -150,19 +226,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                     import time
 
                     t_opts =(spec.get("transcriber") or {}).get("opts") or {}
+
+                    controller.checkpoint()
                     words, t_meta = run_with_stdout_redirect(
                         lambda: transcribe_parallel(audio_path=audio_path, opts=t_opts, ctx=ctx)
                     )
 
                     post_meta = []
-                    for post_spec in spec.get("post") or []:
+                    post_specs = spec.get("post")
+                    if post_specs is None:
+                        post_specs = spec.get("postprocessors") or []
+                    for post_spec in post_specs:
                         p_id = post_spec.get("id")
                         p_opts = post_spec.get("opts") or {}
                         if p_id and p_id in _POSTS:
                             eprint(f"INFO:running post-processor {p_id} with opts {p_opts}")
                             p0 = time.time()
                             words, p_meta = run_with_stdout_redirect(
-                                lambda: _POSTS[p_id]["fn"](words,p_opts,ctx))
+                                lambda w=words, pid=p_id, opts=p_opts: _POSTS[pid]["fn"](
+                                    w, opts, ctx
+                                )
+                            )
                             post_meta.append({
                                 "id": p_id, 
                                 "opts": p_opts, 
@@ -181,16 +265,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                         }
                     }
                 else:
+                    controller.checkpoint()
                     result = run_with_stdout_redirect(
                         lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
                     )
+            except TranscriptionCancelled as e:
+                eprint(f"INFO:cancelled:{e}")
+                json.dump({"error": "Cancelled", "message": str(e)}, sys.stdout)
+                sys.stdout.write("\n")
+                return 2
             except Exception as e:
                 eprint(f"ERROR:{type(e).__name__}:{e}")
                 json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
                 sys.stdout.write("\n")
                 return 1
-            finally:
-                timer.set()  # stop the elapsed timer thread
+            controller.checkpoint()
             _save_cache(cache_key, result)
 
         # Emit machine-readable JSON ONLY on stdout (no extra logs, progress, or library chatter).
@@ -201,8 +290,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 language = "unknown"
             result.pop("meta", None)
             result["language"] = language
+        
         json.dump(result, sys.stdout)
-
         sys.stdout.write("\n")
         return 0
 
