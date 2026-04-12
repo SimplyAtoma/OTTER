@@ -88,6 +88,7 @@ type PieceEntry = {
   word: string;
   sourceStart: number;
   sourceEnd: number;
+  breakAfter?: number;
 };
 
 type Piece = {
@@ -265,6 +266,7 @@ function buildPieceTableFromTranscript(
     word: w.word,
     sourceStart: w.start,
     sourceEnd: w.end,
+    breakAfter: w.breakAfter,
   }));
 
   return {
@@ -367,6 +369,14 @@ function performRedo(): boolean {
   undoStack.push(snapshotState(pieceTable));
   restoreSnapshot(pieceTable, redoStack.pop()!);
   return true;
+}
+
+function syncBreakAfterToPieceTable(): void {
+  if (!pieceTable) return;
+  const viewEntries = getViewEntries(pieceTable);
+  for (let i = 0; i < viewEntries.length && i < words.length; i++) {
+    viewEntries[i].entry.breakAfter = words[i].breakAfter;
+  }
 }
 
 function syncWordsFromPieceTable(): void {
@@ -2200,6 +2210,7 @@ btnSaveEdl.addEventListener("click", async () => {
   if (!pieceTable) return;
 
   try {
+    syncBreakAfterToPieceTable();
     const payload = { version: 2, pieceTable };
     const json = JSON.stringify(payload, null, 2);
     const savedPath = await otter.saveEdl(json);
@@ -2242,6 +2253,7 @@ btnLoadEdl.addEventListener("click", async () => {
       word: ve.entry.word,
       start: ve.entry.sourceStart,
       end: ve.entry.sourceEnd,
+      breakAfter: ve.entry.breakAfter,
     }));
 
     // Load the source audio waveform
