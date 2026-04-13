@@ -3,200 +3,175 @@
   display: flex;
   flex-direction: column;
   justify-content: center;
-  padding: 140px 24px 80px;
+  padding: 140px 32px 80px;
   position: relative;
   overflow: hidden;
 }
 
-/* ── Grid background ── */
+/* Fine grid background */
 .hero__grid {
   position: absolute;
   inset: 0;
   background-image:
     linear-gradient(var(--border) 1px, transparent 1px),
     linear-gradient(90deg, var(--border) 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black 30%, transparent 80%);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 20%, transparent 80%);
 }
 
-/* ── Glow orb ── */
+/* Subtle warm glow */
 .hero__orb {
   position: absolute;
-  top: -160px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 700px;
-  height: 700px;
+  top: -200px; left: 50%; transform: translateX(-50%);
+  width: 800px; height: 800px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(245,166,35,0.1) 0%, transparent 70%);
+  background: radial-gradient(circle, rgba(233,128,116,0.07) 0%, transparent 65%);
   pointer-events: none;
 }
 
-/* ── Content ── */
 .hero__content {
-  max-width: 820px;
+  max-width: 860px;
   margin: 0 auto;
   text-align: center;
   position: relative;
   z-index: 1;
 }
 
-.hero__badge {
-  margin-bottom: 28px;
-}
-
+.hero__badge { margin-bottom: 32px; }
 .hero__badge-dot {
-  width: 6px;
-  height: 6px;
+  width: 5px; height: 5px;
   border-radius: 50%;
-  background: var(--amber);
-  animation: pulse-amber 2s ease-in-out infinite;
+  background: var(--terra);
+  animation: pulse-terra 2.2s ease-in-out infinite;
 }
 
 .hero__title {
   font-family: var(--font-display);
-  font-size: clamp(3rem, 9vw, 6rem);
-  font-weight: 800;
-  line-height: 1.05;
+  font-size: clamp(3.5rem, 10vw, 7rem);
+  font-weight: 300;
+  font-style: italic;
+  line-height: 1.0;
   color: var(--text-hi);
-  margin-bottom: 28px;
-  letter-spacing: -0.02em;
+  margin-bottom: 8px;
+  letter-spacing: -0.01em;
 }
-
-.hero__title-accent {
-  color: var(--amber);
-  position: relative;
+.hero__title-sub {
+  font-family: var(--font-mono);
+  font-size: clamp(0.65rem, 1.5vw, 0.8rem);
+  font-weight: 400;
+  font-style: normal;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--text-lo);
+  display: block;
+  margin-bottom: 36px;
 }
+.hero__title-accent { color: var(--terra); font-style: italic; }
 
 .hero__subtitle {
-  font-size: clamp(1rem, 2vw, 1.15rem);
+  font-size: clamp(0.9rem, 1.8vw, 1.05rem);
   color: var(--text-mid);
-  line-height: 1.8;
-  margin-bottom: 40px;
-  max-width: 640px;
+  line-height: 1.9;
+  margin-bottom: 44px;
+  max-width: 580px;
   margin-left: auto;
   margin-right: auto;
+  font-weight: 300;
 }
-
-.hero__subtitle strong {
-  color: var(--text-hi);
-  font-weight: 500;
-}
+.hero__subtitle strong { color: var(--text-hi); font-weight: 500; }
 
 .hero__actions {
-  display: flex;
-  gap: 16px;
-  justify-content: center;
-  flex-wrap: wrap;
-  margin-bottom: 64px;
+  display: flex; gap: 16px;
+  justify-content: center; flex-wrap: wrap;
+  margin-bottom: 72px;
 }
 
-/* ── Waveform ── */
+/* ── Waveform card ── */
 .hero__waveform {
-  background: var(--ink-mid);
-  border: 1px solid var(--border-hi);
+  background: var(--surface-hi);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 20px 24px 16px;
-  max-width: 720px;
+  padding: 22px 28px 18px;
+  max-width: 680px;
   margin: 0 auto;
-  box-shadow: var(--shadow-card), var(--shadow-glow);
+  box-shadow: var(--shadow-card);
 }
-
 .hero__waveform-track {
   display: flex;
   align-items: center;
   gap: 3px;
-  height: 72px;
+  height: 64px;
   margin-bottom: 16px;
   overflow: hidden;
 }
-
 .hero__bar {
   flex: 0 0 7px;
-  border-radius: 3px;
-  background: var(--amber);
-  animation: waveform 1.8s ease-in-out infinite;
+  border-radius: 2px;
+  background: var(--terra);
+  animation: waveform 2s ease-in-out infinite;
   transform-origin: center;
 }
-
 .hero__bar:nth-child(odd) {
-  background: var(--amber-dim);
-  animation-duration: 2.2s;
+  background: var(--cream-lo);
+  animation-duration: 2.5s;
 }
-
 .hero__waveform-label {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  justify-content: center;
+  display: flex; gap: 8px;
+  align-items: center; justify-content: center;
   flex-wrap: wrap;
-  font-family: var(--font-mono);
-  font-size: 0.8rem;
-  color: var(--text-mid);
+  font-family: var(--font-mono); font-size: 0.75rem;
+  color: var(--text-lo);
   border-top: 1px solid var(--border);
   padding-top: 14px;
 }
-
 .hero__transcript-word {
-  padding: 2px 6px;
-  border-radius: 4px;
+  padding: 2px 7px;
+  border-radius: 3px;
   transition: all 0.2s;
+  color: var(--text-mid);
 }
-
 .hero__transcript-word--active {
-  background: var(--amber);
-  color: var(--ink);
-  font-weight: 600;
+  background: var(--terra);
+  color: #fff;
+  font-weight: 500;
 }
-
 .hero__cursor {
   display: inline-block;
-  width: 2px;
-  height: 14px;
-  background: var(--amber);
+  width: 1.5px; height: 13px;
+  background: var(--terra);
   border-radius: 1px;
   animation: blink-cursor 1s ease-in-out infinite;
 }
 
-/* ── Stats ── */
+/* ── Stats strip ── */
 .hero__stats {
-  display: flex;
-  justify-content: center;
-  gap: 0;
+  display: flex; justify-content: center;
   flex-wrap: wrap;
-  max-width: 720px;
+  max-width: 680px;
   margin: 48px auto 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  position: relative;
-  z-index: 1;
+  background: var(--surface-hi);
+  position: relative; z-index: 1;
 }
-
 .hero__stat {
   flex: 1 1 140px;
   padding: 20px 24px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
+  display: flex; flex-direction: column;
+  align-items: center; gap: 4px;
   border-right: 1px solid var(--border);
 }
-
 .hero__stat:last-child { border-right: none; }
-
 .hero__stat-value {
   font-family: var(--font-display);
-  font-size: 1.25rem;
-  font-weight: 800;
-  color: var(--amber);
+  font-size: 1.3rem; font-weight: 400; font-style: italic;
+  color: var(--terra-deep);
 }
-
 .hero__stat-label {
-  font-size: 0.75rem;
-  color: var(--text-lo);
-  font-family: var(--font-mono);
-  letter-spacing: 0.06em;
+  font-size: 0.68rem; color: var(--text-lo);
+  font-family: var(--font-mono); letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 
 @media (max-width: 600px) {

@@ -1,116 +1,57 @@
-.architecture {
-  border-top: 1px solid var(--border);
-}
-
+.architecture { border-top: 1px solid var(--border); }
 .architecture__layout {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 80px;
-  align-items: start;
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 80px; align-items: start;
 }
-
 .architecture__list {
-  list-style: none;
-  margin-top: 32px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  list-style: none; margin-top: 32px;
+  display: flex; flex-direction: column; gap: 12px;
 }
-
 .architecture__list li {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 0.9rem;
-  color: var(--text-mid);
-  font-family: var(--font-mono);
+  display: flex; align-items: center; gap: 12px;
+  font-size: 0.875rem; color: var(--text-mid);
+  font-family: var(--font-mono); font-weight: 400;
 }
-
 .architecture__list code {
-  font-family: var(--font-mono);
-  font-size: 0.82rem;
-  color: var(--amber);
-  background: var(--amber-glow);
-  padding: 2px 6px;
-  border-radius: 4px;
+  font-family: var(--font-mono); font-size: 0.8rem;
+  color: var(--terra-deep); background: var(--terra-glow);
+  padding: 2px 6px; border-radius: 3px;
 }
-
 .architecture__bullet {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--amber);
-  flex-shrink: 0;
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--terra); flex-shrink: 0;
 }
-
-/* ── Diagram ── */
 .architecture__diagram {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
+  display: flex; flex-direction: column; gap: 0;
 }
-
 .arch-layer {
-  padding: 18px 20px;
-  border: 1px solid var(--border);
-  border-radius: 0;
-  position: relative;
+  padding: 18px 20px; border: 1px solid var(--border); position: relative;
 }
-
 .arch-layer:first-child { border-radius: var(--radius-md) var(--radius-md) 0 0; }
 .arch-layer:last-child  { border-radius: 0 0 var(--radius-md) var(--radius-md); border-top: none; }
 .arch-layer:not(:first-child):not(:last-child) { border-top: none; }
-
-.arch-layer--amber { background: rgba(245,166,35,0.06); }
-.arch-layer--teal  { background: rgba(62,207,207,0.05); }
-.arch-layer--muted { background: var(--ink-mid); }
-
+.arch-layer--amber { background: rgba(233,128,116,0.05); }
+.arch-layer--teal  { background: rgba(142,141,138,0.06); }
+.arch-layer--muted { background: var(--surface-hi); }
 .arch-layer__label {
-  font-family: var(--font-mono);
-  font-size: 0.72rem;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-lo);
-  margin-bottom: 10px;
+  font-family: var(--font-mono); font-size: 0.68rem; font-weight: 400;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--text-lo); margin-bottom: 10px;
 }
-
-.arch-layer--amber .arch-layer__label { color: var(--amber); }
-.arch-layer--teal  .arch-layer__label { color: var(--teal); }
-
-.arch-layer__items {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
+.arch-layer--amber .arch-layer__label { color: var(--terra-deep); }
+.arch-layer--teal  .arch-layer__label { color: var(--slate); }
+.arch-layer__items { display: flex; flex-wrap: wrap; gap: 6px; }
 .arch-layer__item {
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-  color: var(--text-mid);
-  background: var(--surface);
+  font-family: var(--font-mono); font-size: 0.72rem;
+  color: var(--text-mid); background: var(--cream);
   border: 1px solid var(--border);
-  padding: 3px 10px;
-  border-radius: 100px;
+  padding: 3px 10px; border-radius: 100px;
 }
-
 .arch-layer__arrow {
-  position: absolute;
-  bottom: -14px;
-  left: 50%;
-  transform: translateX(-50%);
-  font-family: var(--font-mono);
-  font-size: 0.65rem;
-  color: var(--text-lo);
-  background: var(--ink-mid);
-  padding: 0 8px;
-  z-index: 1;
-  white-space: nowrap;
+  position: absolute; bottom: -13px; left: 50%; transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 0.62rem; color: var(--text-lo);
+  background: var(--surface-hi); padding: 0 8px; z-index: 1; white-space: nowrap;
 }
-
 @media (max-width: 860px) {
-  .architecture__layout {
-    grid-template-columns: 1fr;
-    gap: 48px;
-  }
+  .architecture__layout { grid-template-columns: 1fr; gap: 48px; }
 }

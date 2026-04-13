@@ -1,6 +1,6 @@
 /* ─────────────────────────────────────────────────────────────────
-   OTTER Design System
-   Aesthetic: Editorial dark — deep navy ink, amber accent, mono type
+   OTTER Design System  v2
+   Aesthetic: Warm editorial — cream linen, terracotta, sparse layout
    ───────────────────────────────────────────────────────────────── */
 
 *, *::before, *::after {
@@ -10,42 +10,42 @@
 }
 
 :root {
-  --ink:        #0b0e17;
-  --ink-mid:    #141828;
-  --ink-light:  #1e2538;
-  --surface:    #242d45;
-  --border:     rgba(255,255,255,0.07);
-  --border-hi:  rgba(255,255,255,0.14);
+  --cream:       #f1e0a0;
+  --cream-mid:   #f7c864;
+  --cream-lo:    #f5d3a4;
+  --surface:     #f0ede6;
+  --surface-hi:  #f7f5f0;
 
-  --amber:      #f5a623;
-  --amber-dim:  #c4831a;
-  --amber-glow: rgba(245,166,35,0.18);
+  --border:      rgba(139,118,90,0.18);
+  --border-hi:   rgba(139,118,90,0.36);
 
-  --teal:       #3ecfcf;
-  --teal-dim:   rgba(62,207,207,0.15);
+  --terra:       #e98074;
+  --terra-deep:  #e85A4F;
+  --terra-glow:  rgba(233,128,116,0.14);
 
-  --text-hi:    #eef1fa;
-  --text-mid:   #8b93b0;
-  --text-lo:    #505878;
+  --slate:       #8e8d8a;
+  --slate-dim:   rgba(142,141,138,0.2);
 
-  --font-display: 'Syne', sans-serif;
-  --font-body:    'DM Sans', sans-serif;
+  --text-hi:     #000000;
+  --text-mid:    #6b6259;
+  --text-lo:     #a09690;
+
+  --font-display: "Vast Shadow", serif;
+  --font-body:    'Jost', sans-serif;
   --font-mono:    'JetBrains Mono', monospace;
 
-  --radius-sm: 6px;
-  --radius-md: 12px;
-  --radius-lg: 20px;
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
 
-  --shadow-card: 0 2px 24px rgba(0,0,0,0.45);
-  --shadow-glow: 0 0 40px rgba(245,166,35,0.12);
+  --shadow-card: 0 2px 20px rgba(44,40,37,0.08);
+  --shadow-lift: 0 8px 32px rgba(44,40,37,0.13);
 }
 
-html {
-  scroll-behavior: smooth;
-}
+html { scroll-behavior: smooth; }
 
 body {
-  background-color: var(--ink);
+  background-color: var(--cream);
   color: var(--text-hi);
   font-family: var(--font-body);
   font-size: 16px;
@@ -54,69 +54,49 @@ body {
   overflow-x: hidden;
 }
 
-/* ── Scrollbar ── */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: var(--ink); }
-::-webkit-scrollbar-thumb { background: var(--surface); border-radius: 3px; }
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: var(--cream); }
+::-webkit-scrollbar-thumb { background: var(--cream-lo); border-radius: 3px; }
 
-/* ── Selection ── */
-::selection { background: var(--amber); color: var(--ink); }
+::selection { background: var(--terra); color: #fff; }
 
-/* ── Focus ── */
 :focus-visible {
-  outline: 2px solid var(--amber);
+  outline: 1.5px solid var(--terra);
   outline-offset: 3px;
   border-radius: var(--radius-sm);
 }
 
-/* ── Utilities ── */
 .visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
 }
 
-/* ── Animations ── */
 @keyframes fadeUp {
-  from { opacity: 0; transform: translateY(24px); }
+  from { opacity: 0; transform: translateY(20px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-
 @keyframes fadeIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
+  from { opacity: 0; } to { opacity: 1; }
 }
-
-@keyframes pulse-amber {
-  0%, 100% { box-shadow: 0 0 0 0 var(--amber-glow); }
-  50%       { box-shadow: 0 0 0 12px transparent; }
+@keyframes pulse-terra {
+  0%, 100% { box-shadow: 0 0 0 0 var(--terra-glow); }
+  50%       { box-shadow: 0 0 0 10px transparent; }
 }
-
 @keyframes waveform {
-  0%, 100% { transform: scaleY(0.3); }
+  0%, 100% { transform: scaleY(0.25); }
   50%       { transform: scaleY(1); }
 }
-
-@keyframes scroll-x {
-  0%   { transform: translateX(0); }
-  100% { transform: translateX(-50%); }
-}
-
 @keyframes blink-cursor {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0; }
+  0%, 100% { opacity: 1; } 50% { opacity: 0; }
 }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .animate-fade-up {
-  animation: fadeUp 0.6s ease forwards;
+  animation: fadeUp 0.7s cubic-bezier(0.16,1,0.3,1) forwards;
   opacity: 0;
 }
-
-.delay-1 { animation-delay: 0.1s; }
-.delay-2 { animation-delay: 0.2s; }
-.delay-3 { animation-delay: 0.3s; }
-.delay-4 { animation-delay: 0.45s; }
-.delay-5 { animation-delay: 0.6s; }
+.delay-1 { animation-delay: 0.08s; }
+.delay-2 { animation-delay: 0.18s; }
+.delay-3 { animation-delay: 0.30s; }
+.delay-4 { animation-delay: 0.44s; }
+.delay-5 { animation-delay: 0.58s; }

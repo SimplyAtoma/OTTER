@@ -1,14 +1,6 @@
-.app {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-}
+.app { min-height: 100vh; display: flex; flex-direction: column; }
+main { flex: 1; }
 
-main {
-  flex: 1;
-}
-
-/* ── Shared section styles ── */
 .section {
   padding: 96px 24px;
   max-width: 1160px;
@@ -17,53 +9,54 @@ main {
 
 .section-label {
   font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.14em;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.22em;
   text-transform: uppercase;
-  color: var(--amber);
+  color: var(--terra);
   margin-bottom: 16px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
-
 .section-label::before {
   content: '';
   display: block;
-  width: 20px;
+  width: 24px;
   height: 1px;
-  background: var(--amber);
+  background: var(--terra);
 }
 
 .section-title {
   font-family: var(--font-display);
-  font-size: clamp(2rem, 5vw, 3.2rem);
-  font-weight: 800;
+  font-size: clamp(2.4rem, 5vw, 3.8rem);
+  font-weight: 300;
+  font-style: italic;
   line-height: 1.1;
   color: var(--text-hi);
   margin-bottom: 20px;
+  letter-spacing: -0.01em;
 }
 
 .section-body {
-  font-size: 1.05rem;
+  font-size: 0.95rem;
   color: var(--text-mid);
-  max-width: 600px;
-  line-height: 1.75;
+  max-width: 560px;
+  line-height: 1.85;
+  font-weight: 300;
 }
 
 /* ── Card ── */
 .card {
-  background: var(--ink-mid);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 32px;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  transition: border-color 0.25s, box-shadow 0.25s;
 }
-
 .card:hover {
   border-color: var(--border-hi);
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--shadow-lift);
 }
 
 /* ── Badge ── */
@@ -72,28 +65,26 @@ main {
   align-items: center;
   gap: 6px;
   font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
   padding: 4px 10px;
   border-radius: 100px;
   border: 1px solid;
 }
-
 .badge-amber {
-  color: var(--amber);
-  border-color: var(--amber-dim);
-  background: var(--amber-glow);
+  color: var(--terra-deep);
+  border-color: rgba(201,96,79,0.3);
+  background: var(--terra-glow);
 }
-
 .badge-teal {
-  color: var(--teal);
-  border-color: rgba(62,207,207,0.3);
-  background: var(--teal-dim);
+  color: var(--slate);
+  border-color: rgba(142,141,138,0.4);
+  background: var(--slate-dim);
 }
-
 .badge-muted {
-  color: var(--text-mid);
+  color: var(--text-lo);
   border-color: var(--border);
   background: transparent;
 }
@@ -103,31 +94,28 @@ main {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-family: var(--font-display);
-  font-size: 0.9rem;
-  font-weight: 700;
-  padding: 12px 24px;
-  border-radius: var(--radius-md);
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 13px 28px;
+  border-radius: var(--radius-sm);
   border: none;
   cursor: pointer;
   text-decoration: none;
-  transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
-  letter-spacing: 0.02em;
+  transition: transform 0.18s, box-shadow 0.18s, background 0.18s, color 0.18s;
 }
-
-.btn:hover {
-  transform: translateY(-2px);
-}
+.btn:hover { transform: translateY(-1px); }
 
 .btn-primary {
-  background: var(--amber);
-  color: var(--ink);
-  box-shadow: 0 4px 20px rgba(245,166,35,0.35);
+  background: var(--terra);
+  color: #fff;
+  box-shadow: 0 4px 18px rgba(233,128,116,0.32);
 }
-
 .btn-primary:hover {
-  background: #f7b84a;
-  box-shadow: 0 8px 28px rgba(245,166,35,0.5);
+  background: var(--terra-deep);
+  box-shadow: 0 8px 28px rgba(201,96,79,0.38);
 }
 
 .btn-ghost {
@@ -135,14 +123,12 @@ main {
   color: var(--text-hi);
   border: 1px solid var(--border-hi);
 }
-
 .btn-ghost:hover {
-  background: var(--surface);
-  border-color: var(--amber);
-  color: var(--amber);
+  background: var(--cream-mid);
+  border-color: var(--terra);
+  color: var(--terra-deep);
 }
 
-/* ── Divider ── */
 .divider {
   border: none;
   border-top: 1px solid var(--border);
