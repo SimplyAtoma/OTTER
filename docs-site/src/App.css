@@ -75,12 +75,12 @@ main { flex: 1; }
 }
 .badge-amber {
   color: var(--terra-deep);
-  border-color: rgba(201,96,79,0.3);
+  border-color: var(--slate-dim);
   background: var(--terra-glow);
 }
 .badge-teal {
   color: var(--slate);
-  border-color: rgba(142,141,138,0.4);
+  border-color: var(--terra-glow);
   background: var(--slate-dim);
 }
 .badge-muted {
@@ -111,11 +111,11 @@ main { flex: 1; }
 .btn-primary {
   background: var(--terra);
   color: #fff;
-  box-shadow: 0 4px 18px rgba(233,128,116,0.32);
+  box-shadow: 0 4px 18px rgba(87,185,255,0.32);
 }
 .btn-primary:hover {
   background: var(--terra-deep);
-  box-shadow: 0 8px 28px rgba(201,96,79,0.38);
+  box-shadow: 0 8px 28px rgba(144,213,255,0.38);
 }
 
 .btn-ghost {
@@ -126,7 +126,7 @@ main { flex: 1; }
 .btn-ghost:hover {
   background: var(--cream-mid);
   border-color: var(--terra);
-  color: var(--terra-deep);
+  color: var(--text-hi);
 }
 
 .divider {

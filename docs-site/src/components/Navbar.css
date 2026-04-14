@@ -7,7 +7,7 @@
   border-bottom: 1px solid transparent;
 }
 .navbar--scrolled {
-  background: rgba(234,231,220,0.88);
+  background: rgba(87,185,255,0.88);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border-bottom-color: var(--border);

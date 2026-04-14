@@ -10,25 +10,25 @@
 }
 
 :root {
-  --cream:       #f1e0a0;
-  --cream-mid:   #f7c864;
-  --cream-lo:    #f5d3a4;
-  --surface:     #f0ede6;
-  --surface-hi:  #f7f5f0;
+  --cream:       #517891;
+  --cream-mid:   #77b1d4;
+  --cream-lo:    #57b9ff;
+  --surface:     #69889b;
+  --surface-hi:  #69889b;
 
-  --border:      rgba(139,118,90,0.18);
-  --border-hi:   rgba(139,118,90,0.36);
+  --border:      rgba(74, 227, 247, 0.18);
+  --border-hi:   rgba(17, 71, 89, 0.36);
 
-  --terra:       #e98074;
-  --terra-deep:  #e85A4F;
-  --terra-glow:  rgba(233,128,116,0.14);
+  --terra:       #57b9ff;
+  --terra-deep:  #77b1d4;
+  --terra-glow:  rgba(78, 202, 216, 0.14);
 
-  --slate:       #8e8d8a;
-  --slate-dim:   rgba(142,141,138,0.2);
+  --slate:       #90d5ff;
+  --slate-dim:   rgba(87,185,255,0.2);
 
-  --text-hi:     #000000;
-  --text-mid:    #6b6259;
-  --text-lo:     #a09690;
+  --text-hi:     #fff5e3;
+  --text-mid:    #3a3c2a;
+  --text-lo:     #000000;
 
   --font-display: "Vast Shadow", serif;
   --font-body:    'Jost', sans-serif;
@@ -54,7 +54,7 @@ body {
   overflow-x: hidden;
 }
 
-::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: var(--cream); }
 ::-webkit-scrollbar-thumb { background: var(--cream-lo); border-radius: 3px; }
 
