@@ -1,0 +1,102 @@
+/* ─────────────────────────────────────────────────────────────────
+   OTTER Design System  v2
+   Aesthetic: Warm editorial — cream linen, terracotta, sparse layout
+   ───────────────────────────────────────────────────────────────── */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --cream:       #517891;
+  --cream-mid:   #77b1d4;
+  --cream-lo:    #57b9ff;
+  --surface:     #69889b;
+  --surface-hi:  #69889b;
+
+  --border:      rgba(74, 227, 247, 0.18);
+  --border-hi:   rgba(17, 71, 89, 0.36);
+
+  --terra:       #57b9ff;
+  --terra-deep:  #77b1d4;
+  --terra-glow:  rgba(78, 202, 216, 0.14);
+
+  --slate:       #90d5ff;
+  --slate-dim:   rgba(87,185,255,0.2);
+
+  --text-hi:     #fff5e3;
+  --text-mid:    #3a3c2a;
+  --text-lo:     #000000;
+
+  --font-display: "Vast Shadow", serif;
+  --font-body:    'Jost', sans-serif;
+  --font-mono:    'JetBrains Mono', monospace;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --shadow-card: 0 2px 20px rgba(44,40,37,0.08);
+  --shadow-lift: 0 8px 32px rgba(44,40,37,0.13);
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background-color: var(--cream);
+  color: var(--text-hi);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--cream); }
+::-webkit-scrollbar-thumb { background: var(--cream-lo); border-radius: 3px; }
+
+::selection { background: var(--terra); color: #fff; }
+
+:focus-visible {
+  outline: 1.5px solid var(--terra);
+  outline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; } to { opacity: 1; }
+}
+@keyframes pulse-terra {
+  0%, 100% { box-shadow: 0 0 0 0 var(--terra-glow); }
+  50%       { box-shadow: 0 0 0 10px transparent; }
+}
+@keyframes waveform {
+  0%, 100% { transform: scaleY(0.25); }
+  50%       { transform: scaleY(1); }
+}
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; } 50% { opacity: 0; }
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.animate-fade-up {
+  animation: fadeUp 0.7s cubic-bezier(0.16,1,0.3,1) forwards;
+  opacity: 0;
+}
+.delay-1 { animation-delay: 0.08s; }
+.delay-2 { animation-delay: 0.18s; }
+.delay-3 { animation-delay: 0.30s; }
+.delay-4 { animation-delay: 0.44s; }
+.delay-5 { animation-delay: 0.58s; }
