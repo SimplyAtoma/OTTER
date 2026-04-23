@@ -76,6 +76,10 @@ let win: BrowserWindow | null = null;
 let activeProcess: ManagedTranscriptionProcess | null = null;
 const repoRoot = path.join(__dirname, "..");
 
+function ensureDir(p: string) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
 /**
  * Create the main application window and load the UI.
  *
@@ -573,6 +577,40 @@ function runFfmpeg(args: string[]): Promise<void> {
   });
 }
 
+// =============================================================================
+// Mic recording: save + convert to WAV
+// =============================================================================
+
+ipcMain.handle(
+  "save-mic-recording",
+  async (_event: IpcMainInvokeEvent, data: Buffer, mimeType: string) => {
+    const recDir = path.join(app.getPath("userData"), "recordings");
+    ensureDir(recDir);
+
+    const stamp = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const mt = (mimeType || "").toLowerCase();
+    const ext =
+      mt.includes("ogg") ? "ogg" :
+      mt.includes("webm") ? "webm" :
+      mt.includes("wav") ? "wav" :
+      "webm";
+
+    const rawPath = path.join(recDir, `mic_${stamp}.${ext}`);
+    fs.writeFileSync(rawPath, data);
+
+    const wavPath = path.join(recDir, `mic_${stamp}.wav`);
+    const args = [
+      "-hide_banner",
+      "-y",
+      "-i", rawPath,
+      "-c:a", "pcm_s16le",
+      wavPath,
+    ];
+    await runFfmpeg(args);
+    return wavPath;
+  }
+);
+
 /**
  * IPC: Create a short WAV snippet from a source audio file using ffmpeg.
  *
@@ -695,14 +733,23 @@ ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJs
     throw new Error("No non-muted segments to preview.");
   }
 
-  const sourceFile = edl.sourceFile;
+  const getSource = (e: any) => (typeof e.sourceFile === "string" ? e.sourceFile : edl.sourceFile);
+  const sources = Array.from(new Set(entries.map(getSource)));
+
+  const inputArgs: string[] = [];
+  for (const src of sources) {
+    inputArgs.push("-i", src);
+  }
+
   const filterParts: string[] = [];
   const concatInputs: string[] = [];
 
   for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
+    const e: any = entries[i];
+    const src = getSource(e);
+    const inputIndex = Math.max(0, sources.indexOf(src));
     filterParts.push(
-      `[0]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
+      `[${inputIndex}:a]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
     );
     concatInputs.push(`[a${i}]`);
   }
@@ -723,7 +770,7 @@ ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJs
   const args = [
     "-hide_banner",
     "-y",
-    "-i", sourceFile,
+    ...inputArgs,
     "-filter_complex", filterComplex,
     "-map", "[out]",
     "-c:a", "pcm_s16le",
@@ -770,14 +817,23 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
   //   [0]atrim=start=S0:end=E0,asetpts=PTS-STARTPTS[a0];
   //   [0]atrim=start=S1:end=E1,asetpts=PTS-STARTPTS[a1];
   //   [a0][a1]concat=n=2:v=0:a=1[out]
-  const sourceFile = edl.sourceFile;
+  const getSource = (e: any) => (typeof e.sourceFile === "string" ? e.sourceFile : edl.sourceFile);
+  const sources = Array.from(new Set(entries.map(getSource)));
+
+  const inputArgs: string[] = [];
+  for (const src of sources) {
+    inputArgs.push("-i", src);
+  }
+
   const filterParts: string[] = [];
   const concatInputs: string[] = [];
 
   for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
+    const e: any = entries[i];
+    const src = getSource(e);
+    const inputIndex = Math.max(0, sources.indexOf(src));
     filterParts.push(
-      `[0]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
+      `[${inputIndex}:a]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
     );
     concatInputs.push(`[a${i}]`);
   }
@@ -791,7 +847,7 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
   const args = [
     "-hide_banner",
     "-y",
-    "-i", sourceFile,
+    ...inputArgs,
     "-filter_complex", filterComplex,
     "-map", "[out]",
     "-c:a", "pcm_s16le",

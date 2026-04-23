@@ -38,6 +38,15 @@ header {
   height: 14px;
 }
 
+#micSelect {
+  max-width: 220px;
+  min-width: 120px;
+}
+
+#btnRefreshMics {
+  padding: 2px 8px;
+}
+
 /* Status pill (hidden by default) */
 #status {
   display: none;

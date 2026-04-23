@@ -214,4 +214,17 @@ contextBridge.exposeInMainWorld("otter", {
   renderEditedPreview: (edlJson: string): Promise<string> =>
     ipcRenderer.invoke("render-edited-preview", edlJson),
 
+  /**
+   * Save a microphone recording to disk and return a WAV path.
+   *
+   * The renderer records audio using MediaRecorder (typically webm/opus).
+   * We write the bytes to disk and convert to PCM WAV in the main process
+   * so the rest of the pipeline (WaveSurfer + transcription) can treat it
+   * like any other audio file.
+   */
+  saveMicRecording: (data: ArrayBuffer, mimeType: string): Promise<string> => {
+    const buf = Buffer.from(new Uint8Array(data));
+    return ipcRenderer.invoke("save-mic-recording", buf, mimeType);
+  },
+
 });

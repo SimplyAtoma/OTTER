@@ -89,6 +89,7 @@ type PieceEntry = {
   sourceStart: number;
   sourceEnd: number;
   breakAfter?: number;
+  sourceFile?: string;
 };
 
 type Piece = {
@@ -119,6 +120,7 @@ type EdlV1Entry = {
   sourceEnd: number;
   label: string;
   muted: boolean;
+  sourceFile?: string;
 };
 
 type OtterApi = {
@@ -136,6 +138,7 @@ type OtterApi = {
   loadEdl: () => Promise<{ path: string; content: string } | null>;
   exportEdlAudio: (edlJson: string) => Promise<string | null>;
   renderEditedPreview: (edlJson: string) => Promise<string>;
+  saveMicRecording: (data: ArrayBuffer, mimeType: string) => Promise<string>;
   pauseTranscription: () => Promise<boolean>;
   resumeTranscription: () => Promise<boolean>;
   cancelTranscription: () => Promise<boolean>;
@@ -309,6 +312,10 @@ function getViewEntries(pt: PieceTableData): ViewEntry[] {
  */
 function getActiveEntries(pt: PieceTableData): ViewEntry[] {
   return getViewEntries(pt).filter(v => v.status !== "deleted");
+}
+
+function getEntrySourceFile(pt: PieceTableData, entry: PieceEntry): string {
+  return entry.sourceFile || pt.sourceFile;
 }
 
 /**
@@ -785,6 +792,10 @@ const btnChoose = mustGetEl<HTMLButtonElement>("btnChoose");
 const btnTranscribe = mustGetEl<HTMLButtonElement>("btnTranscribe");
 const btnPause = mustGetEl<HTMLButtonElement>("btnPause");
 const btnStop = mustGetEl<HTMLButtonElement>("btnStop");
+const micSelect = mustGetEl<HTMLSelectElement>("micSelect");
+const btnRefreshMics = mustGetEl<HTMLButtonElement>("btnRefreshMics");
+const btnRecord = mustGetEl<HTMLButtonElement>("btnRecord");
+const btnRecordStop = mustGetEl<HTMLButtonElement>("btnRecordStop");
 const statusEl = mustGetEl<HTMLDivElement>("status");
 
 transcriptEl.addEventListener("dragover", (event: DragEvent) => {
@@ -814,6 +825,107 @@ function setTranscribingState(active: boolean) {
     isPaused = false;
     btnPause.textContent = "⏸ Pause";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Mic recording (MediaRecorder) state
+// ---------------------------------------------------------------------------
+
+let micStream: MediaStream | null = null;
+let micRecorder: MediaRecorder | null = null;
+let micChunks: Blob[] = [];
+let micRecordingStartedAt = 0;
+
+function setRecordingState(active: boolean) {
+  btnRecord.hidden = active;
+  btnRecordStop.hidden = !active;
+  micSelect.disabled = active;
+  btnRefreshMics.disabled = active;
+}
+
+/**
+ * List audio input devices. Labels are empty until the user has granted microphone
+ * permission at least once in this session; use ensureMicPermissionForLabels() first.
+ */
+async function refreshMicDeviceList(): Promise<void> {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const inputs = devices.filter((d) => d.kind === "audioinput");
+  const previous = micSelect.value;
+
+  micSelect.innerHTML = "";
+  const defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "Default (system)";
+  micSelect.appendChild(defaultOpt);
+
+  inputs.forEach((d, i) => {
+    const opt = document.createElement("option");
+    opt.value = d.deviceId;
+    opt.textContent = d.label?.trim() || `Microphone ${i + 1}`;
+    micSelect.appendChild(opt);
+  });
+
+  const stillValid =
+    previous === "" || Array.from(micSelect.options).some((o) => o.value === previous);
+  micSelect.value = stillValid ? previous : "";
+}
+
+/**
+ * Request transient mic access so enumerateDevices() can return real device labels.
+ */
+async function ensureMicPermissionForLabels(): Promise<void> {
+  if (!navigator.mediaDevices?.getUserMedia) return;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    s.getTracks().forEach((t) => t.stop());
+  } catch {
+    // User denied or no device — list may still work with generic names
+  }
+}
+
+async function initMicDeviceList(): Promise<void> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((d) => d.kind === "audioinput");
+    const needLabels = inputs.length > 0 && inputs.every((d) => !d.label);
+    if (needLabels) {
+      await ensureMicPermissionForLabels();
+    }
+    await refreshMicDeviceList();
+  } catch (e) {
+    console.warn("Mic device list failed:", e);
+  }
+}
+
+btnRefreshMics.addEventListener("click", async () => {
+  await ensureMicPermissionForLabels();
+  await refreshMicDeviceList();
+});
+
+if (navigator.mediaDevices?.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    void refreshMicDeviceList();
+  });
+}
+
+void initMicDeviceList();
+
+async function stopMicIfActive() {
+  try {
+    micRecorder?.stop();
+  } catch {
+    // ignore
+  }
+  micRecorder = null;
+
+  try {
+    micStream?.getTracks().forEach((t) => t.stop());
+  } catch {
+    // ignore
+  }
+  micStream = null;
 }
 
 function normalizeRange(a: number, b: number) {
@@ -1092,7 +1204,8 @@ async function refreshMainWavePreviewFromEdits() {
       return;
     }
 
-    const activeEntries = getActiveEntries(pieceTable);
+    const pt = pieceTable;
+    const activeEntries = getActiveEntries(pt);
     if (activeEntries.length === 0) {
       resetEditedPreviewState();
       await loadMainWaveFromPath(audioPath);
@@ -1101,16 +1214,17 @@ async function refreshMainWavePreviewFromEdits() {
 
     const payload = {
       version: 1,
-      sourceFile: pieceTable.sourceFile,
+      sourceFile: pt.sourceFile,
       entries: activeEntries.map((ve) => ({
         id: ve.entry.id,
+        sourceFile: getEntrySourceFile(pt, ve.entry),
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,
         muted: false,
       })),
-      createdAt: pieceTable.createdAt,
-      modifiedAt: pieceTable.modifiedAt,
+      createdAt: pt.createdAt,
+      modifiedAt: pt.modifiedAt,
     };
 
     const json = JSON.stringify(payload);
@@ -1455,7 +1569,7 @@ function renderTranscript(words: TranscriptWord[]) {
  * preventing a "stuck" drag state.
  */
 function initializeDragEnd() {
-  window.addEventListener("mouseup", (_event: MouseEvent) => {
+  window.addEventListener("mouseup", () => {
     if (isDragging) {
       isDragging = false;
       // Selection remains as-is; do not modify it further
@@ -1734,6 +1848,9 @@ function setDetailPlayIcon(isPlaying: boolean) {
   btnDetailPlay.setAttribute("aria-label", isPlaying ? "Pause Detail" : "Play Detail");
 }
 
+// Initial record UI state
+setRecordingState(false);
+
 
 //==============================================================================
 //
@@ -1809,6 +1926,136 @@ btnPause.addEventListener("click", async () => {
 // Handle the "Stop" button
 btnStop.addEventListener("click", async () => {
   await otter.cancelTranscription();
+});
+
+// Handle the "Record" button
+btnRecord.addEventListener("click", async () => {
+  try {
+    micChunks = [];
+    micRecordingStartedAt = Date.now();
+    setStatus("Requesting microphone…", "working");
+
+    const deviceId = micSelect.value.trim();
+    const audioConstraints = deviceId ? { deviceId: { exact: deviceId } } : true;
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+
+    const mimeCandidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+    ];
+    const mimeType = mimeCandidates.find((t) => (window as any).MediaRecorder?.isTypeSupported?.(t)) || "";
+
+    micRecorder = new MediaRecorder(micStream, mimeType ? { mimeType } : undefined);
+    micRecorder.addEventListener("dataavailable", (ev: BlobEvent) => {
+      if (ev.data && ev.data.size > 0) micChunks.push(ev.data);
+    });
+
+    micRecorder.addEventListener("start", () => {
+      setRecordingState(true);
+      setStatus("Recording…", "working");
+    });
+
+    micRecorder.addEventListener("stop", async () => {
+      setRecordingState(false);
+
+      const durMs = Date.now() - micRecordingStartedAt;
+      if (durMs < 250) {
+        setStatus("Recording too short.", "error");
+        await stopMicIfActive();
+        return;
+      }
+
+      try {
+        setStatus("Saving recording…", "working");
+        const blob = new Blob(micChunks, { type: micRecorder?.mimeType || mimeType || "audio/webm" });
+        const ab = await blob.arrayBuffer();
+        const wavPath = await otter.saveMicRecording(ab, blob.type || mimeType || "");
+
+        // Transcribe the recording and append words to the existing transcript (as added words).
+        setStatus("Transcribing recording…", "working");
+        const result = await otter.transcribeAudio(wavPath, getActiveSpecArg());
+        if (result && typeof result === "object" && "cancelled" in result && (result as any).cancelled) {
+          setStatus("Recording transcription cancelled.", "info");
+          return;
+        }
+        const transcript: TranscriptResult = result as TranscriptResult;
+        const newWords = Array.isArray(transcript) ? transcript : (transcript.words || []);
+        if (newWords.length === 0) {
+          setStatus("No words transcribed from recording.", "info");
+          return;
+        }
+
+        // If no base transcript yet, initialize from recording.
+        if (!pieceTable) {
+          words = newWords;
+          audioPath = wavPath;
+          pieceTable = buildPieceTableFromTranscript(words, audioPath);
+          undoStack = [];
+          redoStack = [];
+          updateEditButtonStates();
+          renderTranscript(words);
+          await refreshMainWavePreviewFromEdits();
+          setStatus(`Transcript ready (${words.length} words)`, "success");
+          return;
+        }
+
+        pushUndo();
+        const now = new Date().toISOString();
+        pieceTable.modifiedAt = now;
+
+        const addEntries: PieceEntry[] = newWords.map((w) => ({
+          id: `r${crypto.randomUUID().slice(0, 8)}`,
+          word: w.word,
+          sourceStart: w.start,
+          sourceEnd: w.end,
+          breakAfter: w.breakAfter,
+          sourceFile: wavPath,
+        }));
+
+        const insertOffset = pieceTable.addBuffer.length;
+        pieceTable.addBuffer.push(...addEntries);
+        // Insert as one "added" piece at the end of the transcript
+        pieceTable.pieces.push({
+          source: "add",
+          offset: insertOffset,
+          length: addEntries.length,
+          status: "added",
+        });
+        pieceTable.pieces = mergePieces(pieceTable.pieces);
+
+        syncWordsFromPieceTable();
+        renderTranscript(words);
+        void refreshMainWavePreviewFromEdits();
+        updateEditButtonStates();
+        setStatus(`Recording added (${addEntries.length} words).`, "success");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setStatus("Recording failed (see logs).", "error");
+        appendLog("\nERROR recording:\n" + msg + "\n");
+      } finally {
+        await stopMicIfActive();
+        micChunks = [];
+      }
+    });
+
+    micRecorder.start();
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setRecordingState(false);
+    setStatus("Microphone permission or recording failed.", "error");
+    appendLog("\nERROR mic:\n" + msg + "\n");
+    await stopMicIfActive();
+  }
+});
+
+btnRecordStop.addEventListener("click", async () => {
+  try {
+    micRecorder?.stop();
+  } catch {
+    // ignore
+  }
 });
 
 // Handle the "Choose File" button
@@ -2284,7 +2531,8 @@ btnLoadEdl.addEventListener("click", async () => {
 btnSaveEdits.addEventListener("click", async () => {
   if (!pieceTable) return;
 
-  const activeEntries = getActiveEntries(pieceTable);
+  const pt = pieceTable;
+  const activeEntries = getActiveEntries(pt);
   if (activeEntries.length === 0) {
     setStatus("Nothing to export (all words removed).", "error");
     return;
@@ -2295,16 +2543,17 @@ btnSaveEdits.addEventListener("click", async () => {
 
     const exportPayload = {
       version: 1,
-      sourceFile: pieceTable.sourceFile,
+      sourceFile: pt.sourceFile,
       entries: activeEntries.map(ve => ({
         id: ve.entry.id,
+        sourceFile: getEntrySourceFile(pt, ve.entry),
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,
         muted: false,
       })),
-      createdAt: pieceTable.createdAt,
-      modifiedAt: pieceTable.modifiedAt,
+      createdAt: pt.createdAt,
+      modifiedAt: pt.modifiedAt,
     };
 
     const json = JSON.stringify(exportPayload, null, 2);

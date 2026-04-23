@@ -14,6 +14,11 @@
       <button id="btnTranscribe" disabled>Transcribe</button>
       <button id="btnPause" hidden>⏸ Pause</button>
       <button id="btnStop" hidden>⏹ Stop</button>
+      <label for="micSelect">Mic:</label>
+      <select id="micSelect" title="Recording input device"></select>
+      <button type="button" id="btnRefreshMics" title="Refresh microphone list (may prompt for permission)">↻</button>
+      <button id="btnRecord" title="Record from selected microphone">⏺ Record</button>
+      <button id="btnRecordStop" hidden title="Stop recording">⏹ Stop Rec</button>
 
       <label for="modeSelect">Quality:</label>
       <select id="modeSelect"></select>
