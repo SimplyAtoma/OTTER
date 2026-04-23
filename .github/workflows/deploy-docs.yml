@@ -1,0 +1,76 @@
+name: Deploy Docs Site to GitHub Pages
+
+on:
+  # Runs on every push to main
+  push:
+    branches: [main]
+    paths:
+      - "docs-site/**"          # only trigger when the site changes
+      - ".github/workflows/deploy-docs.yml"
+
+  # Allows manual trigger from the Actions tab
+  workflow_dispatch:
+
+# Grant the GITHUB_TOKEN the permissions needed by the pages action
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment; cancel in-progress runs
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1 – Build the Vite/React site
+  # ──────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Install dependencies
+        working-directory: docs-site
+        run: npm ci
+
+      - name: Build site
+        working-directory: docs-site
+        run: npm run build
+        env:
+          # Silence Vite's "future deprecation" warnings in CI
+          NODE_OPTIONS: "--no-warnings"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Vite outputs to docs-site/dist by default
+          path: docs-site/dist
+
+  # ──────────────────────────────────────────────
+  # Job 2 – Deploy the artifact to GitHub Pages
+  # ──────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
