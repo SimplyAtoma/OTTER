@@ -249,6 +249,22 @@ def transcribe_whisperx_vad(
         "OTTER_WHISPERX_DOWNLOAD_ROOT",
         "WHISPERX_DOWNLOAD_ROOT",
     )
+
+    # High-signal diagnostics: helps confirm we're using the expected cache dirs.
+    dbg(
+        "WhisperX cache env: "
+        f"HF_HOME={os.environ.get('HF_HOME')!r} | "
+        f"HUGGINGFACE_HUB_CACHE={os.environ.get('HUGGINGFACE_HUB_CACHE')!r} | "
+        f"TRANSFORMERS_CACHE={os.environ.get('TRANSFORMERS_CACHE')!r} | "
+        f"OTTER_WHISPERX_DOWNLOAD_ROOT={os.environ.get('OTTER_WHISPERX_DOWNLOAD_ROOT')!r} | "
+        f"WHISPERX_DOWNLOAD_ROOT={os.environ.get('WHISPERX_DOWNLOAD_ROOT')!r}",
+        DebugLevel.WARNING,
+    )
+    dbg(
+        f"WhisperX ASR opts: model={model_name!r} device={device!r} compute_type={compute_type!r} "
+        f"download_root={download_root!r}",
+        DebugLevel.WARNING,
+    )
     asr_key = (
         "whisperx_asr",
         model_name,
@@ -272,6 +288,10 @@ def transcribe_whisperx_vad(
         "Loading WhisperX ASR model (first run may download weights; this can take several minutes).",
         DebugLevel.WARNING,
     )
+    dbg(
+        "Load runs on the worker main thread (Whisper/ctranslate2 can misbehave when loaded from a thread pool on Windows).",
+        DebugLevel.WARNING,
+    )
     model_load_stop = threading.Event()
     model_load_thread = threading.Thread(
         target=_model_load_progress_bridge,
@@ -280,11 +300,16 @@ def transcribe_whisperx_vad(
     )
     model_load_thread.start()
     try:
+        # Do not wrap load_model in run_in_thread_with_timeout: PyTorch/ctranslate2 model init
+        # in a ThreadPool worker has been observed to hang indefinitely on Windows.
         asr_model = get_or_create(asr_key, load_asr)
     finally:
         model_load_stop.set()
 
-    dbg("WhisperX ASR model ready (in-memory LRU may reuse it in this process).", DebugLevel.TRACE)
+    dbg(
+        "WhisperX ASR model ready (in-memory LRU may reuse it in this process).",
+        DebugLevel.WARNING,
+    )
     emit(10)
 
     call_ctx_checkpoint(ctx)

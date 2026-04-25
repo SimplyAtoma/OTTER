@@ -98,7 +98,8 @@ main {
 
 /* Waveform containers */
 #waveform,
-#waveDetail {
+#waveDetail,
+#waveformRecorded {
   height: 80px;
   border: 1px solid #ddd;
   border-radius: 8px;
@@ -157,10 +158,23 @@ main {
   font-weight: 650;
 }
 
-#transcript {
+.transcriptSubTitleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.transcriptPane {
   line-height: 1.8;
   font-size: 16px;
   user-select: none;
+}
+
+.transcriptPane.isActive {
+  outline: 2px solid #f4a949;
+  outline-offset: 6px;
+  border-radius: 8px;
 }
 
 /* Transcript words */

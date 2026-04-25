@@ -30,7 +30,7 @@
  * (macOS apps normally remain running with zero windows.)
  */
 
-import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions, WebContents } from "electron";
 import path from "path";
 import fs from "fs";
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from "child_process";
@@ -74,6 +74,12 @@ type ManagedTranscriptionProcess = ChildProcessWithoutNullStreams & {
 
 let win: BrowserWindow | null = null;
 let activeProcess: ManagedTranscriptionProcess | null = null;
+let workerProcess: ManagedTranscriptionProcess | null = null;
+let workerStdoutBuf = "";
+let workerStderrLineBuf = "";
+let workerCurrentResolve: ((value: unknown) => void) | null = null;
+let workerCurrentReject: ((err: Error) => void) | null = null;
+let workerCurrentSender: WebContents | null = null;
 const repoRoot = path.join(__dirname, "..");
 
 function ensureDir(p: string) {
@@ -287,6 +293,188 @@ function terminateProcess(proc: ManagedTranscriptionProcess): boolean {
   }
 }
 
+function directoryHasFiles(dir: string): boolean {
+  try {
+    if (!fs.existsSync(dir)) return false;
+    return fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Default faster-whisper / WhisperX weight directory when the user did not set
+ * OTTER_WHISPERX_DOWNLOAD_ROOT. Prefer an existing non-empty cache (AppData from
+ * older OTTER builds, or .cache/huggingface/whisperx) so we do not point at an
+ * empty folder and force a multi‑GB re-download.
+ */
+function defaultWhisperxDownloadRoot(userHf: string, hasUserHf: boolean, userDataWx: string): string {
+  if (!hasUserHf) return userDataWx;
+  const underHf = path.join(userHf, "whisperx");
+  if (directoryHasFiles(underHf)) return underHf;
+  if (directoryHasFiles(userDataWx)) return userDataWx;
+  return underHf;
+}
+
+/**
+ * Env passed to the persistent Python worker so Hugging Face / WhisperX on-disk
+ * caches match a typical CLI install: prefer %USER%\.cache\huggingface when it
+ * exists, otherwise use AppData. Explicit OTTER_* / HF_* env always wins.
+ */
+function buildPythonWorkerEnv(): { env: typeof process.env; logLine: string } {
+  const home = app.getPath("home");
+  const userData = app.getPath("userData");
+  const userHf = path.join(home, ".cache", "huggingface");
+  const hasUserHf = fs.existsSync(userHf);
+  const userDataHf = path.join(userData, "hf_home");
+  const userDataWx = path.join(userData, "whisperx_download");
+
+  const hfHomeExplicit = Boolean(process.env.OTTER_HF_HOME || process.env.HF_HOME);
+
+  const hfHome =
+    process.env.OTTER_HF_HOME ||
+    process.env.HF_HOME ||
+    (hasUserHf ? userHf : userDataHf);
+
+  const huggingfaceHubCache =
+    process.env.HUGGINGFACE_HUB_CACHE ||
+    (!hfHomeExplicit && hasUserHf ? path.join(userHf, "hub") : undefined);
+
+  const transformersCache =
+    process.env.TRANSFORMERS_CACHE ||
+    (!hfHomeExplicit && hasUserHf ? path.join(userHf, "transformers") : undefined);
+
+  const wxRoot =
+    process.env.OTTER_WHISPERX_DOWNLOAD_ROOT ||
+    process.env.WHISPERX_DOWNLOAD_ROOT ||
+    defaultWhisperxDownloadRoot(userHf, hasUserHf, userDataWx);
+
+  for (const p of [hfHome, huggingfaceHubCache, transformersCache, wxRoot]) {
+    if (p) {
+      try {
+        if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+      } catch {
+        // best-effort; Python may still fail with a clear error
+      }
+    }
+  }
+
+  const env: typeof process.env = {
+    ...process.env,
+    PYTHONUNBUFFERED: "1",
+    HF_HOME: hfHome,
+    OTTER_WHISPERX_DOWNLOAD_ROOT: wxRoot,
+    HF_HUB_DISABLE_TELEMETRY: process.env.HF_HUB_DISABLE_TELEMETRY ?? "1",
+  };
+  if (huggingfaceHubCache) env.HUGGINGFACE_HUB_CACHE = huggingfaceHubCache;
+  if (transformersCache) env.TRANSFORMERS_CACHE = transformersCache;
+
+  const logLine =
+    `INFO:HF_HOME=${hfHome} | HUGGINGFACE_HUB_CACHE=${huggingfaceHubCache ?? "(unset)"} | ` +
+    `TRANSFORMERS_CACHE=${transformersCache ?? "(unset)"} | OTTER_WHISPERX_DOWNLOAD_ROOT=${wxRoot}\n`;
+  return { env, logLine };
+}
+
+function ensureWorkerProcess() {
+  if (workerProcess && workerProcess.pid && !workerProcess.killed) return workerProcess;
+
+  const python = getPythonPath();
+  const argv = ["-m", "otter_py.worker"];
+  const cwd = repoRoot;
+  const { env } = buildPythonWorkerEnv();
+
+  const child = spawn(python, argv, {
+    cwd,
+    stdio: ["pipe", "pipe", "pipe"],
+    env,
+  }) as ManagedTranscriptionProcess;
+
+  workerProcess = child;
+  workerStdoutBuf = "";
+  workerStderrLineBuf = "";
+
+  const handleStderrLine = (rawLine: string) => {
+    const line = rawLine.replace(/\r$/, "").trim();
+    if (!line) return;
+
+    const sender = workerCurrentSender;
+    if (!sender) return;
+
+    const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
+    if (progressMatch) {
+      sender.send("transcribe-progress", Number(progressMatch[1]));
+      return;
+    }
+    if (line === "CONTROL:PAUSED") {
+      child.otterState = "paused";
+      sender.send("transcribe-state", { state: "paused" });
+      return;
+    }
+    if (line === "CONTROL:RESUMED") {
+      child.otterState = "running";
+      sender.send("transcribe-state", { state: "running" });
+      return;
+    }
+    if (line === "CONTROL:CANCELLING") {
+      child.otterState = "cancelling";
+      sender.send("transcribe-state", { state: "cancelling" });
+      return;
+    }
+    sender.send("transcribe-log", line + "\n");
+  };
+
+  child.stderr.on("data", (d: Buffer) => {
+    const chunk = d.toString();
+    workerStderrLineBuf += chunk;
+    let nl: number;
+    while ((nl = workerStderrLineBuf.indexOf("\n")) >= 0) {
+      const line = workerStderrLineBuf.slice(0, nl);
+      workerStderrLineBuf = workerStderrLineBuf.slice(nl + 1);
+      handleStderrLine(line);
+    }
+    if (workerStderrLineBuf.length > 256 * 1024) {
+      workerStderrLineBuf = workerStderrLineBuf.slice(-64 * 1024);
+    }
+  });
+
+  child.stdout.on("data", (d: Buffer) => {
+    workerStdoutBuf += d.toString();
+    let nl: number;
+    while ((nl = workerStdoutBuf.indexOf("\n")) >= 0) {
+      const line = workerStdoutBuf.slice(0, nl).trim();
+      workerStdoutBuf = workerStdoutBuf.slice(nl + 1);
+      if (!line) continue;
+      if (workerCurrentResolve) {
+        try {
+          const parsed = JSON.parse(line);
+          workerCurrentResolve(parsed);
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          workerCurrentReject?.(new Error(`Failed to parse worker JSON: ${msg}\n${line}`));
+        } finally {
+          workerCurrentResolve = null;
+          workerCurrentReject = null;
+          workerCurrentSender = null;
+          if (activeProcess === child) activeProcess = null;
+        }
+      }
+    }
+  });
+
+  child.on("close", () => {
+    if (workerProcess === child) workerProcess = null;
+    if (activeProcess === child) activeProcess = null;
+    if (workerCurrentReject) {
+      workerCurrentReject(new Error("Worker process exited"));
+      workerCurrentResolve = null;
+      workerCurrentReject = null;
+      workerCurrentSender = null;
+    }
+  });
+
+  return child;
+}
+
 
 
 /**
@@ -313,172 +501,46 @@ ipcMain.handle(
     audioPath: string,
     spec?: TranscribeSpec
   ) => { 
-    if( activeProcess){
+    if (activeProcess) {
       throw new Error("A transcription is already running.");
     }
 
-    // Run from the repo root so "python -m otter_py.transcribe" works.
-    const cwd = repoRoot;
+    const worker = ensureWorkerProcess();
+    activeProcess = worker;
+    worker.otterState = "running";
+    worker.otterCancelled = false;
 
-    // Build argv for: python -m otter_py.transcribe run --audio ... --spec-...
-    const python = getPythonPath();
-    const argv = ["-m", "otter_py.transcribe", "run", "--audio", audioPath];
-    event.sender.send("transcribe-log", `INFO:Python=${python} | CWD=${cwd} | ARGS=${argv.join(" ")}\n`);
+    workerCurrentSender = event.sender;
+    event.sender.send("transcribe-progress", 0);
 
-    // Choose spec source
+    // Resolve spec for worker message
+    let specFile: string | undefined;
+    let specJson: string | undefined;
     if (spec?.mode === "file") {
-      // All presets live here; only pass a filename from renderer for safety.
       const safeName = path.basename(spec.name);
-      if (safeName !== spec.name){
+      if (safeName !== spec.name) {
         throw new Error("Invalid spec file name");
       }
-      const specPath = path.join(repoRoot, "otter_py", "sample_specs", safeName);
-      argv.push("--spec-file", specPath);
+      specFile = path.join(repoRoot, "otter_py", "sample_specs", safeName);
     } else if (spec?.mode === "json") {
-      argv.push("--spec-json", spec.jsonText);
+      specJson = spec.jsonText;
     } else {
-      // Default: use default_spec.json
-      const specPath = path.join(repoRoot, "otter_py", "sample_specs", "default_spec.json");
-      argv.push("--spec-file", specPath);
+      specFile = path.join(repoRoot, "otter_py", "sample_specs", "default_spec.json");
     }
 
-    // Optional: if you want meta sometimes
-    // argv.push("--emit-meta");
+    const { logLine: workerCacheLog } = buildPythonWorkerEnv();
+    event.sender.send(
+      "transcribe-log",
+      `INFO:PythonWorker=enabled | Audio=${audioPath}\n` + workerCacheLog
+    );
 
     return await new Promise((resolve, reject) => {
-      const child = spawn(python, argv, { 
-        cwd,
-        stdio: ["pipe","pipe","pipe"],
-        env: {...process.env, PYTHONUNBUFFERED: "1"}
-    }) as ManagedTranscriptionProcess;
-
-      activeProcess = child;
-      child.otterState = "running";
-      child.otterCancelled= false;
-
-      event.sender.send("transcribe-progress", 0);
-
-      let stdout = "";
-      let stderr = "";
-      /** Incomplete stderr line from last chunk (avoids losing PROGRESS:NN split across reads). */
-      let stderrLineBuf = "";
-      let settled = false;
-
-      const cleanup = ()=> {
-        if(activeProcess === child){
-          activeProcess = null;
-        }
-      }
-
-      const failOnce = (err: Error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(err);
-      };
-
-      const resolveOnce = (value: unknown) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(value);
-      };
-
-      child.stdout.on("data", (d: Buffer) => {
-        stdout += d.toString();
-      });
-
-      const handleStderrLine = (rawLine: string) => {
-        const line = rawLine.replace(/\r$/, "").trim();
-        if (!line) return;
-
-        const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
-        if (progressMatch) {
-          event.sender.send("transcribe-progress", Number(progressMatch[1]));
-          return;
-        }
-        if (line === "CONTROL:PAUSED") {
-          child.otterState = "paused";
-          event.sender.send("transcribe-state", { state: "paused" });
-          return;
-        }
-        if (line === "CONTROL:RESUMED") {
-          child.otterState = "running";
-          event.sender.send("transcribe-state", { state: "running" });
-          return;
-        }
-        if (line === "CONTROL:CANCELLING") {
-          child.otterState = "cancelling";
-          event.sender.send("transcribe-state", { state: "cancelling" });
-          return;
-        }
-        event.sender.send("transcribe-log", line + "\n");
-      };
-
-      child.stderr.on("data", (d: Buffer) => {
-        const chunk = d.toString();
-        stderr += chunk;
-        stderrLineBuf += chunk;
-
-        let nl: number;
-        while ((nl = stderrLineBuf.indexOf("\n")) >= 0) {
-          const line = stderrLineBuf.slice(0, nl);
-          stderrLineBuf = stderrLineBuf.slice(nl + 1);
-          handleStderrLine(line);
-        }
-        if (stderrLineBuf.length > 256 * 1024) {
-          stderrLineBuf = stderrLineBuf.slice(-64 * 1024);
-        }
-      });
-
-      child.on("error", (err) => {
-        failOnce(err instanceof Error ? err : new Error(String(err)));
-      });
-
-      child.on("close", (code, signal) => {
-        if (stderrLineBuf.trim()) {
-          handleStderrLine(stderrLineBuf);
-          stderrLineBuf = "";
-        }
-
-        cleanup();
-
-        // User clicked Stop (or cancel IPC). Resolve — do not reject — so Electron
-        // does not log this as an IPC handler error in the main process console.
-        if (child.otterCancelled) {
-          resolveOnce({ cancelled: true as const });
-          return;
-        }
-        if (signal) {
-          failOnce(new Error(`transcription exited due to signal: ${signal}`));
-          return;
-        }
-
-        // Cooperative cancel from Python (exit 2 + error JSON) without Node flag
-        if (code === 2) {
-          try {
-            const parsed = JSON.parse(stdout) as { error?: string };
-            if (parsed?.error === "Cancelled") {
-              resolveOnce({ cancelled: true as const });
-              return;
-            }
-          } catch {
-            // fall through to generic non-zero handling
-          }
-        }
-
-        if (code !== 0) {
-          failOnce(new Error(`transcribe exited with ${code}\n${stderr}`));
-          return;
-        }
-        try {
-          const parsed = JSON.parse(stdout);
-          resolveOnce(parsed);
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          reject(new Error(`Failed to parse JSON from transcribe:\n${stdout}\n\n${stderr}\n${msg}`));
-        }
-      });
+      workerCurrentResolve = resolve;
+      workerCurrentReject = reject;
+      const payload: any = { type: "run", audio_path: audioPath };
+      if (specFile) payload.spec_file = specFile;
+      if (specJson) payload.spec_json = specJson;
+      worker.stdin.write(JSON.stringify(payload) + "\n");
     });
   });
 
@@ -608,6 +670,47 @@ ipcMain.handle(
     ];
     await runFfmpeg(args);
     return wavPath;
+  }
+);
+
+ipcMain.handle(
+  "save-mic-recording-as",
+  async (_event: IpcMainInvokeEvent, data: Buffer, mimeType: string) => {
+    const options = {
+      title: "Save Recording",
+      defaultPath: `recording_${new Date().toISOString().replace(/[:.]/g, "-")}.wav`,
+      filters: [{ name: "WAV Audio", extensions: ["wav"] }],
+    };
+
+    const result = win
+      ? await dialog.showSaveDialog(win, options)
+      : await dialog.showSaveDialog(options);
+
+    if (result.canceled || !result.filePath) return null;
+
+    const recDir = path.join(app.getPath("userData"), "recordings");
+    ensureDir(recDir);
+
+    const stamp = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const mt = (mimeType || "").toLowerCase();
+    const ext =
+      mt.includes("ogg") ? "ogg" :
+      mt.includes("webm") ? "webm" :
+      mt.includes("wav") ? "wav" :
+      "webm";
+
+    const rawPath = path.join(recDir, `mic_${stamp}.${ext}`);
+    fs.writeFileSync(rawPath, data);
+
+    const args = [
+      "-hide_banner",
+      "-y",
+      "-i", rawPath,
+      "-c:a", "pcm_s16le",
+      result.filePath,
+    ];
+    await runFfmpeg(args);
+    return result.filePath;
   }
 );
 

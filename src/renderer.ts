@@ -139,6 +139,7 @@ type OtterApi = {
   exportEdlAudio: (edlJson: string) => Promise<string | null>;
   renderEditedPreview: (edlJson: string) => Promise<string>;
   saveMicRecording: (data: ArrayBuffer, mimeType: string) => Promise<string>;
+  saveMicRecordingAs: (data: ArrayBuffer, mimeType: string) => Promise<string | null>;
   pauseTranscription: () => Promise<boolean>;
   resumeTranscription: () => Promise<boolean>;
   cancelTranscription: () => Promise<boolean>;
@@ -165,12 +166,115 @@ const DETAIL_PAD_AFTER  = 0.25; // seconds
 const WaveSurfer = window.WaveSurfer as any;
 const otter = window.otter;
 
-let audioPath: string | null = null;
-let words: TranscriptWord[] = [];
-let selectionStart: number | null = null;
-let selectionEnd: number | null = null;
-let selectionAnchor: number | null = null;
-let selectedIndices: number[] = [];
+// Always-available diagnostics pane (so early crashes still show details).
+function ensureDiagPane(): HTMLPreElement {
+  let pre = document.getElementById("otterDiag") as HTMLPreElement | null;
+  if (pre) return pre;
+  pre = document.createElement("pre");
+  pre.id = "otterDiag";
+  pre.style.position = "fixed";
+  pre.style.left = "10px";
+  pre.style.right = "10px";
+  pre.style.bottom = "10px";
+  pre.style.maxHeight = "40vh";
+  pre.style.overflow = "auto";
+  pre.style.margin = "0";
+  pre.style.padding = "10px";
+  pre.style.border = "1px solid #ef4444";
+  pre.style.borderRadius = "8px";
+  pre.style.background = "#0b0b0b";
+  pre.style.color = "#e8e8e8";
+  pre.style.fontSize = "12px";
+  pre.style.lineHeight = "1.35";
+  pre.style.whiteSpace = "pre-wrap";
+  pre.style.zIndex = "9999";
+  pre.hidden = true;
+  document.body.appendChild(pre);
+  return pre;
+}
+
+function diag(msg: string) {
+  const pre = ensureDiagPane();
+  pre.hidden = false;
+  pre.textContent += msg;
+  pre.scrollTop = pre.scrollHeight;
+}
+
+if (!otter) {
+  const s = document.getElementById("status");
+  if (s) {
+    s.textContent = "Bridge API (window.otter) is missing. UI cannot function.";
+    s.className = "error";
+    (s as HTMLElement).style.display = "inline-block";
+  }
+  diag("\nFATAL: window.otter is missing (preload bridge not available)\n");
+  // Do not throw here; we want the diagnostics pane to remain visible.
+}
+
+// Surface runtime errors into the in-app log/status (Electron users may not have devtools open).
+const earlyLogBuffer: string[] = [];
+
+function bufferOrLog(msg: string) {
+  const logger = (window as any).__otterAppendLog as ((m: string) => void) | undefined;
+  if (logger) logger(msg);
+  else earlyLogBuffer.push(msg);
+  diag(msg);
+}
+
+function openDevPanelIfPresent() {
+  const devPanel = document.getElementById("devPanel") as HTMLDetailsElement | null;
+  if (devPanel) devPanel.open = true;
+}
+
+window.addEventListener("error", (ev) => {
+  try {
+    const msg = (ev as ErrorEvent).error instanceof Error
+      ? (ev as ErrorEvent).error.stack || (ev as ErrorEvent).error.message
+      : (ev as ErrorEvent).message || String(ev);
+    const safe = msg || "Unknown error";
+    bufferOrLog(`\nRUNTIME ERROR:\n${safe}\n`);
+    openDevPanelIfPresent();
+    const statusEl = document.getElementById("status");
+    if (statusEl) {
+      statusEl.textContent = "UI error (see log).";
+      statusEl.className = "error";
+      (statusEl as HTMLElement).style.display = "inline-block";
+    }
+  } catch {
+    // ignore
+  }
+});
+
+window.addEventListener("unhandledrejection", (ev) => {
+  try {
+    const reason = (ev as PromiseRejectionEvent).reason;
+    const msg = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+    bufferOrLog(`\nUNHANDLED REJECTION:\n${msg}\n`);
+    openDevPanelIfPresent();
+  } catch {
+    // ignore
+  }
+});
+
+type EditorKind = "imported" | "recorded";
+
+type EditorState = {
+  kind: EditorKind;
+  paneEl: HTMLDivElement;
+  audioPath: string | null;
+  words: TranscriptWord[];
+  pieceTable: PieceTableData | null;
+  undoStack: UndoSnapshot[];
+  redoStack: UndoSnapshot[];
+  selectionStart: number | null;
+  selectionEnd: number | null;
+  selectionAnchor: number | null;
+  selectedIndices: number[];
+};
+
+let importedEditor: EditorState;
+let recordedEditor: EditorState;
+let activeEditor: EditorState;
 let playheadIndex = -1;
 let isDragging = false;
 
@@ -181,10 +285,6 @@ type UndoSnapshot = {
   words: TranscriptWord[];
 };
 
-let pieceTable: PieceTableData | null = null;
-let undoStack: UndoSnapshot[] = [];
-let redoStack: UndoSnapshot[] = [];
-
 let detailSelStart: number | null = null;
 let detailSelEnd: number | null = null;
 let isMouseSelecting = false;
@@ -194,6 +294,16 @@ let isEditedPreviewMode = false;
 let previewWordTimes: Array<{ start: number; end: number }> = [];
 let previewRefreshToken = 0;
 let isRefreshingPreview = false;
+
+function setActiveEditor(next: EditorState) {
+  activeEditor = next;
+  transcriptImportedEl.classList.toggle("isActive", activeEditor.kind === "imported");
+  transcriptRecordedEl.classList.toggle("isActive", activeEditor.kind === "recorded");
+  updateEditButtonStates();
+}
+
+// The most recently chosen audio file to transcribe (import flow).
+let pendingImportAudioPath: string | null = null;
 
 //
 // Utility Functions
@@ -314,10 +424,6 @@ function getActiveEntries(pt: PieceTableData): ViewEntry[] {
   return getViewEntries(pt).filter(v => v.status !== "deleted");
 }
 
-function getEntrySourceFile(pt: PieceTableData, entry: PieceEntry): string {
-  return entry.sourceFile || pt.sourceFile;
-}
-
 /**
  * Merge adjacent pieces that reference contiguous spans in the same
  * buffer with the same status. Keeps the piece list compact.
@@ -341,56 +447,56 @@ function mergePieces(pieces: Piece[]): Piece[] {
   return merged;
 }
 
-function snapshotState(pt: PieceTableData): UndoSnapshot {
+function snapshotState(editor: EditorState, pt: PieceTableData): UndoSnapshot {
   return {
     pieces: pt.pieces.map(p => ({ ...p })),
     originalBuffer: pt.originalBuffer.map(e => ({ ...e })),
     addBuffer: pt.addBuffer.map(e => ({ ...e })),
-    words: words.map(w => ({ ...w })),
+    words: editor.words.map(w => ({ ...w })),
   };
 }
 
-function pushUndo(): void {
-  if (!pieceTable) return;
-  undoStack.push(snapshotState(pieceTable));
-  redoStack = [];
+function pushUndo(editor: EditorState): void {
+  if (!editor.pieceTable) return;
+  editor.undoStack.push(snapshotState(editor, editor.pieceTable));
+  editor.redoStack = [];
 }
 
-function restoreSnapshot(pt: PieceTableData, snap: UndoSnapshot): void {
+function restoreSnapshot(editor: EditorState, pt: PieceTableData, snap: UndoSnapshot): void {
   pt.pieces = snap.pieces.map(p => ({ ...p }));
   pt.originalBuffer = snap.originalBuffer.map(e => ({ ...e }));
   pt.addBuffer = snap.addBuffer.map(e => ({ ...e }));
-  words = snap.words.map(w => ({ ...w }));
+  editor.words = snap.words.map(w => ({ ...w }));
   pt.modifiedAt = new Date().toISOString();
 }
 
-function performUndo(): boolean {
-  if (!pieceTable || undoStack.length === 0) return false;
-  redoStack.push(snapshotState(pieceTable));
-  restoreSnapshot(pieceTable, undoStack.pop()!);
+function performUndo(editor: EditorState): boolean {
+  if (!editor.pieceTable || editor.undoStack.length === 0) return false;
+  editor.redoStack.push(snapshotState(editor, editor.pieceTable));
+  restoreSnapshot(editor, editor.pieceTable, editor.undoStack.pop()!);
   return true;
 }
 
-function performRedo(): boolean {
-  if (!pieceTable || redoStack.length === 0) return false;
-  undoStack.push(snapshotState(pieceTable));
-  restoreSnapshot(pieceTable, redoStack.pop()!);
+function performRedo(editor: EditorState): boolean {
+  if (!editor.pieceTable || editor.redoStack.length === 0) return false;
+  editor.undoStack.push(snapshotState(editor, editor.pieceTable));
+  restoreSnapshot(editor, editor.pieceTable, editor.redoStack.pop()!);
   return true;
 }
 
-function syncBreakAfterToPieceTable(): void {
-  if (!pieceTable) return;
-  const viewEntries = getViewEntries(pieceTable);
-  for (let i = 0; i < viewEntries.length && i < words.length; i++) {
-    viewEntries[i].entry.breakAfter = words[i].breakAfter;
+function syncBreakAfterToPieceTable(editor: EditorState): void {
+  if (!editor.pieceTable) return;
+  const viewEntries = getViewEntries(editor.pieceTable);
+  for (let i = 0; i < viewEntries.length && i < editor.words.length; i++) {
+    viewEntries[i].entry.breakAfter = editor.words[i].breakAfter;
   }
 }
 
-function syncWordsFromPieceTable(): void {
-  if (!pieceTable) return;
+function syncWordsFromPieceTable(editor: EditorState): void {
+  if (!editor.pieceTable) return;
 
-  const oldWords = words;
-  const viewEntries = getViewEntries(pieceTable);
+  const oldWords = editor.words;
+  const viewEntries = getViewEntries(editor.pieceTable);
 
   const newWords: TranscriptWord[] = viewEntries.map(ve => ({
     word: ve.entry.word,
@@ -404,15 +510,15 @@ function syncWordsFromPieceTable(): void {
     }
   }
 
-  words = newWords;
+  editor.words = newWords;
 }
 
 async function refreshDetailIfActive(): Promise<void> {
   if (detailSelStart == null || detailSelEnd == null) return;
-  if (detailSelStart >= words.length) { detailSelStart = null; detailSelEnd = null; return; }
-  const endIdx = Math.min(detailSelEnd, words.length - 1);
-  const rangeStart = Number(words[detailSelStart].start);
-  const rangeEnd = Number(words[endIdx].end);
+  if (detailSelStart >= importedEditor.words.length) { detailSelStart = null; detailSelEnd = null; return; }
+  const endIdx2 = Math.min(detailSelEnd, importedEditor.words.length - 1);
+  const rangeStart = Number(importedEditor.words[detailSelStart].start);
+  const rangeEnd = Number(importedEditor.words[endIdx2].end);
   try {
     await loadDetailForRange(rangeStart, rangeEnd);
   } catch (err: unknown) {
@@ -699,15 +805,17 @@ function convertV1ToV2(v1: { sourceFile: string; entries: EdlV1Entry[]; createdA
  * Enable or disable editing buttons based on current piece table and selection state.
  */
 function updateEditButtonStates() {
-  const hasPt = pieceTable != null;
-  const hasSel = selectedIndices.length > 0;
+  const hasPt = activeEditor.pieceTable != null;
+  const hasSel = activeEditor.selectedIndices.length > 0;
 
   btnRemove.disabled = !hasPt || !hasSel;
   btnRestore.disabled = !hasPt || !hasSel;
-  btnUndo.disabled = !hasPt || undoStack.length === 0;
-  btnRedo.disabled = !hasPt || redoStack.length === 0;
+  btnUndo.disabled = !hasPt || activeEditor.undoStack.length === 0;
+  btnRedo.disabled = !hasPt || activeEditor.redoStack.length === 0;
   btnSaveEdl.disabled = !hasPt;
   btnSaveEdits.disabled = !hasPt;
+
+  btnAddRecordedToTranscript.disabled = recordedEditor.pieceTable == null || recordedEditor.words.length === 0;
 }
 
 /**
@@ -716,34 +824,34 @@ function updateEditButtonStates() {
  * adjustments are persisted.
  */
 function writebackRegionBounds() {
-  if (!pieceTable || !detailRegion || detailSelStart == null) return;
+  if (!importedEditor.pieceTable || !detailRegion || detailSelStart == null) return;
 
   const absStart = detailWinStartAbs + detailRegion.start;
   const absEnd = detailWinStartAbs + detailRegion.end;
-  const viewEntries = getViewEntries(pieceTable);
+  const viewEntries = getViewEntries(importedEditor.pieceTable);
 
   if (detailSelStart === detailSelEnd) {
     const ve = viewEntries[detailSelStart];
     if (ve) {
       ve.entry.sourceStart = absStart;
       ve.entry.sourceEnd = absEnd;
-      words[detailSelStart].start = absStart;
-      words[detailSelStart].end = absEnd;
+      importedEditor.words[detailSelStart].start = absStart;
+      importedEditor.words[detailSelStart].end = absEnd;
     }
   } else if (detailSelEnd != null) {
     const veStart = viewEntries[detailSelStart];
     const veEnd = viewEntries[detailSelEnd];
     if (veStart) {
       veStart.entry.sourceStart = absStart;
-      words[detailSelStart].start = absStart;
+      importedEditor.words[detailSelStart].start = absStart;
     }
     if (veEnd) {
       veEnd.entry.sourceEnd = absEnd;
-      words[detailSelEnd].end = absEnd;
+      importedEditor.words[detailSelEnd].end = absEnd;
     }
   }
 
-  pieceTable.modifiedAt = new Date().toISOString();
+  importedEditor.pieceTable.modifiedAt = new Date().toISOString();
 }
 
 
@@ -756,9 +864,9 @@ const DELETED_REGION_COLOR = "rgba(180, 180, 180, 0.45)";
  */
 function updateDeletedRegions() {
   mainRegions.clearRegions();
-  if (!pieceTable) return;
+  if (!importedEditor.pieceTable) return;
 
-  const viewEntries = getViewEntries(pieceTable);
+  const viewEntries = getViewEntries(importedEditor.pieceTable);
   let i = 0;
   while (i < viewEntries.length) {
     if (viewEntries[i].status !== "deleted") { i++; continue; }
@@ -787,7 +895,10 @@ function updateDeletedRegions() {
 //
 //==============================================================================
 
-const transcriptEl = mustGetEl<HTMLDivElement>("transcript");
+const transcriptImportedEl = mustGetEl<HTMLDivElement>("transcriptImported");
+const transcriptRecordedEl = mustGetEl<HTMLDivElement>("transcriptRecorded");
+// Back-compat for existing transcript logic; will be extended to support both panes.
+const transcriptEl = transcriptImportedEl;
 const btnChoose = mustGetEl<HTMLButtonElement>("btnChoose");
 const btnTranscribe = mustGetEl<HTMLButtonElement>("btnTranscribe");
 const btnPause = mustGetEl<HTMLButtonElement>("btnPause");
@@ -795,25 +906,65 @@ const btnStop = mustGetEl<HTMLButtonElement>("btnStop");
 const micSelect = mustGetEl<HTMLSelectElement>("micSelect");
 const btnRefreshMics = mustGetEl<HTMLButtonElement>("btnRefreshMics");
 const btnRecord = mustGetEl<HTMLButtonElement>("btnRecord");
+const btnRecordPause = mustGetEl<HTMLButtonElement>("btnRecordPause");
 const btnRecordStop = mustGetEl<HTMLButtonElement>("btnRecordStop");
+const btnAddRecordedToTranscript = mustGetEl<HTMLButtonElement>("btnAddRecordedToTranscript");
 const statusEl = mustGetEl<HTMLDivElement>("status");
 
-transcriptEl.addEventListener("dragover", (event: DragEvent) => {
-  if (dragMoveSourceIndices.length === 0) return;
-  if ((event.target as HTMLElement).closest(".word")) return;
-  event.preventDefault();
-  clearDropIndicators();
-});
+importedEditor = {
+  kind: "imported",
+  paneEl: transcriptImportedEl,
+  audioPath: null,
+  words: [],
+  pieceTable: null,
+  undoStack: [],
+  redoStack: [],
+  selectionStart: null,
+  selectionEnd: null,
+  selectionAnchor: null,
+  selectedIndices: [],
+};
 
-transcriptEl.addEventListener("drop", (event: DragEvent) => {
-  if (dragMoveSourceIndices.length === 0) return;
-  if ((event.target as HTMLElement).closest(".word")) return;
-  event.preventDefault();
-  clearDropIndicators();
-  moveCurrentSelection(words.length);
-  dragMoveSourceIndices = [];
-  transcriptEl.classList.remove("dragging-words");
-});
+recordedEditor = {
+  kind: "recorded",
+  paneEl: transcriptRecordedEl,
+  audioPath: null,
+  words: [],
+  pieceTable: null,
+  undoStack: [],
+  redoStack: [],
+  selectionStart: null,
+  selectionEnd: null,
+  selectionAnchor: null,
+  selectedIndices: [],
+};
+
+activeEditor = importedEditor;
+// NOTE: don't call setActiveEditor() yet; it touches edit buttons that are declared later.
+
+function attachTranscriptPaneDnD(pane: HTMLDivElement, editor: EditorState) {
+  pane.addEventListener("dragover", (event: DragEvent) => {
+    if (dragMoveSourceIndices.length === 0) return;
+    if ((event.target as HTMLElement).closest(".word")) return;
+    event.preventDefault();
+    setActiveEditor(editor);
+    clearDropIndicators();
+  });
+
+  pane.addEventListener("drop", (event: DragEvent) => {
+    if (dragMoveSourceIndices.length === 0) return;
+    if ((event.target as HTMLElement).closest(".word")) return;
+    event.preventDefault();
+    setActiveEditor(editor);
+    clearDropIndicators();
+    moveCurrentSelection(editor, editor.words.length);
+    dragMoveSourceIndices = [];
+    pane.classList.remove("dragging-words");
+  });
+}
+
+attachTranscriptPaneDnD(transcriptImportedEl, importedEditor);
+attachTranscriptPaneDnD(transcriptRecordedEl, recordedEditor);
 
 let isPaused = false;
 
@@ -827,6 +978,11 @@ function setTranscribingState(active: boolean) {
   }
 }
 
+function setRecordedTranscribingState(active: boolean) {
+  btnTranscribeRecorded.hidden = active;
+  btnStopRecorded.hidden = !active;
+}
+
 // ---------------------------------------------------------------------------
 // Mic recording (MediaRecorder) state
 // ---------------------------------------------------------------------------
@@ -838,6 +994,7 @@ let micRecordingStartedAt = 0;
 
 function setRecordingState(active: boolean) {
   btnRecord.hidden = active;
+  btnRecordPause.hidden = !active;
   btnRecordStop.hidden = !active;
   micSelect.disabled = active;
   btnRefreshMics.disabled = active;
@@ -976,18 +1133,18 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
         lastSearchQuery = searchQuery;
       }
     let found = false;
-    for(let i = lastFoundIndex + 1; i < words.length; i++)
+    for(let i = lastFoundIndex + 1; i < activeEditor.words.length; i++)
     {
-      if(words[i].word.toLowerCase().includes(searchQuery))
+      if(activeEditor.words[i].word.toLowerCase().includes(searchQuery))
       {
         lastFoundIndex=  i;
         found = true;
         lastSearchQuery = searchQuery;
-      const wordFound = words[i];
-      setSelectionRange(i, i);
-      ws.setTime(Number(wordFound.start) + SEEK_EPS);
+      const wordFound = activeEditor.words[i];
+      setSelectionRange(activeEditor, i, i);
+      if (activeEditor.kind === "imported") ws.setTime(Number(wordFound.start) + SEEK_EPS);
 
-      const wordElement = transcriptEl.querySelector(
+      const wordElement = activeEditor.paneEl.querySelector(
       `.word[data-index="${i}"]`
       ) as HTMLElement | null;
 
@@ -1001,15 +1158,15 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
     {
       for(let i = 0; i < lastFoundIndex; i++)
       {
-        if(words[i].word.toLowerCase().includes(searchQuery))
+        if(activeEditor.words[i].word.toLowerCase().includes(searchQuery))
         {
           lastFoundIndex = i;
             lastSearchQuery = searchQuery;
-      const wordFound = words[i];
-      setSelectionRange(i, i);
-      ws.setTime(Number(wordFound.start) + SEEK_EPS);
+      const wordFound = activeEditor.words[i];
+      setSelectionRange(activeEditor, i, i);
+      if (activeEditor.kind === "imported") ws.setTime(Number(wordFound.start) + SEEK_EPS);
 
-      const wordElement = transcriptEl.querySelector(
+      const wordElement = activeEditor.paneEl.querySelector(
       `.word[data-index="${i}"]`
       ) as HTMLElement | null;
 
@@ -1022,25 +1179,25 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
   });
 
 function clearSearchHighlights() {
-  const transcriptWords = transcriptEl.querySelectorAll(".word");
+  const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
 
   for (let i = 0; i < transcriptWords.length; i++) {
     const wordElement = transcriptWords[i] as HTMLElement;
     const index = Number(wordElement.dataset.index);
-    const wordText = words[index].word;    
+    const wordText = activeEditor.words[index].word;    
     wordElement.innerHTML = wordText + " ";
   }
 }
 
   findInput.addEventListener("input", () =>{
     const searchQuery = findInput.value.trim().toLowerCase();
-    const transcriptWords = transcriptEl.querySelectorAll(".word");
+    const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
    
     for(let i = 0; i < transcriptWords.length; i++)
     {
       const wordElement = transcriptWords[i] as HTMLElement;
       const index = Number(wordElement.dataset.index);
-      const wordText = words[index].word;
+      const wordText = activeEditor.words[index].word;
       wordElement.innerHTML = wordText + " ";
       const matchPosition = wordText.toLowerCase().indexOf(searchQuery)
       if(matchPosition === -1)
@@ -1089,21 +1246,21 @@ function getSelectedRanges(indices: number[]): Array<{ start: number; end: numbe
   return ranges;
 }
 
-function setSelectedIndices(indices: number[], anchor: number | null = selectionAnchor) {
-  const next = uniqueSortedIndices(indices).filter((idx) => idx >= 0 && idx < words.length);
-  selectedIndices = next;
-  selectionAnchor = anchor;
+function setSelectedIndices(editor: EditorState, indices: number[], anchor: number | null = editor.selectionAnchor) {
+  const next = uniqueSortedIndices(indices).filter((idx) => idx >= 0 && idx < editor.words.length);
+  editor.selectedIndices = next;
+  editor.selectionAnchor = anchor;
 
   if (next.length > 0 && isContiguousSelection(next)) {
-    selectionStart = next[0];
-    selectionEnd = next[next.length - 1];
+    editor.selectionStart = next[0];
+    editor.selectionEnd = next[next.length - 1];
   } else {
-    selectionStart = null;
-    selectionEnd = null;
+    editor.selectionStart = null;
+    editor.selectionEnd = null;
   }
 
   const selectedSet = new Set(next);
-  const nodes = transcriptEl.querySelectorAll<HTMLElement>(".word");
+  const nodes = editor.paneEl.querySelectorAll<HTMLElement>(".word");
   nodes.forEach((el) => {
     const idx = Number(el.dataset.index);
     el.classList.toggle("selected", selectedSet.has(idx));
@@ -1113,60 +1270,60 @@ function setSelectedIndices(indices: number[], anchor: number | null = selection
 }
 
 function clearDropIndicators() {
-  const nodes = transcriptEl.querySelectorAll<HTMLElement>(".word.drop-before, .word.drop-after");
+  const nodes = document.querySelectorAll<HTMLElement>(".word.drop-before, .word.drop-after");
   nodes.forEach((n) => {
     n.classList.remove("drop-before");
     n.classList.remove("drop-after");
   });
 }
 
-function moveCurrentSelection(toIndex: number) {
-  if (!pieceTable || selectedIndices.length === 0) return;
+function moveCurrentSelection(editor: EditorState, toIndex: number) {
+  if (!editor.pieceTable || editor.selectedIndices.length === 0) return;
 
-  const sorted = uniqueSortedIndices(selectedIndices);
+  const sorted = uniqueSortedIndices(editor.selectedIndices);
   const selectedCount = sorted.length;
   const selectedBefore = sorted.filter((idx) => idx < toIndex).length;
   const insertAt = toIndex - selectedBefore;
 
-  pushUndo();
+  pushUndo(editor);
 
   let changed = false;
-  if (sorted.length === 1 && toIndex < words.length) {
-    changed = moveWord(pieceTable, sorted[0], toIndex);
+  if (sorted.length === 1 && toIndex < editor.words.length) {
+    changed = moveWord(editor.pieceTable, sorted[0], toIndex);
   } else if (isContiguousSelection(sorted)) {
-    changed = moveRange(pieceTable, sorted[0], sorted[sorted.length - 1], toIndex);
+    changed = moveRange(editor.pieceTable, sorted[0], sorted[sorted.length - 1], toIndex);
   } else {
-    changed = moveSelectedIndices(pieceTable, sorted, toIndex);
+    changed = moveSelectedIndices(editor.pieceTable, sorted, toIndex);
   }
 
   if (!changed) {
-    undoStack.pop();
+    editor.undoStack.pop();
     return;
   }
 
-  syncWordsFromPieceTable();
+  syncWordsFromPieceTable(editor);
 
   const movedSelection: number[] = [];
   for (let i = 0; i < selectedCount; i++) {
     movedSelection.push(insertAt + i);
   }
 
-  setSelectedIndices(movedSelection, movedSelection.length > 0 ? movedSelection[0] : null);
+  setSelectedIndices(editor, movedSelection, movedSelection.length > 0 ? movedSelection[0] : null);
 
-  if (movedSelection.length === 1) {
+  if (editor.kind === "imported" && movedSelection.length === 1) {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[0];
-  } else if (isContiguousSelection(movedSelection)) {
+  } else if (editor.kind === "imported" && isContiguousSelection(movedSelection)) {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[movedSelection.length - 1];
-  } else {
+  } else if (editor.kind === "imported") {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[0];
   }
 
-  renderTranscript(words);
+  renderTranscript(editor);
   void refreshMainWavePreviewFromEdits();
-  refreshDetailIfActive();
+  if (editor.kind === "imported") refreshDetailIfActive();
 }
 
 function resetEditedPreviewState() {
@@ -1192,39 +1349,43 @@ async function loadMainWaveFromPath(filePath: string) {
 }
 
 async function refreshMainWavePreviewFromEdits() {
-  if (!audioPath) return;
+  const baseAudio = importedEditor.audioPath || recordedEditor.audioPath;
+  if (!baseAudio) return;
 
   const token = ++previewRefreshToken;
   isRefreshingPreview = true;
 
   try {
-    if (!pieceTable) {
+    // If there is no transcript editing state at all, show the raw imported audio.
+    if (!importedEditor.pieceTable && !recordedEditor.pieceTable) {
       resetEditedPreviewState();
-      await loadMainWaveFromPath(audioPath);
+      await loadMainWaveFromPath(baseAudio);
       return;
     }
 
-    const pt = pieceTable;
-    const activeEntries = getActiveEntries(pt);
-    if (activeEntries.length === 0) {
+    const activeImported = importedEditor.pieceTable ? getActiveEntries(importedEditor.pieceTable) : [];
+    const activeRecorded = recordedEditor.pieceTable ? getActiveEntries(recordedEditor.pieceTable) : [];
+    const combined = activeImported.concat(activeRecorded);
+
+    if (combined.length === 0) {
       resetEditedPreviewState();
-      await loadMainWaveFromPath(audioPath);
+      await loadMainWaveFromPath(baseAudio);
       return;
     }
 
     const payload = {
       version: 1,
-      sourceFile: pt.sourceFile,
-      entries: activeEntries.map((ve) => ({
+      sourceFile: baseAudio,
+      entries: combined.map((ve) => ({
         id: ve.entry.id,
-        sourceFile: getEntrySourceFile(pt, ve.entry),
+        sourceFile: ve.entry.sourceFile || baseAudio,
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,
         muted: false,
       })),
-      createdAt: pt.createdAt,
-      modifiedAt: pt.modifiedAt,
+      createdAt: importedEditor.pieceTable?.createdAt || new Date().toISOString(),
+      modifiedAt: importedEditor.pieceTable?.modifiedAt || new Date().toISOString(),
     };
 
     const json = JSON.stringify(payload);
@@ -1234,14 +1395,14 @@ async function refreshMainWavePreviewFromEdits() {
     await loadMainWaveFromPath(previewPath);
     if (token !== previewRefreshToken) return;
 
-    previewWordTimes = buildPreviewWordTimesFromActiveEntries(activeEntries);
+    previewWordTimes = buildPreviewWordTimesFromActiveEntries(combined);
     isEditedPreviewMode = true;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     appendLog(`\nWARN: Failed to refresh edited preview: ${msg}\n`);
-    if (token === previewRefreshToken && audioPath) {
+    if (token === previewRefreshToken && baseAudio) {
       resetEditedPreviewState();
-      await loadMainWaveFromPath(audioPath);
+      await loadMainWaveFromPath(baseAudio);
     }
   } finally {
     if (token === previewRefreshToken) {
@@ -1275,14 +1436,14 @@ function setPlayheadIndex(idx: number) {
  * @param {number|null} start - Start index, or null to clear selection.
  * @param {number|null} end   - End index, or null to clear selection.
  */
-function setSelectionRange(start: number | null, end: number | null) {
+function setSelectionRange(editor: EditorState, start: number | null, end: number | null) {
   if (start == null || end == null) {
-    setSelectedIndices([], null);
+    setSelectedIndices(editor, [], null);
   } else {
     const range = normalizeRange(start, end);
     const indices: number[] = [];
     for (let i = range.start; i <= range.end; i++) indices.push(i);
-    setSelectedIndices(indices, selectionAnchor);
+    setSelectedIndices(editor, indices, editor.selectionAnchor);
   }
 }
 
@@ -1308,11 +1469,11 @@ function computeDetailWindow(start: number, end: number) {
  * and that precise editing may require user refinement.
  */
 async function loadDetailForRange(start: number, end: number) {
-  if (!audioPath) throw new Error("No audio loaded");
+  if (!importedEditor.audioPath) throw new Error("No audio loaded");
   const { winStart, winDur } = computeDetailWindow(start, end);
 
   // Create a short WAV snippet around the selected word (main process uses ffmpeg)
-  const snippetPath = await otter.makeSnippet(audioPath, winStart, winDur);
+  const snippetPath = await otter.makeSnippet(importedEditor.audioPath, winStart, winDur);
 
   // If the detail waveform is currently playing, stop it before swapping media
   if (wsDetail.isPlaying()) wsDetail.pause();
@@ -1368,12 +1529,13 @@ async function loadDetailForRange(start: number, end: number) {
  * @param {Array<Object>} words - Transcript words with timing metadata
  *                                (each entry includes at least { word, start, end })
  */
-function renderTranscript(words: TranscriptWord[]) {
-  transcriptEl.innerHTML = "";
-  const viewEntries = pieceTable ? getViewEntries(pieceTable) : [];
+function renderTranscript(editor: EditorState) {
+  const pane = editor.paneEl;
+  pane.innerHTML = "";
+  const viewEntries = editor.pieceTable ? getViewEntries(editor.pieceTable) : [];
 
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
+  for (let i = 0; i < editor.words.length; i++) {
+    const w = editor.words[i];
 
     const span = document.createElement("span");
     span.className = "word";
@@ -1392,36 +1554,38 @@ function renderTranscript(words: TranscriptWord[]) {
       if (event.button !== 0) return;
       if (event.ctrlKey || event.metaKey) return;
 
-      const alreadySelected = selectedIndices.includes(i);
-      if (alreadySelected && selectedIndices.length > 0) {
+      setActiveEditor(editor);
+      const alreadySelected = editor.selectedIndices.includes(i);
+      if (alreadySelected && editor.selectedIndices.length > 0) {
         mouseSelectionMoved = false;
         return;
       }
 
-      selectionAnchor = i;
-      setSelectionRange(i, i);
+      editor.selectionAnchor = i;
+      setSelectionRange(editor, i, i);
       isMouseSelecting = true;
       mouseSelectionMoved = false;
       event.preventDefault();
     });
 
     span.addEventListener("mouseenter", () => {
-      if (!isMouseSelecting || selectionAnchor == null) return;
-      if (selectionEnd !== i || selectionStart !== selectionAnchor) {
+      if (!isMouseSelecting || editor.selectionAnchor == null) return;
+      if (editor.selectionEnd !== i || editor.selectionStart !== editor.selectionAnchor) {
         mouseSelectionMoved = true;
       }
-      setSelectionRange(selectionAnchor, i);
+      setSelectionRange(editor, editor.selectionAnchor, i);
     });
 
     span.addEventListener("dragstart", (event: DragEvent) => {
-      if (selectedIndices.includes(i) && selectedIndices.length > 0) {
-        dragMoveSourceIndices = selectedIndices.slice();
+      setActiveEditor(editor);
+      if (editor.selectedIndices.includes(i) && editor.selectedIndices.length > 0) {
+        dragMoveSourceIndices = editor.selectedIndices.slice();
       } else {
-        setSelectedIndices([i], i);
+        setSelectedIndices(editor, [i], i);
         dragMoveSourceIndices = [i];
       }
 
-      transcriptEl.classList.add("dragging-words");
+      pane.classList.add("dragging-words");
       if (event.dataTransfer) {
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", "move");
@@ -1449,15 +1613,15 @@ function renderTranscript(words: TranscriptWord[]) {
       const targetIndex = before ? i : i + 1;
 
       clearDropIndicators();
-      moveCurrentSelection(targetIndex);
+      moveCurrentSelection(editor, targetIndex);
       dragMoveSourceIndices = [];
-      transcriptEl.classList.remove("dragging-words");
+      pane.classList.remove("dragging-words");
     });
 
     span.addEventListener("dragend", () => {
       clearDropIndicators();
       dragMoveSourceIndices = [];
-      transcriptEl.classList.remove("dragging-words");
+      pane.classList.remove("dragging-words");
     });
 
     span.addEventListener("click", async (event: MouseEvent) => {
@@ -1465,22 +1629,26 @@ function renderTranscript(words: TranscriptWord[]) {
         mouseSelectionMoved = false;
         return;
       }
+      setActiveEditor(editor);
 
       // Transcript click = select word + seek main audio
       if (event.ctrlKey || event.metaKey) {
-        if (selectedIndices.includes(i)) {
-          setSelectedIndices(selectedIndices.filter((idx) => idx !== i), selectionAnchor);
+        if (editor.selectedIndices.includes(i)) {
+          setSelectedIndices(editor, editor.selectedIndices.filter((idx) => idx !== i), editor.selectionAnchor);
         } else {
-          setSelectedIndices(selectedIndices.concat(i), i);
+          setSelectedIndices(editor, editor.selectedIndices.concat(i), i);
         }
-      } else if (event.shiftKey && selectionAnchor != null) {
-        setSelectionRange(selectionAnchor, i);
+      } else if (event.shiftKey && editor.selectionAnchor != null) {
+        setSelectionRange(editor, editor.selectionAnchor, i);
       } else {
-        selectionAnchor = i;
-        setSelectionRange(i, i);
+        editor.selectionAnchor = i;
+        setSelectionRange(editor, i, i);
       }
 
-      if (!selectedIndices.includes(i)) return;
+      if (!editor.selectedIndices.includes(i)) return;
+
+      // Only the imported transcript drives the detail waveform + seeking for now.
+      if (editor.kind !== "imported") return;
 
       const seekTime = isEditedPreviewMode && previewWordTimes[i]
         ? previewWordTimes[i].start
@@ -1491,12 +1659,12 @@ function renderTranscript(words: TranscriptWord[]) {
       // Load the detail waveform snippet centered on the selected range
       let rangeStartIdx = i;
       let rangeEndIdx = i;
-      if (selectedIndices.length > 1 && isContiguousSelection(selectedIndices)) {
-        rangeStartIdx = selectedIndices[0];
-        rangeEndIdx = selectedIndices[selectedIndices.length - 1];
+      if (editor.selectedIndices.length > 1 && isContiguousSelection(editor.selectedIndices)) {
+        rangeStartIdx = editor.selectedIndices[0];
+        rangeEndIdx = editor.selectedIndices[editor.selectedIndices.length - 1];
       }
-      const rangeStart = Number(words[rangeStartIdx].start);
-      const rangeEnd = Number(words[rangeEndIdx].end);
+      const rangeStart = Number(editor.words[rangeStartIdx].start);
+      const rangeEnd = Number(editor.words[rangeEndIdx].end);
 
       detailSelStart = rangeStartIdx;
       detailSelEnd = rangeEndIdx;
@@ -1515,9 +1683,10 @@ function renderTranscript(words: TranscriptWord[]) {
     //   • Highlight the starting word immediately
     span.addEventListener("mousedown", (event: MouseEvent) => {
       event.preventDefault();
+      setActiveEditor(editor);
       isDragging = true;
-      selectionAnchor = i;
-      setSelectionRange(i, i);
+      editor.selectionAnchor = i;
+      setSelectionRange(editor, i, i);
     });
 
     // Drag Selection: mouseover while dragging
@@ -1530,29 +1699,29 @@ function renderTranscript(words: TranscriptWord[]) {
     span.addEventListener("mouseover", (event: MouseEvent) => {
       if (!isDragging) return;
       const hoveredIndex = Number((event.target as HTMLElement).dataset.index);
-      if (selectionAnchor != null && !isNaN(hoveredIndex)) {
-        setSelectionRange(selectionAnchor, hoveredIndex);
+      if (editor.selectionAnchor != null && !isNaN(hoveredIndex)) {
+        setSelectionRange(editor, editor.selectionAnchor, hoveredIndex);
       }
     });
 
-    transcriptEl.appendChild(span);
+    pane.appendChild(span);
 
-    const breakCount = words[i].breakAfter ?? 0;
+    const breakCount = editor.words[i].breakAfter ?? 0;
     for (let j = 0; j < breakCount; j++) 
     {
-      transcriptEl.appendChild(document.createElement("br"));
+      pane.appendChild(document.createElement("br"));
     }
 
     
   }
 
   // Re-apply selection and playhead after re-render (e.g., new transcript)
-  const keptSelection = selectedIndices.filter((idx) => idx >= 0 && idx < words.length);
-  setSelectedIndices(keptSelection, selectionAnchor);
+  const keptSelection = editor.selectedIndices.filter((idx) => idx >= 0 && idx < editor.words.length);
+  setSelectedIndices(editor, keptSelection, editor.selectionAnchor);
 
-  if (playheadIndex >= 0 && playheadIndex < words.length) {
+  if (editor.kind === "imported" && playheadIndex >= 0 && playheadIndex < editor.words.length) {
     setPlayheadIndex(playheadIndex);
-  } else {
+  } else if (editor.kind === "imported") {
     setPlayheadIndex(-1);
   }
 
@@ -1588,6 +1757,14 @@ const timeEl = mustGetEl<HTMLSpanElement>("time");
 const progressEl = mustGetEl<HTMLProgressElement>("transcribeProgress");
 const fnameEl = mustGetEl<HTMLSpanElement>("loadedFile");
 
+// Recorded waveform UI
+const recordedWavePane = mustGetEl<HTMLDivElement>("recordedWavePane");
+const recordedWaveDivider = mustGetEl<HTMLHRElement>("recordedWaveDivider");
+const btnRecordedPlay = mustGetEl<HTMLButtonElement>("btnRecordedPlay");
+const recordedTimeEl = mustGetEl<HTMLSpanElement>("recordedTime");
+const btnTranscribeRecorded = mustGetEl<HTMLButtonElement>("btnTranscribeRecorded");
+const btnStopRecorded = mustGetEl<HTMLButtonElement>("btnStopRecorded");
+
 // Switch between play and pause icons
 function setPlayIcon(isPlaying: boolean) {
   btnPlay.textContent = isPlaying ? "⏸︎" : "▶︎";
@@ -1604,6 +1781,31 @@ const ws = WaveSurfer.create({
   height: 80,
   normalize: true,
   plugins: [mainRegions]
+});
+
+// Recorded waveform (separate from project waveform)
+const wsRecorded = WaveSurfer.create({
+  container: "#waveformRecorded",
+  height: 80,
+  normalize: true,
+});
+
+function setRecordedPlayIcon(isPlaying: boolean) {
+  btnRecordedPlay.textContent = isPlaying ? "⏸︎" : "▶︎";
+  btnRecordedPlay.title = isPlaying ? "Pause Recording" : "Play Recording";
+  btnRecordedPlay.setAttribute("aria-label", isPlaying ? "Pause Recording" : "Play Recording");
+}
+
+wsRecorded.on("play", () => setRecordedPlayIcon(true));
+wsRecorded.on("pause", () => setRecordedPlayIcon(false));
+wsRecorded.on("finish", () => setRecordedPlayIcon(false));
+
+wsRecorded.on("timeupdate", (t: number) => {
+  recordedTimeEl.textContent = `${t.toFixed(2)}s`;
+});
+
+btnRecordedPlay.addEventListener("click", () => {
+  wsRecorded.playPause();
 });
 
 // Keep the play/pause button icon in sync with the current status of playback
@@ -1643,13 +1845,13 @@ ws.on("timeupdate", (t: number) => {
   // We use a simple linear scan for this PoC, but
   // a real implementation should be smarter (e.g. binary search)
   let idx = -1;
-  for (let i = 0; i < words.length; i++) {
+  for (let i = 0; i < importedEditor.words.length; i++) {
     const start = isEditedPreviewMode && previewWordTimes[i]
       ? previewWordTimes[i].start
-      : words[i].start;
+      : importedEditor.words[i].start;
     const end = isEditedPreviewMode && previewWordTimes[i]
       ? previewWordTimes[i].end
-      : words[i].end;
+      : importedEditor.words[i].end;
     if (te >= start && te < end) { idx = i; break; }
   }
   setPlayheadIndex(idx);
@@ -1731,7 +1933,7 @@ function setDetailWordRegion(localStart: number, localEnd: number) {
   let regionUndoPushed = false;
   detailRegion.on("update", () => {
     if (!regionUndoPushed) {
-      pushUndo();
+      pushUndo(importedEditor);
       regionUndoPushed = true;
     }
   });
@@ -1850,6 +2052,11 @@ function setDetailPlayIcon(isPlaying: boolean) {
 
 // Initial record UI state
 setRecordingState(false);
+recordedWavePane.hidden = true;
+recordedWaveDivider.hidden = true;
+btnRecordedPlay.disabled = true;
+btnTranscribeRecorded.disabled = true;
+btnStopRecorded.hidden = true;
 
 
 //==============================================================================
@@ -1860,7 +2067,8 @@ setRecordingState(false);
 
 // Handle the "Transcribe" button
 btnTranscribe.addEventListener("click", async () => {
-  if (!audioPath) return;
+  const toTranscribe = pendingImportAudioPath || importedEditor.audioPath;
+  if (!toTranscribe) return;
   resetEditedPreviewState();
   btnTranscribe.disabled = true;
   setStatus("Starting transcription...", "working");
@@ -1872,26 +2080,75 @@ btnTranscribe.addEventListener("click", async () => {
     progressEl.hidden = false;
     setTranscribingState(true);
 
-    const result = await otter.transcribeAudio(audioPath, getActiveSpecArg());
+    const result = await otter.transcribeAudio(toTranscribe, getActiveSpecArg());
     if (result && typeof result === "object" && "cancelled" in result && result.cancelled) {
       setStatus("Transcription cancelled.", "info");
       return;
     }
     const transcript: TranscriptResult = result as TranscriptResult;
-    words = Array.isArray(transcript) ? transcript : (transcript.words || []);
+    const newWords = Array.isArray(transcript) ? transcript : (transcript.words || []);
     const lang = Array.isArray(transcript) ? undefined : transcript.language;
     const langSuffix = lang ? `, lang=${lang}` : "";
-    setStatus(`Transcript ready (${words.length} words${langSuffix})`, "success");
+    setStatus(`Transcript ready (${newWords.length} words${langSuffix})`, "success");
 
-    pieceTable = buildPieceTableFromTranscript(words, audioPath!);
-    undoStack = [];
-    redoStack = [];
+    // If this is the first transcript in the project, it becomes the project base.
+    if (!importedEditor.pieceTable && !recordedEditor.pieceTable) {
+      importedEditor.audioPath = toTranscribe;
+      importedEditor.words = newWords;
+      importedEditor.pieceTable = buildPieceTableFromTranscript(importedEditor.words, importedEditor.audioPath!);
+      importedEditor.undoStack = [];
+      importedEditor.redoStack = [];
+      importedEditor.selectedIndices = [];
+      importedEditor.selectionAnchor = null;
+      importedEditor.selectionStart = null;
+      importedEditor.selectionEnd = null;
+    } else if (!importedEditor.pieceTable) {
+      // If project exists but imported transcript doesn't, initialize imported editor,
+      // then treat this transcript as the first imported segment.
+      importedEditor.audioPath = importedEditor.audioPath || toTranscribe;
+      importedEditor.words = newWords;
+      importedEditor.pieceTable = buildPieceTableFromTranscript(importedEditor.words, importedEditor.audioPath!);
+      importedEditor.undoStack = [];
+      importedEditor.redoStack = [];
+      importedEditor.selectedIndices = [];
+      importedEditor.selectionAnchor = null;
+      importedEditor.selectionStart = null;
+      importedEditor.selectionEnd = null;
+    } else {
+      // Append to end of main transcript (project timeline).
+      const mainPt = importedEditor.pieceTable;
+      pushUndo(importedEditor);
+
+      const addEntries: PieceEntry[] = newWords.map((w) => ({
+        id: `i${crypto.randomUUID().slice(0, 8)}`,
+        word: w.word,
+        sourceStart: w.start,
+        sourceEnd: w.end,
+        breakAfter: w.breakAfter,
+        sourceFile: toTranscribe,
+      }));
+
+      const insertOffset = mainPt.addBuffer.length;
+      mainPt.addBuffer.push(...addEntries);
+      mainPt.pieces.push({
+        source: "add",
+        offset: insertOffset,
+        length: addEntries.length,
+        status: "added",
+      });
+      mainPt.pieces = mergePieces(mainPt.pieces);
+
+      syncWordsFromPieceTable(importedEditor);
+    }
     updateEditButtonStates();
 
-    renderTranscript(words);
+    renderTranscript(importedEditor);
     if (!isRefreshingPreview) {
       await refreshMainWavePreviewFromEdits();
     }
+
+    // Clear pending import once used
+    pendingImportAudioPath = null;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.toLowerCase().includes("cancelled")) {
@@ -1959,6 +2216,7 @@ btnRecord.addEventListener("click", async () => {
 
     micRecorder.addEventListener("stop", async () => {
       setRecordingState(false);
+      btnRecordPause.textContent = "⏸ Pause Rec";
 
       const durMs = Date.now() - micRecordingStartedAt;
       if (durMs < 250) {
@@ -1971,65 +2229,37 @@ btnRecord.addEventListener("click", async () => {
         setStatus("Saving recording…", "working");
         const blob = new Blob(micChunks, { type: micRecorder?.mimeType || mimeType || "audio/webm" });
         const ab = await blob.arrayBuffer();
-        const wavPath = await otter.saveMicRecording(ab, blob.type || mimeType || "");
-
-        // Transcribe the recording and append words to the existing transcript (as added words).
-        setStatus("Transcribing recording…", "working");
-        const result = await otter.transcribeAudio(wavPath, getActiveSpecArg());
-        if (result && typeof result === "object" && "cancelled" in result && (result as any).cancelled) {
-          setStatus("Recording transcription cancelled.", "info");
-          return;
-        }
-        const transcript: TranscriptResult = result as TranscriptResult;
-        const newWords = Array.isArray(transcript) ? transcript : (transcript.words || []);
-        if (newWords.length === 0) {
-          setStatus("No words transcribed from recording.", "info");
+        const wavPath = await otter.saveMicRecordingAs(ab, blob.type || mimeType || "");
+        if (!wavPath) {
+          setStatus("Recording save canceled.", "info");
           return;
         }
 
-        // If no base transcript yet, initialize from recording.
-        if (!pieceTable) {
-          words = newWords;
-          audioPath = wavPath;
-          pieceTable = buildPieceTableFromTranscript(words, audioPath);
-          undoStack = [];
-          redoStack = [];
-          updateEditButtonStates();
-          renderTranscript(words);
-          await refreshMainWavePreviewFromEdits();
-          setStatus(`Transcript ready (${words.length} words)`, "success");
-          return;
-        }
+        // Show the recorded waveform + a separate transcribe button.
+        recordedEditor.audioPath = wavPath;
+        recordedEditor.words = [];
+        recordedEditor.pieceTable = null;
+        recordedEditor.undoStack = [];
+        recordedEditor.redoStack = [];
+        recordedEditor.selectedIndices = [];
+        recordedEditor.selectionAnchor = null;
+        recordedEditor.selectionStart = null;
+        recordedEditor.selectionEnd = null;
 
-        pushUndo();
-        const now = new Date().toISOString();
-        pieceTable.modifiedAt = now;
+        transcriptRecordedEl.innerHTML = "";
+        recordedWavePane.hidden = false;
+        recordedWaveDivider.hidden = false;
+        btnRecordedPlay.disabled = true;
+        btnTranscribeRecorded.disabled = false;
+        btnStopRecorded.hidden = true;
 
-        const addEntries: PieceEntry[] = newWords.map((w) => ({
-          id: `r${crypto.randomUUID().slice(0, 8)}`,
-          word: w.word,
-          sourceStart: w.start,
-          sourceEnd: w.end,
-          breakAfter: w.breakAfter,
-          sourceFile: wavPath,
-        }));
+        const recAb = await otter.readFileAsArrayBuffer(wavPath);
+        await wsRecorded.loadBlob(new Blob([recAb]));
+        btnRecordedPlay.disabled = false;
+        setRecordedPlayIcon(false);
 
-        const insertOffset = pieceTable.addBuffer.length;
-        pieceTable.addBuffer.push(...addEntries);
-        // Insert as one "added" piece at the end of the transcript
-        pieceTable.pieces.push({
-          source: "add",
-          offset: insertOffset,
-          length: addEntries.length,
-          status: "added",
-        });
-        pieceTable.pieces = mergePieces(pieceTable.pieces);
-
-        syncWordsFromPieceTable();
-        renderTranscript(words);
-        void refreshMainWavePreviewFromEdits();
         updateEditButtonStates();
-        setStatus(`Recording added (${addEntries.length} words).`, "success");
+        setStatus("Recording saved. Ready to transcribe.", "success");
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         setStatus("Recording failed (see logs).", "error");
@@ -2050,6 +2280,69 @@ btnRecord.addEventListener("click", async () => {
   }
 });
 
+btnRecordPause.addEventListener("click", () => {
+  if (!micRecorder) return;
+  if (micRecorder.state === "recording") {
+    try { micRecorder.pause(); } catch { /* ignore */ }
+    btnRecordPause.textContent = "▶ Resume Rec";
+    setStatus("Recording paused.", "info");
+  } else if (micRecorder.state === "paused") {
+    try { micRecorder.resume(); } catch { /* ignore */ }
+    btnRecordPause.textContent = "⏸ Pause Rec";
+    setStatus("Recording…", "working");
+  }
+});
+
+btnTranscribeRecorded.addEventListener("click", async () => {
+  if (!recordedEditor.audioPath) return;
+
+  btnTranscribeRecorded.disabled = true;
+  setRecordedTranscribingState(true);
+  setStatus("Transcribing recording…", "working");
+  progressEl.value = 0;
+  progressEl.hidden = false;
+
+  try {
+    const result = await otter.transcribeAudio(recordedEditor.audioPath, getActiveSpecArg());
+    if (result && typeof result === "object" && "cancelled" in result && (result as any).cancelled) {
+      setStatus("Recording transcription cancelled.", "info");
+      return;
+    }
+    const transcript: TranscriptResult = result as TranscriptResult;
+    const newWords = Array.isArray(transcript) ? transcript : (transcript.words || []);
+    if (newWords.length === 0) {
+      setStatus("No words transcribed from recording.", "info");
+      return;
+    }
+
+    recordedEditor.words = newWords;
+    recordedEditor.pieceTable = buildPieceTableFromTranscript(newWords, recordedEditor.audioPath);
+    recordedEditor.undoStack = [];
+    recordedEditor.redoStack = [];
+    recordedEditor.selectedIndices = [];
+    recordedEditor.selectionAnchor = null;
+    recordedEditor.selectionStart = null;
+    recordedEditor.selectionEnd = null;
+
+    renderTranscript(recordedEditor);
+    setActiveEditor(recordedEditor);
+    updateEditButtonStates();
+    setStatus(`Recording transcript ready (${newWords.length} words).`, "success");
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setStatus("Recording transcription failed (see logs).", "error");
+    appendLog("\nERROR recording transcription:\n" + msg + "\n");
+  } finally {
+    btnTranscribeRecorded.disabled = false;
+    setRecordedTranscribingState(false);
+    progressEl.hidden = true;
+  }
+});
+
+btnStopRecorded.addEventListener("click", async () => {
+  await otter.cancelTranscription();
+});
+
 btnRecordStop.addEventListener("click", async () => {
   try {
     micRecorder?.stop();
@@ -2063,41 +2356,38 @@ btnChoose.addEventListener("click", async () => {
   resetEditedPreviewState();
   setStatus("Choosing file…", "info");
 
+  // For now: one imported audio per project.
+  // If an imported audio already exists, block importing a second file.
+  if (importedEditor.audioPath || importedEditor.pieceTable) {
+    setStatus("This project already has an imported audio. (One imported audio per project for now.)", "error");
+    return;
+  }
+
   const selectedPath = await otter.chooseAudioFile();
   if (!selectedPath) {
     setStatus("File selection canceled.", "info");
     return;
   }
 
-  audioPath = selectedPath;
+  // Stage for transcription; do not clear existing project.
+  pendingImportAudioPath = selectedPath;
 
-  transcriptEl.innerHTML = "";
-  logEl.textContent = "";
-  pieceTable = null;
-  undoStack = [];
-  redoStack = [];
-  selectedIndices = [];
-  selectionStart = null;
-  selectionEnd = null;
-  selectionAnchor = null;
-  detailSelStart = null;
-  detailSelEnd = null;
-  updateEditButtonStates();
+  const fname = pendingImportAudioPath.split("/").pop() ?? pendingImportAudioPath;
+  setStatus(`Selected to append: ${fname}`, "success");
 
-  btnPlay.disabled = true;
-  let fname = audioPath.split("/").pop() ?? audioPath;
-  setStatus(`Loaded: ${fname}`, "success");
-  setPlayIcon(false);
   btnTranscribe.disabled = false;
 
-  // Load waveform from local file bytes via preload bridge
-  const ab = await otter.readFileAsArrayBuffer(audioPath);
-  const blob = new Blob([ab]);
-  await ws.loadBlob(blob);
-
-  btnPlay.disabled = false;
-
-  fnameEl.textContent = shortenFilenameMiddle(fname);
+  // If there is no existing project audio yet, this becomes the project base,
+  // so it's fine to show it in the waveform + filename label.
+  if (!importedEditor.pieceTable && !recordedEditor.pieceTable) {
+    fnameEl.textContent = shortenFilenameMiddle(fname);
+    btnPlay.disabled = true;
+    const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
+    const blob = new Blob([ab]);
+    await ws.loadBlob(blob);
+    btnPlay.disabled = false;
+    setPlayIcon(false);
+  }
 });
 
 //==============================================================================
@@ -2114,6 +2404,16 @@ function appendLog(msg: string) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// allow early error hooks to log once appendLog exists
+(window as any).__otterAppendLog = appendLog;
+
+// Flush any errors that happened before the log was initialized.
+if (earlyLogBuffer.length) {
+  for (const m of earlyLogBuffer) appendLog(m);
+  earlyLogBuffer.length = 0;
+  openDevPanelIfPresent();
+}
+
 // We've received a normal log message
 otter.onTranscribeLog((msg: string) => appendLog(msg));
 
@@ -2121,7 +2421,10 @@ otter.onTranscribeLog((msg: string) => appendLog(msg));
 otter.onTranscribeProgress((pct: number) => {
   progressEl.value = pct;
   progressEl.hidden = false;
-  statusEl.textContent = "Transcribing…";
+  // Don't override more specific statuses (e.g. "Transcribing recording…")
+  if (!statusEl.textContent || statusEl.textContent === "Transcribing…") {
+    statusEl.textContent = "Transcribing…";
+  }
 });
 
 
@@ -2270,11 +2573,16 @@ specSelect.addEventListener("change", async () => {
 
 // Init
 (async function initSpecUi() {
-  await populateSpecSelect();
-
-  // Start state: default selected, Customize unchecked, textarea hidden
-  chkCustomSpec.checked = false;
-  showCustomArea(false);
+  try {
+    await populateSpecSelect();
+    // Start state: default selected, Customize unchecked, textarea hidden
+    chkCustomSpec.checked = false;
+    showCustomArea(false);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    appendLog(`\nERROR: Failed to initialize model dropdown: ${msg}\n`);
+    setStatus("Model dropdown failed (see logs).", "error");
+  }
 })();
 
 //==============================================================================
@@ -2291,18 +2599,21 @@ const btnSaveEdl = mustGetEl<HTMLButtonElement>("btnSaveEdl");
 const btnLoadEdl = mustGetEl<HTMLButtonElement>("btnLoadEdl");
 const btnSaveEdits = mustGetEl<HTMLButtonElement>("btnSaveEdits");
 
+// Now that edit controls exist, it's safe to apply active editor UI state.
+setActiveEditor(activeEditor);
+
 //helper function for removing one breakline
 function removeOneBreakline(): boolean {
-  if (selectedIndices.length === 0) return false;
+  if (activeEditor.selectedIndices.length === 0) return false;
 
-  const lastSelected = selectedIndices[selectedIndices.length - 1];
-  const currentBreaks = words[lastSelected]?.breakAfter ?? 0;
+  const lastSelected = activeEditor.selectedIndices[activeEditor.selectedIndices.length - 1];
+  const currentBreaks = activeEditor.words[lastSelected]?.breakAfter ?? 0;
 
   if (currentBreaks <= 0) return false;
 
-  pushUndo();
-  words[lastSelected].breakAfter = currentBreaks - 1;
-  renderTranscript(words);
+  pushUndo(activeEditor);
+  activeEditor.words[lastSelected].breakAfter = currentBreaks - 1;
+  renderTranscript(activeEditor);
   updateEditButtonStates();
   return true;
 }
@@ -2315,45 +2626,45 @@ function removeOneBreakline(): boolean {
  * remain visible with strikethrough styling so the user can restore them.
  */
 function removeSelection() {
-  if (!pieceTable || selectedIndices.length === 0) return;
-  pushUndo();
+  if (!activeEditor.pieceTable || activeEditor.selectedIndices.length === 0) return;
+  pushUndo(activeEditor);
   let changedAny = false;
-  const ranges = getSelectedRanges(uniqueSortedIndices(selectedIndices));
+  const ranges = getSelectedRanges(uniqueSortedIndices(activeEditor.selectedIndices));
   for (const r of ranges) {
-    const changed = applyStatusToRange(pieceTable, r.start, r.end, "active", "deleted");
+    const changed = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "active", "deleted");
     if (changed) changedAny = true;
   }
   if (!changedAny) {
     // Nothing was active in that range — pop the undo we just pushed
-    undoStack.pop();
+    activeEditor.undoStack.pop();
     return;
   }
-  renderTranscript(words);
+  renderTranscript(activeEditor);
   void refreshMainWavePreviewFromEdits();
   updateEditButtonStates();
-  refreshDetailIfActive();
+  if (activeEditor.kind === "imported") refreshDetailIfActive();
 }
 
 /**
  * Restore previously removed words in the current selection.
  */
 function restoreSelection() {
-  if (!pieceTable || selectedIndices.length === 0) return;
-  pushUndo();
+  if (!activeEditor.pieceTable || activeEditor.selectedIndices.length === 0) return;
+  pushUndo(activeEditor);
   let changedAny = false;
-  const ranges = getSelectedRanges(uniqueSortedIndices(selectedIndices));
+  const ranges = getSelectedRanges(uniqueSortedIndices(activeEditor.selectedIndices));
   for (const r of ranges) {
-    const changed = applyStatusToRange(pieceTable, r.start, r.end, "deleted", "active");
+    const changed = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "deleted", "active");
     if (changed) changedAny = true;
   }
   if (!changedAny) {
-    undoStack.pop();
+    activeEditor.undoStack.pop();
     return;
   }
-  renderTranscript(words);
+  renderTranscript(activeEditor);
   void refreshMainWavePreviewFromEdits();
   updateEditButtonStates();
-  refreshDetailIfActive();
+  if (activeEditor.kind === "imported") refreshDetailIfActive();
 }
 
 btnRemove.addEventListener("click", () => removeSelection());
@@ -2364,21 +2675,113 @@ window.addEventListener("mouseup", () => {
 });
 
 btnUndo.addEventListener("click", () => {
-  if (performUndo()) {
-    renderTranscript(words);
+  if (performUndo(activeEditor)) {
+    renderTranscript(activeEditor);
     void refreshMainWavePreviewFromEdits();
     updateEditButtonStates();
-    refreshDetailIfActive();
+    if (activeEditor.kind === "imported") refreshDetailIfActive();
   }
 });
 
 btnRedo.addEventListener("click", () => {
-  if (performRedo()) {
-    renderTranscript(words);
+  if (performRedo(activeEditor)) {
+    renderTranscript(activeEditor);
     void refreshMainWavePreviewFromEdits();
     updateEditButtonStates();
-    refreshDetailIfActive();
+    if (activeEditor.kind === "imported") refreshDetailIfActive();
   }
+});
+
+btnAddRecordedToTranscript.addEventListener("click", () => {
+  if (!recordedEditor.pieceTable || recordedEditor.words.length === 0) return;
+
+  // If there is no imported transcript yet, promote recorded → imported.
+  if (!importedEditor.pieceTable) {
+    importedEditor.audioPath = importedEditor.audioPath || recordedEditor.audioPath;
+    importedEditor.words = recordedEditor.words.map(w => ({ ...w }));
+    importedEditor.pieceTable = recordedEditor.pieceTable;
+    importedEditor.undoStack = recordedEditor.undoStack.slice();
+    importedEditor.redoStack = recordedEditor.redoStack.slice();
+    importedEditor.selectedIndices = [];
+    importedEditor.selectionAnchor = null;
+    importedEditor.selectionStart = null;
+    importedEditor.selectionEnd = null;
+
+    recordedEditor.audioPath = null;
+    recordedEditor.words = [];
+    recordedEditor.pieceTable = null;
+    recordedEditor.undoStack = [];
+    recordedEditor.redoStack = [];
+    recordedEditor.selectedIndices = [];
+    recordedEditor.selectionAnchor = null;
+    recordedEditor.selectionStart = null;
+    recordedEditor.selectionEnd = null;
+
+    renderTranscript(importedEditor);
+    transcriptRecordedEl.innerHTML = "";
+    recordedWavePane.hidden = true;
+    recordedWaveDivider.hidden = true;
+    btnRecordedPlay.disabled = true;
+    btnTranscribeRecorded.disabled = true;
+    btnStopRecorded.hidden = true;
+    setActiveEditor(importedEditor);
+    void refreshMainWavePreviewFromEdits();
+    updateEditButtonStates();
+    setStatus("Recorded transcript added to main transcript.", "success");
+    return;
+  }
+
+  // Merge: append recorded transcript entries as "added" words at the end of imported.
+  const mainPt = importedEditor.pieceTable;
+  const recPt = recordedEditor.pieceTable;
+
+  pushUndo(importedEditor);
+
+  const recView = getViewEntries(recPt);
+  const recActive = recView.filter(v => v.status !== "deleted");
+  const addEntries: PieceEntry[] = recActive.map((ve) => ({
+    id: `r${crypto.randomUUID().slice(0, 8)}`,
+    word: ve.entry.word,
+    sourceStart: ve.entry.sourceStart,
+    sourceEnd: ve.entry.sourceEnd,
+    breakAfter: ve.entry.breakAfter,
+    sourceFile: recordedEditor.audioPath || ve.entry.sourceFile,
+  }));
+
+  const insertOffset = mainPt.addBuffer.length;
+  mainPt.addBuffer.push(...addEntries);
+  mainPt.pieces.push({
+    source: "add",
+    offset: insertOffset,
+    length: addEntries.length,
+    status: "added",
+  });
+  mainPt.pieces = mergePieces(mainPt.pieces);
+
+  syncWordsFromPieceTable(importedEditor);
+  renderTranscript(importedEditor);
+
+  // Clear recorded editor after merge
+  recordedEditor.audioPath = null;
+  recordedEditor.words = [];
+  recordedEditor.pieceTable = null;
+  recordedEditor.undoStack = [];
+  recordedEditor.redoStack = [];
+  recordedEditor.selectedIndices = [];
+  recordedEditor.selectionAnchor = null;
+  recordedEditor.selectionStart = null;
+  recordedEditor.selectionEnd = null;
+  transcriptRecordedEl.innerHTML = "";
+  recordedWavePane.hidden = true;
+  recordedWaveDivider.hidden = true;
+  btnRecordedPlay.disabled = true;
+  btnTranscribeRecorded.disabled = true;
+  btnStopRecorded.hidden = true;
+
+  setActiveEditor(importedEditor);
+  void refreshMainWavePreviewFromEdits();
+  updateEditButtonStates();
+  setStatus("Recorded transcript appended to main transcript.", "success");
 });
 
 document.addEventListener("keydown", (e: KeyboardEvent) => {
@@ -2390,30 +2793,30 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
 
   if (isMeta && !e.shiftKey && e.key === "z") {
     e.preventDefault();
-    if (performUndo()) {
-      renderTranscript(words);
+    if (performUndo(activeEditor)) {
+      renderTranscript(activeEditor);
       updateEditButtonStates();
-      refreshDetailIfActive();
+      if (activeEditor.kind === "imported") refreshDetailIfActive();
     }
     return;
   }
 
   if (isMeta && e.shiftKey && e.key === "z") {
     e.preventDefault();
-    if (performRedo()) {
-      renderTranscript(words);
+    if (performRedo(activeEditor)) {
+      renderTranscript(activeEditor);
       updateEditButtonStates();
-      refreshDetailIfActive();
+      if (activeEditor.kind === "imported") refreshDetailIfActive();
     }
     return;
   }
 
   if (isMeta && e.key === "y") {
     e.preventDefault();
-    if (performRedo()) {
-      renderTranscript(words);
+    if (performRedo(activeEditor)) {
+      renderTranscript(activeEditor);
       updateEditButtonStates();
-      refreshDetailIfActive();
+      if (activeEditor.kind === "imported") refreshDetailIfActive();
     }
     return;
   }
@@ -2442,11 +2845,11 @@ if (e.key === "r" || e.key === "R") {
 if (e.key === "Enter") {
   e.preventDefault();
 
-  if (selectedIndices.length > 0) {
-    const lastSelected = selectedIndices[selectedIndices.length - 1];
-    pushUndo();
-    words[lastSelected].breakAfter = (words[lastSelected].breakAfter ?? 0) + 1;
-    renderTranscript(words);
+  if (activeEditor.selectedIndices.length > 0) {
+    const lastSelected = activeEditor.selectedIndices[activeEditor.selectedIndices.length - 1];
+    pushUndo(activeEditor);
+    activeEditor.words[lastSelected].breakAfter = (activeEditor.words[lastSelected].breakAfter ?? 0) + 1;
+    renderTranscript(activeEditor);
     updateEditButtonStates();
   }
   return;
@@ -2454,11 +2857,19 @@ if (e.key === "Enter") {
 });
 
 btnSaveEdl.addEventListener("click", async () => {
-  if (!pieceTable) return;
+  if (!importedEditor.pieceTable && !recordedEditor.pieceTable) return;
 
   try {
-    syncBreakAfterToPieceTable();
-    const payload = { version: 2, pieceTable };
+    if (importedEditor.pieceTable) syncBreakAfterToPieceTable(importedEditor);
+    if (recordedEditor.pieceTable) syncBreakAfterToPieceTable(recordedEditor);
+
+    const payload = {
+      version: 3,
+      imported: importedEditor.pieceTable,
+      recorded: recordedEditor.pieceTable,
+      importedAudioPath: importedEditor.audioPath,
+      recordedAudioPath: recordedEditor.audioPath,
+    };
     const json = JSON.stringify(payload, null, 2);
     const savedPath = await otter.saveEdl(json);
     if (savedPath) {
@@ -2481,43 +2892,86 @@ btnLoadEdl.addEventListener("click", async () => {
 
     const parsed = JSON.parse(result.content);
 
+    if (parsed && typeof parsed === "object" && parsed.version === 3) {
+      const p = parsed as any;
+      importedEditor.pieceTable = p.imported ?? null;
+      recordedEditor.pieceTable = p.recorded ?? null;
+      importedEditor.audioPath = typeof p.importedAudioPath === "string" ? p.importedAudioPath : (importedEditor.pieceTable?.sourceFile ?? null);
+      recordedEditor.audioPath = typeof p.recordedAudioPath === "string" ? p.recordedAudioPath : (recordedEditor.pieceTable?.sourceFile ?? null);
+    } else
     if (isEdlV2(parsed)) {
-      pieceTable = parsed.pieceTable;
+      importedEditor.pieceTable = parsed.pieceTable;
     } else if (isEdlV1(parsed)) {
-      pieceTable = convertV1ToV2(parsed);
+      importedEditor.pieceTable = convertV1ToV2(parsed);
     } else {
       setStatus("Invalid EDL file.", "error");
       appendLog("\nERROR: file is not a valid OTTER EDL.\n");
       return;
     }
 
-    undoStack = [];
-    redoStack = [];
-    audioPath = pieceTable.sourceFile;
+    importedEditor.undoStack = [];
+    importedEditor.redoStack = [];
+    importedEditor.selectedIndices = [];
+    importedEditor.selectionAnchor = null;
+    importedEditor.selectionStart = null;
+    importedEditor.selectionEnd = null;
 
-    const viewEntries = getViewEntries(pieceTable);
-    words = viewEntries.map(ve => ({
-      word: ve.entry.word,
-      start: ve.entry.sourceStart,
-      end: ve.entry.sourceEnd,
-      breakAfter: ve.entry.breakAfter,
-    }));
+    recordedEditor.undoStack = [];
+    recordedEditor.redoStack = [];
+    recordedEditor.selectedIndices = [];
+    recordedEditor.selectionAnchor = null;
+    recordedEditor.selectionStart = null;
+    recordedEditor.selectionEnd = null;
 
-    // Load the source audio waveform
-    const ab = await otter.readFileAsArrayBuffer(audioPath);
-    const blob = new Blob([ab]);
-    await ws.loadBlob(blob);
+    if (importedEditor.pieceTable) {
+      importedEditor.audioPath = importedEditor.audioPath || importedEditor.pieceTable.sourceFile;
+      const viewEntries = getViewEntries(importedEditor.pieceTable);
+      importedEditor.words = viewEntries.map(ve => ({
+        word: ve.entry.word,
+        start: ve.entry.sourceStart,
+        end: ve.entry.sourceEnd,
+        breakAfter: ve.entry.breakAfter,
+      }));
+    } else {
+      importedEditor.words = [];
+    }
+
+    if (recordedEditor.pieceTable) {
+      recordedEditor.audioPath = recordedEditor.audioPath || recordedEditor.pieceTable.sourceFile;
+      const viewEntries = getViewEntries(recordedEditor.pieceTable);
+      recordedEditor.words = viewEntries.map(ve => ({
+        word: ve.entry.word,
+        start: ve.entry.sourceStart,
+        end: ve.entry.sourceEnd,
+        breakAfter: ve.entry.breakAfter,
+      }));
+    } else {
+      recordedEditor.words = [];
+    }
+
+    transcriptImportedEl.innerHTML = "";
+    transcriptRecordedEl.innerHTML = "";
+    if (importedEditor.pieceTable) renderTranscript(importedEditor);
+    if (recordedEditor.pieceTable) renderTranscript(recordedEditor);
+
+    // Load base waveform from imported audio if available, else recorded.
+    const baseAudio = importedEditor.audioPath || recordedEditor.audioPath;
+    if (baseAudio) {
+      const ab = await otter.readFileAsArrayBuffer(baseAudio);
+      const blob = new Blob([ab]);
+      await ws.loadBlob(blob);
+    }
 
     // Update UI state
-    const fname = audioPath.split("/").pop() ?? audioPath;
-    fnameEl.textContent = shortenFilenameMiddle(fname);
-    setStatus(`EDL loaded (${viewEntries.length} entries)`, "success");
+    const fname = (importedEditor.audioPath || recordedEditor.audioPath || "").split("/").pop() ?? "";
+    fnameEl.textContent = fname ? shortenFilenameMiddle(fname) : "No file loaded";
+    setStatus(`EDL loaded`, "success");
     appendLog(`EDL loaded from ${result.path}\n`);
 
     btnPlay.disabled = false;
     btnTranscribe.disabled = false;
+    setActiveEditor(importedEditor.pieceTable ? importedEditor : recordedEditor);
     updateEditButtonStates();
-    renderTranscript(words);
     updateDeletedRegions();
     refreshDetailIfActive();
     await refreshMainWavePreviewFromEdits();
@@ -2529,10 +2983,12 @@ btnLoadEdl.addEventListener("click", async () => {
 });
 
 btnSaveEdits.addEventListener("click", async () => {
-  if (!pieceTable) return;
+  if (!importedEditor.pieceTable && !recordedEditor.pieceTable) return;
 
-  const pt = pieceTable;
-  const activeEntries = getActiveEntries(pt);
+  // Export uses the combined active entries (imported + recorded).
+  const activeImported = importedEditor.pieceTable ? getActiveEntries(importedEditor.pieceTable) : [];
+  const activeRecorded = recordedEditor.pieceTable ? getActiveEntries(recordedEditor.pieceTable) : [];
+  const activeEntries = activeImported.concat(activeRecorded);
   if (activeEntries.length === 0) {
     setStatus("Nothing to export (all words removed).", "error");
     return;
@@ -2543,17 +2999,17 @@ btnSaveEdits.addEventListener("click", async () => {
 
     const exportPayload = {
       version: 1,
-      sourceFile: pt.sourceFile,
+      sourceFile: importedEditor.audioPath || recordedEditor.audioPath || "",
       entries: activeEntries.map(ve => ({
         id: ve.entry.id,
-        sourceFile: getEntrySourceFile(pt, ve.entry),
+        sourceFile: ve.entry.sourceFile || importedEditor.audioPath || recordedEditor.audioPath || "",
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,
         muted: false,
       })),
-      createdAt: pt.createdAt,
-      modifiedAt: pt.modifiedAt,
+      createdAt: importedEditor.pieceTable?.createdAt || new Date().toISOString(),
+      modifiedAt: importedEditor.pieceTable?.modifiedAt || new Date().toISOString(),
     };
 
     const json = JSON.stringify(exportPayload, null, 2);

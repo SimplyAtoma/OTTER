@@ -18,6 +18,7 @@
       <select id="micSelect" title="Recording input device"></select>
       <button type="button" id="btnRefreshMics" title="Refresh microphone list (may prompt for permission)">↻</button>
       <button id="btnRecord" title="Record from selected microphone">⏺ Record</button>
+      <button id="btnRecordPause" hidden title="Pause recording">⏸ Pause Rec</button>
       <button id="btnRecordStop" hidden title="Stop recording">⏹ Stop Rec</button>
 
       <label for="modeSelect">Quality:</label>
@@ -56,6 +57,28 @@
             </div>
             <div class="transportGroup right">
               <span id="loadedFile">No file loaded</span>
+            </div>
+          </div>
+        </div>
+
+        <hr id="recordedWaveDivider" hidden>
+
+        <div id="recordedWavePane" hidden>
+          <div class="waveBlock">
+            <div id="waveformRecorded"></div>
+
+            <div class="transport" id="recordedTransport">
+              <div class="transportGroup left">
+                <label>Play Recording</label>
+                <button id="btnRecordedPlay" disabled aria-label="Play/Pause Recording" title="Play/Pause Recording">▶︎</button>
+              </div>
+              <div class="transportGroup center">
+                <span id="recordedTime" class="numericReadout">0.00</span>
+              </div>
+              <div class="transportGroup right">
+                <button id="btnTranscribeRecorded" disabled title="Transcribe recorded audio">Transcribe Rec</button>
+                <button id="btnStopRecorded" hidden title="Stop recorded transcription">⏹ Stop</button>
+              </div>
             </div>
           </div>
         </div>
@@ -126,7 +149,15 @@
       <!-- RIGHT COLUMN: Transcript only -->
       <section class="textPane">
         <div class="paneTitle">Transcript</div>
-        <div id="transcript"></div>
+        <div id="transcriptImported" class="transcriptPane"></div>
+
+        <div class="paneTitle transcriptSubTitleRow">
+          <span>Recorded Transcript</span>
+          <button id="btnAddRecordedToTranscript" disabled title="Append the edited recorded transcript to the end of the main transcript">
+            Add to Transcript
+          </button>
+        </div>
+        <div id="transcriptRecorded" class="transcriptPane"></div>
       </section>
 
       <div id ="searchBar" hidden>

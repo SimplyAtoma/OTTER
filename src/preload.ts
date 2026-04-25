@@ -227,4 +227,14 @@ contextBridge.exposeInMainWorld("otter", {
     return ipcRenderer.invoke("save-mic-recording", buf, mimeType);
   },
 
+  /**
+   * Save a microphone recording to a user-chosen WAV path and return that path.
+   *
+   * @returns {Promise<string|null>} Saved WAV path, or null if canceled
+   */
+  saveMicRecordingAs: (data: ArrayBuffer, mimeType: string): Promise<string | null> => {
+    const buf = Buffer.from(new Uint8Array(data));
+    return ipcRenderer.invoke("save-mic-recording-as", buf, mimeType);
+  },
+
 });
