@@ -256,7 +256,7 @@ window.addEventListener("unhandledrejection", (ev) => {
   }
 });
 
-type EditorKind = "imported" | "recorded";
+type EditorKind = "imported" | "pending-import" | "recorded";
 type InteractionMode = "select" | "move";
 
 type EditorState = {
@@ -275,6 +275,7 @@ type EditorState = {
 };
 
 let importedEditor: EditorState;
+let pendingImportEditor: EditorState;
 let recordedEditor: EditorState;
 let activeEditor: EditorState;
 let playheadIndex = -1;
@@ -302,6 +303,7 @@ let isRefreshingPreview = false;
 function setActiveEditor(next: EditorState) {
   activeEditor = next;
   transcriptImportedEl.classList.toggle("isActive", activeEditor.kind === "imported");
+  transcriptPendingImportedEl.classList.toggle("isActive", activeEditor.kind === "pending-import");
   transcriptRecordedEl.classList.toggle("isActive", activeEditor.kind === "recorded");
   updateEditButtonStates();
 }
@@ -819,14 +821,17 @@ function convertV1ToV2(v1: { sourceFile: string; entries: EdlV1Entry[]; createdA
 function updateEditButtonStates() {
   const hasPt = activeEditor.pieceTable != null;
   const hasSel = activeEditor.selectedIndices.length > 0;
+  const hasAnyTranscript = importedEditor.pieceTable != null || pendingImportEditor.pieceTable != null || recordedEditor.pieceTable != null;
+  const hasMainTranscript = importedEditor.pieceTable != null;
 
   btnRemove.disabled = !hasPt || !hasSel;
   btnRestore.disabled = !hasPt || !hasSel;
   btnUndo.disabled = !hasPt || activeEditor.undoStack.length === 0;
   btnRedo.disabled = !hasPt || activeEditor.redoStack.length === 0;
-  btnSaveEdl.disabled = !hasPt;
-  btnSaveEdits.disabled = !hasPt;
+  btnSaveEdl.disabled = !hasAnyTranscript;
+  btnSaveEdits.disabled = !hasMainTranscript;
 
+  btnAddImportedToTranscript.disabled = pendingImportEditor.pieceTable == null || pendingImportEditor.words.length === 0;
   btnAddRecordedToTranscript.disabled = recordedEditor.pieceTable == null || recordedEditor.words.length === 0;
 }
 
@@ -908,6 +913,7 @@ function updateDeletedRegions() {
 //==============================================================================
 
 const transcriptImportedEl = mustGetEl<HTMLDivElement>("transcriptImported");
+const transcriptPendingImportedEl = mustGetEl<HTMLDivElement>("transcriptPendingImported");
 const transcriptRecordedEl = mustGetEl<HTMLDivElement>("transcriptRecorded");
 // Back-compat for existing transcript logic; will be extended to support both panes.
 const transcriptEl = transcriptImportedEl;
@@ -920,9 +926,12 @@ const btnRefreshMics = mustGetEl<HTMLButtonElement>("btnRefreshMics");
 const btnRecord = mustGetEl<HTMLButtonElement>("btnRecord");
 const btnRecordPause = mustGetEl<HTMLButtonElement>("btnRecordPause");
 const btnRecordStop = mustGetEl<HTMLButtonElement>("btnRecordStop");
+const btnAddImportedToTranscript = mustGetEl<HTMLButtonElement>("btnAddImportedToTranscript");
 const btnAddRecordedToTranscript = mustGetEl<HTMLButtonElement>("btnAddRecordedToTranscript");
 const btnImportedSelectMode = mustGetEl<HTMLButtonElement>("btnImportedSelectMode");
 const btnImportedMoveMode = mustGetEl<HTMLButtonElement>("btnImportedMoveMode");
+const btnPendingImportSelectMode = mustGetEl<HTMLButtonElement>("btnPendingImportSelectMode");
+const btnPendingImportMoveMode = mustGetEl<HTMLButtonElement>("btnPendingImportMoveMode");
 const btnRecordedSelectMode = mustGetEl<HTMLButtonElement>("btnRecordedSelectMode");
 const btnRecordedMoveMode = mustGetEl<HTMLButtonElement>("btnRecordedMoveMode");
 const statusEl = mustGetEl<HTMLDivElement>("status");
@@ -930,6 +939,21 @@ const statusEl = mustGetEl<HTMLDivElement>("status");
 importedEditor = {
   kind: "imported",
   paneEl: transcriptImportedEl,
+  audioPath: null,
+  words: [],
+  pieceTable: null,
+  undoStack: [],
+  redoStack: [],
+  selectionStart: null,
+  selectionEnd: null,
+  selectionAnchor: null,
+  selectedIndices: [],
+  interactionMode: "select",
+};
+
+pendingImportEditor = {
+  kind: "pending-import",
+  paneEl: transcriptPendingImportedEl,
   audioPath: null,
   words: [],
   pieceTable: null,
@@ -987,11 +1011,13 @@ function attachTranscriptPaneDnD(pane: HTMLDivElement, editor: EditorState) {
 }
 
 attachTranscriptPaneDnD(transcriptImportedEl, importedEditor);
+attachTranscriptPaneDnD(transcriptPendingImportedEl, pendingImportEditor);
 attachTranscriptPaneDnD(transcriptRecordedEl, recordedEditor);
 
 function updateInteractionModeButtons() {
   const buttonPairs = [
     { editor: importedEditor, selectBtn: btnImportedSelectMode, moveBtn: btnImportedMoveMode },
+    { editor: pendingImportEditor, selectBtn: btnPendingImportSelectMode, moveBtn: btnPendingImportMoveMode },
     { editor: recordedEditor, selectBtn: btnRecordedSelectMode, moveBtn: btnRecordedMoveMode },
   ];
 
@@ -1026,6 +1052,8 @@ function setInteractionMode(editor: EditorState, nextMode: InteractionMode) {
 
 btnImportedSelectMode.addEventListener("click", () => setInteractionMode(importedEditor, "select"));
 btnImportedMoveMode.addEventListener("click", () => setInteractionMode(importedEditor, "move"));
+btnPendingImportSelectMode.addEventListener("click", () => setInteractionMode(pendingImportEditor, "select"));
+btnPendingImportMoveMode.addEventListener("click", () => setInteractionMode(pendingImportEditor, "move"));
 btnRecordedSelectMode.addEventListener("click", () => setInteractionMode(recordedEditor, "select"));
 btnRecordedMoveMode.addEventListener("click", () => setInteractionMode(recordedEditor, "move"));
 updateInteractionModeButtons();
@@ -1045,6 +1073,43 @@ function setTranscribingState(active: boolean) {
 function setRecordedTranscribingState(active: boolean) {
   btnTranscribeRecorded.hidden = active;
   btnStopRecorded.hidden = !active;
+}
+
+function resetEditorState(editor: EditorState) {
+  editor.audioPath = null;
+  editor.words = [];
+  editor.pieceTable = null;
+  editor.undoStack = [];
+  editor.redoStack = [];
+  editor.selectedIndices = [];
+  editor.selectionAnchor = null;
+  editor.selectionStart = null;
+  editor.selectionEnd = null;
+}
+
+function clearPendingImportedView() {
+  resetEditorState(pendingImportEditor);
+  transcriptPendingImportedEl.innerHTML = "";
+  importedWavePane.hidden = true;
+  importedWaveDivider.hidden = true;
+  btnImportedPlay.disabled = true;
+  importedLoadedFileEl.textContent = "No imported audio staged";
+  importedTimeEl.textContent = "0.00";
+  if (typeof wsImported.empty === "function") wsImported.empty();
+  setImportedPlayIcon(false);
+}
+
+function clearRecordedView() {
+  resetEditorState(recordedEditor);
+  transcriptRecordedEl.innerHTML = "";
+  recordedWavePane.hidden = true;
+  recordedWaveDivider.hidden = true;
+  btnRecordedPlay.disabled = true;
+  btnTranscribeRecorded.disabled = true;
+  btnStopRecorded.hidden = true;
+  recordedTimeEl.textContent = "0.00";
+  if (typeof wsRecorded.empty === "function") wsRecorded.empty();
+  setRecordedPlayIcon(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1398,6 +1463,14 @@ function resetEditedPreviewState() {
   previewWordTimes = [];
 }
 
+function clearMainWave() {
+  if (ws.isPlaying()) ws.pause();
+  if (typeof ws.empty === "function") ws.empty();
+  btnPlay.disabled = true;
+  fnameEl.textContent = "No file loaded";
+  setPlayIcon(false);
+}
+
 function buildPreviewWordTimesFromActiveEntries(activeEntries: ViewEntry[]): Array<{ start: number; end: number }> {
   const out: Array<{ start: number; end: number }> = [];
   let t = 0;
@@ -1420,34 +1493,29 @@ async function loadMainWaveFromPath(filePath: string) {
 }
 
 async function refreshMainWavePreviewFromEdits() {
-  const baseAudio = importedEditor.audioPath || recordedEditor.audioPath;
-  if (!baseAudio) return;
+  const baseAudio = importedEditor.audioPath;
+  if (!baseAudio || !importedEditor.pieceTable) {
+    resetEditedPreviewState();
+    clearMainWave();
+    return;
+  }
 
   const token = ++previewRefreshToken;
   isRefreshingPreview = true;
 
   try {
-    // If there is no transcript editing state at all, show the raw imported audio.
-    if (!importedEditor.pieceTable && !recordedEditor.pieceTable) {
-      resetEditedPreviewState();
-      await loadMainWaveFromPath(baseAudio);
-      return;
-    }
-
     const activeImported = importedEditor.pieceTable ? getActiveEntries(importedEditor.pieceTable) : [];
-    const activeRecorded = recordedEditor.pieceTable ? getActiveEntries(recordedEditor.pieceTable) : [];
-    const combined = activeImported.concat(activeRecorded);
 
-    if (combined.length === 0) {
+    if (activeImported.length === 0) {
       resetEditedPreviewState();
-      await loadMainWaveFromPath(baseAudio);
+      clearMainWave();
       return;
     }
 
     const payload = {
       version: 1,
       sourceFile: baseAudio,
-      entries: combined.map((ve) => ({
+      entries: activeImported.map((ve) => ({
         id: ve.entry.id,
         sourceFile: ve.entry.sourceFile || baseAudio,
         sourceStart: ve.entry.sourceStart,
@@ -1466,14 +1534,14 @@ async function refreshMainWavePreviewFromEdits() {
     await loadMainWaveFromPath(previewPath);
     if (token !== previewRefreshToken) return;
 
-    previewWordTimes = buildPreviewWordTimesFromActiveEntries(combined);
+    previewWordTimes = buildPreviewWordTimesFromActiveEntries(activeImported);
     isEditedPreviewMode = true;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     appendLog(`\nWARN: Failed to refresh edited preview: ${msg}\n`);
-    if (token === previewRefreshToken && baseAudio) {
+    if (token === previewRefreshToken) {
       resetEditedPreviewState();
-      await loadMainWaveFromPath(baseAudio);
+      clearMainWave();
     }
   } finally {
     if (token === previewRefreshToken) {
@@ -1743,6 +1811,8 @@ function renderTranscript(editor: EditorState) {
           : Number(w.start);
         ws.setTime(seekTime + SEEK_EPS);
         setPlayheadIndex(i);
+      } else if (editor.kind === "pending-import") {
+        wsImported.setTime(Number(w.start) + SEEK_EPS);
       } else {
         wsRecorded.setTime(Number(w.start) + SEEK_EPS);
       }
@@ -1858,6 +1928,13 @@ const timeEl = mustGetEl<HTMLSpanElement>("time");
 const progressEl = mustGetEl<HTMLProgressElement>("transcribeProgress");
 const fnameEl = mustGetEl<HTMLSpanElement>("loadedFile");
 
+// Pending imported waveform UI
+const importedWavePane = mustGetEl<HTMLDivElement>("importedWavePane");
+const importedWaveDivider = mustGetEl<HTMLHRElement>("importedWaveDivider");
+const btnImportedPlay = mustGetEl<HTMLButtonElement>("btnImportedPlay");
+const importedTimeEl = mustGetEl<HTMLSpanElement>("importedTime");
+const importedLoadedFileEl = mustGetEl<HTMLSpanElement>("importedLoadedFile");
+
 // Recorded waveform UI
 const recordedWavePane = mustGetEl<HTMLDivElement>("recordedWavePane");
 const recordedWaveDivider = mustGetEl<HTMLHRElement>("recordedWaveDivider");
@@ -1884,11 +1961,34 @@ const ws = WaveSurfer.create({
   plugins: [mainRegions]
 });
 
+const wsImported = WaveSurfer.create({
+  container: "#waveformImported",
+  height: 80,
+  normalize: true,
+});
+
 // Recorded waveform (separate from project waveform)
 const wsRecorded = WaveSurfer.create({
   container: "#waveformRecorded",
   height: 80,
   normalize: true,
+});
+
+function setImportedPlayIcon(isPlaying: boolean) {
+  btnImportedPlay.textContent = "Play";
+  btnImportedPlay.title = isPlaying ? "Pause Imported Audio" : "Play Imported Audio";
+  btnImportedPlay.setAttribute("aria-label", isPlaying ? "Pause Imported Audio" : "Play Imported Audio");
+}
+
+wsImported.on("play", () => setImportedPlayIcon(true));
+wsImported.on("pause", () => setImportedPlayIcon(false));
+wsImported.on("finish", () => setImportedPlayIcon(false));
+wsImported.on("timeupdate", (t: number) => {
+  importedTimeEl.textContent = `${t.toFixed(2)}s`;
+});
+
+btnImportedPlay.addEventListener("click", () => {
+  wsImported.playPause();
 });
 
 function setRecordedPlayIcon(isPlaying: boolean) {
@@ -2153,6 +2253,10 @@ function setDetailPlayIcon(isPlaying: boolean) {
 
 // Initial record UI state
 setRecordingState(false);
+importedWavePane.hidden = true;
+importedWaveDivider.hidden = true;
+btnImportedPlay.disabled = true;
+setImportedPlayIcon(false);
 recordedWavePane.hidden = true;
 recordedWaveDivider.hidden = true;
 btnRecordedPlay.disabled = true;
@@ -2168,7 +2272,7 @@ btnStopRecorded.hidden = true;
 
 // Handle the "Transcribe" button
 btnTranscribe.addEventListener("click", async () => {
-  const toTranscribe = pendingImportAudioPath || importedEditor.audioPath;
+  const toTranscribe = pendingImportAudioPath;
   if (!toTranscribe) return;
   resetEditedPreviewState();
   btnTranscribe.disabled = true;
@@ -2192,63 +2296,19 @@ btnTranscribe.addEventListener("click", async () => {
     const langSuffix = lang ? `, lang=${lang}` : "";
     setStatus(`Transcript ready (${newWords.length} words${langSuffix})`, "success");
 
-    // If this is the first transcript in the project, it becomes the project base.
-    if (!importedEditor.pieceTable && !recordedEditor.pieceTable) {
-      importedEditor.audioPath = toTranscribe;
-      importedEditor.words = newWords;
-      importedEditor.pieceTable = buildPieceTableFromTranscript(importedEditor.words, importedEditor.audioPath!);
-      importedEditor.undoStack = [];
-      importedEditor.redoStack = [];
-      importedEditor.selectedIndices = [];
-      importedEditor.selectionAnchor = null;
-      importedEditor.selectionStart = null;
-      importedEditor.selectionEnd = null;
-    } else if (!importedEditor.pieceTable) {
-      // If project exists but imported transcript doesn't, initialize imported editor,
-      // then treat this transcript as the first imported segment.
-      importedEditor.audioPath = importedEditor.audioPath || toTranscribe;
-      importedEditor.words = newWords;
-      importedEditor.pieceTable = buildPieceTableFromTranscript(importedEditor.words, importedEditor.audioPath!);
-      importedEditor.undoStack = [];
-      importedEditor.redoStack = [];
-      importedEditor.selectedIndices = [];
-      importedEditor.selectionAnchor = null;
-      importedEditor.selectionStart = null;
-      importedEditor.selectionEnd = null;
-    } else {
-      // Append to end of main transcript (project timeline).
-      const mainPt = importedEditor.pieceTable;
-      pushUndo(importedEditor);
-
-      const addEntries: PieceEntry[] = newWords.map((w) => ({
-        id: `i${crypto.randomUUID().slice(0, 8)}`,
-        word: w.word,
-        sourceStart: w.start,
-        sourceEnd: w.end,
-        breakAfter: w.breakAfter,
-        sourceFile: toTranscribe,
-      }));
-
-      const insertOffset = mainPt.addBuffer.length;
-      mainPt.addBuffer.push(...addEntries);
-      mainPt.pieces.push({
-        source: "add",
-        offset: insertOffset,
-        length: addEntries.length,
-        status: "added",
-      });
-      mainPt.pieces = mergePieces(mainPt.pieces);
-
-      syncWordsFromPieceTable(importedEditor);
-    }
+    pendingImportEditor.audioPath = toTranscribe;
+    pendingImportEditor.words = newWords;
+    pendingImportEditor.pieceTable = buildPieceTableFromTranscript(newWords, toTranscribe);
+    pendingImportEditor.undoStack = [];
+    pendingImportEditor.redoStack = [];
+    pendingImportEditor.selectedIndices = [];
+    pendingImportEditor.selectionAnchor = null;
+    pendingImportEditor.selectionStart = null;
+    pendingImportEditor.selectionEnd = null;
     updateEditButtonStates();
 
-    renderTranscript(importedEditor);
-    if (!isRefreshingPreview) {
-      await refreshMainWavePreviewFromEdits();
-    }
-
-    // Clear pending import once used
+    renderTranscript(pendingImportEditor);
+    setActiveEditor(pendingImportEditor);
     pendingImportAudioPath = null;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -2260,7 +2320,7 @@ btnTranscribe.addEventListener("click", async () => {
     }
   } finally {
     btnChoose.disabled = false;
-    btnTranscribe.disabled = false;
+    btnTranscribe.disabled = pendingImportAudioPath == null;
     setTranscribingState(false);
     progressEl.hidden = true;
   }
@@ -2458,38 +2518,30 @@ btnChoose.addEventListener("click", async () => {
   resetEditedPreviewState();
   setStatus("Choosing file…", "info");
 
-  // For now: one imported audio per project.
-  // If an imported audio already exists, block importing a second file.
-  if (importedEditor.audioPath || importedEditor.pieceTable) {
-    setStatus("This project already has an imported audio. (One imported audio per project for now.)", "error");
-    return;
-  }
-
   const selectedPath = await otter.chooseAudioFile();
   if (!selectedPath) {
     setStatus("File selection canceled.", "info");
     return;
   }
 
-  // Stage for transcription; do not clear existing project.
+  clearPendingImportedView();
   pendingImportAudioPath = selectedPath;
 
   const fname = pendingImportAudioPath.split("/").pop() ?? pendingImportAudioPath;
-  setStatus(`Selected to append: ${fname}`, "success");
+  setStatus(`Selected imported audio: ${fname}`, "success");
 
   btnTranscribe.disabled = false;
 
-  // If there is no existing project audio yet, this becomes the project base,
-  // so it's fine to show it in the waveform + filename label.
-  if (!importedEditor.pieceTable && !recordedEditor.pieceTable) {
-    fnameEl.textContent = shortenFilenameMiddle(fname);
-    btnPlay.disabled = true;
-    const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
-    const blob = new Blob([ab]);
-    await ws.loadBlob(blob);
-    btnPlay.disabled = false;
-    setPlayIcon(false);
-  }
+  importedWavePane.hidden = false;
+  importedWaveDivider.hidden = false;
+  importedLoadedFileEl.textContent = shortenFilenameMiddle(fname);
+  btnImportedPlay.disabled = true;
+  importedTimeEl.textContent = "0.00";
+  const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
+  const blob = new Blob([ab]);
+  await wsImported.loadBlob(blob);
+  btnImportedPlay.disabled = false;
+  setImportedPlayIcon(false);
 });
 
 //==============================================================================
@@ -2795,8 +2847,67 @@ btnRedo.addEventListener("click", () => {
   }
 });
 
+function appendEditorToMain(sourceEditor: EditorState, sourcePrefix: string, successMessage: string) {
+  if (!sourceEditor.pieceTable || sourceEditor.words.length === 0) return;
+
+  if (!importedEditor.pieceTable) {
+    importedEditor.audioPath = sourceEditor.audioPath;
+    importedEditor.words = sourceEditor.words.map(w => ({ ...w }));
+    importedEditor.pieceTable = sourceEditor.pieceTable;
+    importedEditor.undoStack = sourceEditor.undoStack.slice();
+    importedEditor.redoStack = sourceEditor.redoStack.slice();
+    importedEditor.selectedIndices = [];
+    importedEditor.selectionAnchor = null;
+    importedEditor.selectionStart = null;
+    importedEditor.selectionEnd = null;
+  } else {
+    const mainPt = importedEditor.pieceTable;
+    const sourceView = getViewEntries(sourceEditor.pieceTable);
+    const sourceActive = sourceView.filter(v => v.status !== "deleted");
+
+    pushUndo(importedEditor);
+
+    const addEntries: PieceEntry[] = sourceActive.map((ve) => ({
+      id: `${sourcePrefix}${crypto.randomUUID().slice(0, 8)}`,
+      word: ve.entry.word,
+      sourceStart: ve.entry.sourceStart,
+      sourceEnd: ve.entry.sourceEnd,
+      breakAfter: ve.entry.breakAfter,
+      sourceFile: sourceEditor.audioPath || ve.entry.sourceFile,
+    }));
+
+    const insertOffset = mainPt.addBuffer.length;
+    mainPt.addBuffer.push(...addEntries);
+    mainPt.pieces.push({
+      source: "add",
+      offset: insertOffset,
+      length: addEntries.length,
+      status: "added",
+    });
+    mainPt.pieces = mergePieces(mainPt.pieces);
+    syncWordsFromPieceTable(importedEditor);
+  }
+
+  renderTranscript(importedEditor);
+  setActiveEditor(importedEditor);
+  void refreshMainWavePreviewFromEdits();
+  updateEditButtonStates();
+  setStatus(successMessage, "success");
+}
+
+btnAddImportedToTranscript.addEventListener("click", () => {
+  if (!pendingImportEditor.pieceTable || pendingImportEditor.words.length === 0) return;
+  appendEditorToMain(pendingImportEditor, "i", "Imported transcript added to main transcript.");
+  clearPendingImportedView();
+  updateEditButtonStates();
+});
+
 btnAddRecordedToTranscript.addEventListener("click", () => {
   if (!recordedEditor.pieceTable || recordedEditor.words.length === 0) return;
+  appendEditorToMain(recordedEditor, "r", "Recorded transcript added to main transcript.");
+  clearRecordedView();
+  updateEditButtonStates();
+  return;
 
   // If there is no imported transcript yet, promote recorded → imported.
   if (!importedEditor.pieceTable) {
@@ -2835,8 +2946,8 @@ btnAddRecordedToTranscript.addEventListener("click", () => {
   }
 
   // Merge: append recorded transcript entries as "added" words at the end of imported.
-  const mainPt = importedEditor.pieceTable;
-  const recPt = recordedEditor.pieceTable;
+  const mainPt = importedEditor.pieceTable!;
+  const recPt = recordedEditor.pieceTable!;
 
   pushUndo(importedEditor);
 
@@ -2960,17 +3071,20 @@ if (e.key === "Enter") {
 });
 
 btnSaveEdl.addEventListener("click", async () => {
-  if (!importedEditor.pieceTable && !recordedEditor.pieceTable) return;
+  if (!importedEditor.pieceTable && !pendingImportEditor.pieceTable && !recordedEditor.pieceTable) return;
 
   try {
     if (importedEditor.pieceTable) syncBreakAfterToPieceTable(importedEditor);
+    if (pendingImportEditor.pieceTable) syncBreakAfterToPieceTable(pendingImportEditor);
     if (recordedEditor.pieceTable) syncBreakAfterToPieceTable(recordedEditor);
 
     const payload = {
-      version: 3,
+      version: 4,
       imported: importedEditor.pieceTable,
+      pendingImported: pendingImportEditor.pieceTable,
       recorded: recordedEditor.pieceTable,
       importedAudioPath: importedEditor.audioPath,
+      pendingImportedAudioPath: pendingImportEditor.audioPath,
       recordedAudioPath: recordedEditor.audioPath,
     };
     const json = JSON.stringify(payload, null, 2);
@@ -2995,17 +3109,35 @@ btnLoadEdl.addEventListener("click", async () => {
 
     const parsed = JSON.parse(result.content);
 
-    if (parsed && typeof parsed === "object" && parsed.version === 3) {
+    if (parsed && typeof parsed === "object" && parsed.version === 4) {
       const p = parsed as any;
       importedEditor.pieceTable = p.imported ?? null;
+      pendingImportEditor.pieceTable = p.pendingImported ?? null;
       recordedEditor.pieceTable = p.recorded ?? null;
       importedEditor.audioPath = typeof p.importedAudioPath === "string" ? p.importedAudioPath : (importedEditor.pieceTable?.sourceFile ?? null);
+      pendingImportEditor.audioPath = typeof p.pendingImportedAudioPath === "string" ? p.pendingImportedAudioPath : (pendingImportEditor.pieceTable?.sourceFile ?? null);
+      recordedEditor.audioPath = typeof p.recordedAudioPath === "string" ? p.recordedAudioPath : (recordedEditor.pieceTable?.sourceFile ?? null);
+    } else if (parsed && typeof parsed === "object" && parsed.version === 3) {
+      const p = parsed as any;
+      importedEditor.pieceTable = p.imported ?? null;
+      pendingImportEditor.pieceTable = null;
+      recordedEditor.pieceTable = p.recorded ?? null;
+      importedEditor.audioPath = typeof p.importedAudioPath === "string" ? p.importedAudioPath : (importedEditor.pieceTable?.sourceFile ?? null);
+      pendingImportEditor.audioPath = null;
       recordedEditor.audioPath = typeof p.recordedAudioPath === "string" ? p.recordedAudioPath : (recordedEditor.pieceTable?.sourceFile ?? null);
     } else
     if (isEdlV2(parsed)) {
       importedEditor.pieceTable = parsed.pieceTable;
+      pendingImportEditor.pieceTable = null;
+      recordedEditor.pieceTable = null;
+      pendingImportEditor.audioPath = null;
+      recordedEditor.audioPath = null;
     } else if (isEdlV1(parsed)) {
       importedEditor.pieceTable = convertV1ToV2(parsed);
+      pendingImportEditor.pieceTable = null;
+      recordedEditor.pieceTable = null;
+      pendingImportEditor.audioPath = null;
+      recordedEditor.audioPath = null;
     } else {
       setStatus("Invalid EDL file.", "error");
       appendLog("\nERROR: file is not a valid OTTER EDL.\n");
@@ -3018,6 +3150,13 @@ btnLoadEdl.addEventListener("click", async () => {
     importedEditor.selectionAnchor = null;
     importedEditor.selectionStart = null;
     importedEditor.selectionEnd = null;
+
+    pendingImportEditor.undoStack = [];
+    pendingImportEditor.redoStack = [];
+    pendingImportEditor.selectedIndices = [];
+    pendingImportEditor.selectionAnchor = null;
+    pendingImportEditor.selectionStart = null;
+    pendingImportEditor.selectionEnd = null;
 
     recordedEditor.undoStack = [];
     recordedEditor.redoStack = [];
@@ -3039,6 +3178,19 @@ btnLoadEdl.addEventListener("click", async () => {
       importedEditor.words = [];
     }
 
+    if (pendingImportEditor.pieceTable) {
+      pendingImportEditor.audioPath = pendingImportEditor.audioPath || pendingImportEditor.pieceTable.sourceFile;
+      const viewEntries = getViewEntries(pendingImportEditor.pieceTable);
+      pendingImportEditor.words = viewEntries.map(ve => ({
+        word: ve.entry.word,
+        start: ve.entry.sourceStart,
+        end: ve.entry.sourceEnd,
+        breakAfter: ve.entry.breakAfter,
+      }));
+    } else {
+      pendingImportEditor.words = [];
+    }
+
     if (recordedEditor.pieceTable) {
       recordedEditor.audioPath = recordedEditor.audioPath || recordedEditor.pieceTable.sourceFile;
       const viewEntries = getViewEntries(recordedEditor.pieceTable);
@@ -3053,9 +3205,35 @@ btnLoadEdl.addEventListener("click", async () => {
     }
 
     transcriptImportedEl.innerHTML = "";
+    transcriptPendingImportedEl.innerHTML = "";
     transcriptRecordedEl.innerHTML = "";
     if (importedEditor.pieceTable) renderTranscript(importedEditor);
+    if (pendingImportEditor.pieceTable) renderTranscript(pendingImportEditor);
     if (recordedEditor.pieceTable) renderTranscript(recordedEditor);
+
+    if (pendingImportEditor.audioPath) {
+      importedWavePane.hidden = false;
+      importedWaveDivider.hidden = false;
+      importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
+      btnImportedPlay.disabled = true;
+      try {
+        const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
+        await wsImported.loadBlob(new Blob([importAb]));
+        btnImportedPlay.disabled = false;
+        setImportedPlayIcon(false);
+      } catch (err: unknown) {
+        importedWavePane.hidden = true;
+        importedWaveDivider.hidden = true;
+        btnImportedPlay.disabled = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        appendLog(`ERROR: failed to load imported waveform from EDL audio path: ${msg}\n`);
+      }
+    } else {
+      importedWavePane.hidden = true;
+      importedWaveDivider.hidden = true;
+      btnImportedPlay.disabled = true;
+      importedLoadedFileEl.textContent = "No imported audio staged";
+    }
 
     if (recordedEditor.audioPath) {
       recordedWavePane.hidden = false;
@@ -3083,27 +3261,24 @@ btnLoadEdl.addEventListener("click", async () => {
       btnStopRecorded.hidden = true;
     }
 
-    // Load base waveform from imported audio if available, else recorded.
-    const baseAudio = importedEditor.audioPath || recordedEditor.audioPath;
-    if (baseAudio) {
-      const ab = await otter.readFileAsArrayBuffer(baseAudio);
-      const blob = new Blob([ab]);
-      await ws.loadBlob(blob);
+    if (importedEditor.audioPath && importedEditor.pieceTable) {
+      await refreshMainWavePreviewFromEdits();
+    } else {
+      clearMainWave();
     }
 
     // Update UI state
-    const fname = (importedEditor.audioPath || recordedEditor.audioPath || "").split("/").pop() ?? "";
+    const fname = (importedEditor.audioPath || "").split("/").pop() ?? "";
     fnameEl.textContent = fname ? shortenFilenameMiddle(fname) : "No file loaded";
     setStatus(`EDL loaded`, "success");
     appendLog(`EDL loaded from ${result.path}\n`);
 
-    btnPlay.disabled = false;
-    btnTranscribe.disabled = false;
-    setActiveEditor(importedEditor.pieceTable ? importedEditor : recordedEditor);
+    btnPlay.disabled = importedEditor.pieceTable == null;
+    btnTranscribe.disabled = pendingImportAudioPath == null;
+    setActiveEditor(importedEditor.pieceTable ? importedEditor : (pendingImportEditor.pieceTable ? pendingImportEditor : recordedEditor));
     updateEditButtonStates();
     updateDeletedRegions();
     refreshDetailIfActive();
-    await refreshMainWavePreviewFromEdits();
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     setStatus("Failed to load EDL.", "error");
@@ -3112,12 +3287,9 @@ btnLoadEdl.addEventListener("click", async () => {
 });
 
 btnSaveEdits.addEventListener("click", async () => {
-  if (!importedEditor.pieceTable && !recordedEditor.pieceTable) return;
+  if (!importedEditor.pieceTable) return;
 
-  // Export uses the combined active entries (imported + recorded).
-  const activeImported = importedEditor.pieceTable ? getActiveEntries(importedEditor.pieceTable) : [];
-  const activeRecorded = recordedEditor.pieceTable ? getActiveEntries(recordedEditor.pieceTable) : [];
-  const activeEntries = activeImported.concat(activeRecorded);
+  const activeEntries = getActiveEntries(importedEditor.pieceTable);
   if (activeEntries.length === 0) {
     setStatus("Nothing to export (all words removed).", "error");
     return;
@@ -3128,10 +3300,10 @@ btnSaveEdits.addEventListener("click", async () => {
 
     const exportPayload = {
       version: 1,
-      sourceFile: importedEditor.audioPath || recordedEditor.audioPath || "",
+      sourceFile: importedEditor.audioPath || "",
       entries: activeEntries.map(ve => ({
         id: ve.entry.id,
-        sourceFile: ve.entry.sourceFile || importedEditor.audioPath || recordedEditor.audioPath || "",
+        sourceFile: ve.entry.sourceFile || importedEditor.audioPath || "",
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,

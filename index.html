@@ -50,6 +50,8 @@
               <button id="btnRecord" title="Record from selected microphone">Record</button>
               <button id="btnRecordPause" hidden title="Pause recording">Pause Rec</button>
               <button id="btnRecordStop" hidden title="Stop recording">Stop Rec</button>
+              <button id="btnTranscribeRecorded" disabled title="Transcribe recorded audio">Transcribe Rec</button>
+              <button id="btnStopRecorded" hidden title="Stop recorded transcription">Stop</button>
             </div>
           </div>
         </section>
@@ -96,6 +98,27 @@
           </div>
         </div>
 
+        <hr id="importedWaveDivider" hidden>
+
+        <div id="importedWavePane" hidden>
+          <div class="waveBlock">
+            <div id="waveformImported"></div>
+
+            <div class="transport" id="importedTransport">
+              <div class="transportGroup left">
+                <label>Play Imported</label>
+                <button id="btnImportedPlay" disabled aria-label="Play/Pause Imported" title="Play/Pause Imported">Play</button>
+              </div>
+              <div class="transportGroup center">
+                <span id="importedTime" class="numericReadout">0.00</span>
+              </div>
+              <div class="transportGroup right">
+                <span id="importedLoadedFile">No imported audio staged</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <hr id="recordedWaveDivider" hidden>
 
         <div id="recordedWavePane" hidden>
@@ -110,10 +133,7 @@
               <div class="transportGroup center">
                 <span id="recordedTime" class="numericReadout">0.00</span>
               </div>
-              <div class="transportGroup right">
-                <button id="btnTranscribeRecorded" disabled title="Transcribe recorded audio">Transcribe Rec</button>
-                <button id="btnStopRecorded" hidden title="Stop recorded transcription">Stop</button>
-              </div>
+              <div class="transportGroup right"></div>
             </div>
           </div>
         </div>
@@ -171,7 +191,7 @@
         </section>
 
         <div class="paneTitle paneHeaderRow">
-          <span>Transcript</span>
+          <span>Main Transcript</span>
           <div class="modeToggleGroup" role="group" aria-label="Main transcript interaction mode">
             <button id="btnImportedSelectMode" class="modeToggle isActive" type="button" aria-pressed="true" title="Highlight one or more words">
               Select Words
@@ -182,6 +202,24 @@
           </div>
         </div>
         <div id="transcriptImported" class="transcriptPane"></div>
+
+        <div class="paneTitle transcriptSubTitleRow">
+          <span>Imported Transcript</span>
+          <div class="paneHeaderActions">
+            <div class="modeToggleGroup" role="group" aria-label="Imported transcript interaction mode">
+              <button id="btnPendingImportSelectMode" class="modeToggle isActive" type="button" aria-pressed="true" title="Highlight one or more imported words">
+                Select Words
+              </button>
+              <button id="btnPendingImportMoveMode" class="modeToggle" type="button" aria-pressed="false" title="Drag selected imported words within the imported transcript">
+                Move Words
+              </button>
+            </div>
+            <button id="btnAddImportedToTranscript" disabled title="Append the edited imported transcript to the end of the main transcript">
+              Add to Transcript
+            </button>
+          </div>
+        </div>
+        <div id="transcriptPendingImported" class="transcriptPane"></div>
 
         <div class="paneTitle transcriptSubTitleRow">
           <span>Recorded Transcript</span>

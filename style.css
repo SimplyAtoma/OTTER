@@ -197,6 +197,7 @@ main {
 
 #waveform,
 #waveDetail,
+#waveformImported,
 #waveformRecorded {
   height: 80px;
   border: 1px solid #d9deea;
