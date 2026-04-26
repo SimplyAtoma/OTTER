@@ -1,36 +1,95 @@
-/* ============================================================================
-   Base / Layout
-   ========================================================================== */
-
 html, body { height: 100%; }
 
 body {
   margin: 0;
   font-family: system-ui, -apple-system, sans-serif;
-
+  background: #f6f7f9;
+  color: #162033;
   display: flex;
   flex-direction: column;
 }
 
-/* ============================================================================
-   Header
-   ========================================================================== */
+button,
+select,
+input,
+textarea {
+  font: inherit;
+}
+
+button,
+select {
+  min-height: 34px;
+  border-radius: 8px;
+}
+
+button {
+  border: 1px solid #cfd6e4;
+  background: #fff;
+  color: #162033;
+  padding: 6px 12px;
+}
+
+button:hover:enabled {
+  background: #f8fafc;
+}
+
+button:disabled,
+select:disabled {
+  opacity: 0.65;
+}
+
+select {
+  border: 1px solid #cfd6e4;
+  background: #fff;
+  padding: 4px 10px;
+}
 
 header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0px 12px;
-  border-bottom: 1px solid #ddd;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #d9deea;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
 }
 
-.title { font-weight: 700; margin-right: 8px; }
+.appBrand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.appBrand img {
+  width: 58px;
+  height: auto;
+  flex: 0 0 auto;
+}
+
+.brandText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.brandTitle {
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+}
+
+.brandSubtitle {
+  color: #667085;
+  font-size: 12px;
+}
 
 .statusArea {
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 #transcribeProgress {
@@ -39,15 +98,10 @@ header {
 }
 
 #micSelect {
-  max-width: 220px;
-  min-width: 120px;
+  max-width: 260px;
+  min-width: 150px;
 }
 
-#btnRefreshMics {
-  padding: 2px 8px;
-}
-
-/* Status pill (hidden by default) */
 #status {
   display: none;
   padding: 4px 8px;
@@ -56,71 +110,113 @@ header {
   white-space: nowrap;
 }
 
-/* Status pill states */
 #status.info    { background: #e5e7eb; color: #1f2937; }
 #status.working { background: #dbeafe; color: #1e40af; }
 #status.error   { background: #fee2e2; color: #991b1b; }
 #status.success { background: #dcfce7; color: #166534; }
 
-/* ============================================================================
-   Main Two-Pane Layout
-   ========================================================================== */
-
 main {
   flex: 1;
-  min-height: 0;                 /* allows panes to scroll inside */
+  min-height: 0;
   display: grid;
   grid-template-columns: 1.1fr 0.9fr;
 }
 
-.wavePane, .textPane { min-width: 0; min-height: 0; }
-
-/* ============================================================================
-   Left Pane: Waveforms + Transports + Dev Panel
-   ========================================================================== */
-
-.wavePane {
-  padding: 12px;
-  border-right: 1px solid #ddd;
-
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+.wavePane,
+.textPane {
+  min-width: 0;
   min-height: 0;
 }
 
-/* A waveform + its transport, kept visually tight */
+.wavePane {
+  padding: 14px;
+  border-right: 1px solid #d9deea;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+}
+
+.textPane {
+  padding: 14px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.controlBoard,
+.transcriptToolbar {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.controlGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #d9deea;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.controlGroupTitle {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #475467;
+}
+
+.controlRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.controlRow label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #344054;
+}
+
 .waveBlock {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  padding: 10px;
+  border: 1px solid #d9deea;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
 }
 
-/* Waveform containers */
 #waveform,
 #waveDetail,
 #waveformRecorded {
   height: 80px;
-  border: 1px solid #ddd;
+  border: 1px solid #d9deea;
   border-radius: 8px;
+  background: linear-gradient(180deg, #ffffff 0%, #fbfcfe 100%);
 }
 
-/* Detail pane variables */
 #waveDetailPane {
-  /* Region highlight color for the detail waveform.
-     Read by renderer.js and passed to WaveSurfer regions. */
   --word-region-color: rgba(0, 200, 0, 0.35);
 }
 
-.transport{
+.transport {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   column-gap: 12px;
   align-items: center;
 }
 
-.transportGroup{
-  min-width: 0;               /* allow shrinking inside grid cell */
+.transportGroup {
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -128,10 +224,9 @@ main {
   white-space: nowrap;
 }
 
-/* Align contents inside each third */
-.transportGroup.left   { justify-self: start; }
+.transportGroup.left { justify-self: start; }
 .transportGroup.center { justify-self: center; }
-.transportGroup.right  { justify-self: end; }
+.transportGroup.right { justify-self: end; }
 
 .numericReadout {
   font-variant-numeric: tabular-nums;
@@ -140,22 +235,20 @@ main {
 .wavePane hr {
   width: 100%;
   border: 0;
-  border-top: 1px solid #ddd;
-  margin: 6px 0;   /* tweak to taste */
-}
-
-/* ============================================================================
-   Right Pane: Transcript
-   ========================================================================== */
-
-.textPane {
-  padding: 12px;
-  overflow: auto;
+  border-top: 1px solid #d9deea;
+  margin: 6px 0;
 }
 
 .paneTitle {
-  margin: 10px 0 6px;
+  margin: 0;
   font-weight: 650;
+}
+
+.paneHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .transcriptSubTitleRow {
@@ -165,7 +258,55 @@ main {
   gap: 10px;
 }
 
+.paneHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.modeToggleGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid #d9deea;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.modeToggle {
+  border: 0;
+  border-right: 1px solid #d9deea;
+  border-radius: 0;
+  background: transparent;
+  padding: 7px 11px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #344054;
+}
+
+.modeToggle:last-child {
+  border-right: 0;
+}
+
+.modeToggle:hover:not(.isActive) {
+  background: #f8fafc;
+}
+
+.modeToggle.isActive {
+  background: #fff4e3;
+  color: #8f4a00;
+}
+
 .transcriptPane {
+  min-height: 120px;
+  padding: 12px;
+  border: 1px solid #d9deea;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
   line-height: 1.8;
   font-size: 16px;
   user-select: none;
@@ -177,7 +318,10 @@ main {
   border-radius: 8px;
 }
 
-/* Transcript words */
+.transcriptPane.moveMode .word {
+  cursor: grab;
+}
+
 .word {
   cursor: pointer;
   padding: 1px 2px;
@@ -185,17 +329,14 @@ main {
 }
 
 .word:hover { background: #f1f1f1; }
-
-.word.selected {
-  background: #ffe08a;
-}
+.word.selected { background: #ffe08a; }
 
 .word.playhead {
   outline: 2px solid #f4a949;
   outline-offset: 1px;
 }
 
-#transcript.dragging-words .word {
+.transcriptPane.dragging-words .word {
   cursor: grabbing;
 }
 
@@ -227,12 +368,9 @@ main {
 #searchInput {
   width: 160px;
 }
-/* ============================================================================
-   Developer Panel (bottom of left column)
-   ========================================================================== */
 
 .devPanel {
-  margin-top: auto;              /* push to bottom */
+  margin-top: auto;
   padding-top: 8px;
 }
 
@@ -240,10 +378,9 @@ main {
   cursor: pointer;
   user-select: none;
   padding: 8px 10px;
-  border: 1px solid #ddd;
+  border: 1px solid #d9deea;
   border-radius: 8px;
-  background: #fafafa;
-
+  background: #ffffff;
   display: flex;
   justify-content: space-between;
   gap: 10px;
@@ -255,11 +392,10 @@ main {
 
 .devBody {
   margin-top: 10px;
-  border: 1px solid #ddd;
+  border: 1px solid #d9deea;
   border-radius: 8px;
   padding: 10px;
   background: #fff;
-
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -291,7 +427,6 @@ main {
   font-style: italic;
 }
 
-/* Spec JSON editor */
 #specJson {
   width: 100%;
   height: 160px;
@@ -302,9 +437,9 @@ main {
   border: 1px solid #ddd;
   border-radius: 8px;
   resize: vertical;
+  background: #fcfcfd;
 }
 
-/* Logs */
 #log {
   max-height: 180px;
   overflow: auto;
@@ -318,7 +453,32 @@ main {
   line-height: 1.35;
 }
 
-/* Highlight search words */
 .highlight {
   background: #f4a949;
+}
+
+@media (max-width: 1100px) {
+  main {
+    grid-template-columns: 1fr;
+  }
+
+  .wavePane {
+    border-right: 0;
+    border-bottom: 1px solid #d9deea;
+  }
+
+  .controlBoard,
+  .transcriptToolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .paneHeaderRow,
+  .transcriptSubTitleRow {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .paneHeaderActions {
+    justify-content: flex-start;
+  }
 }

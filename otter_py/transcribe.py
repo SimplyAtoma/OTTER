@@ -29,7 +29,7 @@ from typing import Any, Dict, Optional
 
 from pydash import get as deep_get
 from otter_py.exceptions import TranscriptionCancelled
-from otter_py.util import eprint, run_with_stdout_redirect
+from otter_py.util import _start_elapsed_timer, eprint, run_with_stdout_redirect
 from otter_py.cacheUtil import _cache_key, _cache_dir, _load_cache, _save_cache
 
 
@@ -200,6 +200,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             result = cached
         else:
             eprint("INFO:cache miss, running pipeline")
+            timer_stop = _start_elapsed_timer(label="transcription")
             try:
                 import soundfile as sf
                 duration = sf.info(audio_path).duration
@@ -270,15 +271,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                         lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
                     )
             except TranscriptionCancelled as e:
+                timer_stop.set()
                 eprint(f"INFO:cancelled:{e}")
                 json.dump({"error": "Cancelled", "message": str(e)}, sys.stdout)
                 sys.stdout.write("\n")
                 return 2
             except Exception as e:
+                timer_stop.set()
                 eprint(f"ERROR:{type(e).__name__}:{e}")
                 json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
                 sys.stdout.write("\n")
                 return 1
+            timer_stop.set()
             controller.checkpoint()
             _save_cache(cache_key, result)
 

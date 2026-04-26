@@ -257,6 +257,7 @@ window.addEventListener("unhandledrejection", (ev) => {
 });
 
 type EditorKind = "imported" | "recorded";
+type InteractionMode = "select" | "move";
 
 type EditorState = {
   kind: EditorKind;
@@ -270,6 +271,7 @@ type EditorState = {
   selectionEnd: number | null;
   selectionAnchor: number | null;
   selectedIndices: number[];
+  interactionMode: InteractionMode;
 };
 
 let importedEditor: EditorState;
@@ -287,9 +289,11 @@ type UndoSnapshot = {
 
 let detailSelStart: number | null = null;
 let detailSelEnd: number | null = null;
+let detailEditor: EditorState | null = null;
 let isMouseSelecting = false;
 let mouseSelectionMoved = false;
 let dragMoveSourceIndices: number[] = [];
+let dragMoveEditorKind: EditorKind | null = null;
 let isEditedPreviewMode = false;
 let previewWordTimes: Array<{ start: number; end: number }> = [];
 let previewRefreshToken = 0;
@@ -514,13 +518,21 @@ function syncWordsFromPieceTable(editor: EditorState): void {
 }
 
 async function refreshDetailIfActive(): Promise<void> {
+  if (!detailEditor) return;
+  const currentDetailEditor = detailEditor;
   if (detailSelStart == null || detailSelEnd == null) return;
-  if (detailSelStart >= importedEditor.words.length) { detailSelStart = null; detailSelEnd = null; return; }
-  const endIdx2 = Math.min(detailSelEnd, importedEditor.words.length - 1);
-  const rangeStart = Number(importedEditor.words[detailSelStart].start);
-  const rangeEnd = Number(importedEditor.words[endIdx2].end);
+  if (detailSelStart >= currentDetailEditor.words.length) { detailSelStart = null; detailSelEnd = null; detailEditor = null; return; }
+  const endIdx2 = Math.min(detailSelEnd, currentDetailEditor.words.length - 1);
+  const viewEntries = currentDetailEditor.pieceTable ? getViewEntries(currentDetailEditor.pieceTable) : [];
+  const rangeEntries = viewEntries.slice(detailSelStart, endIdx2 + 1);
+  const rangeSourceFile = rangeEntries[0]?.entry.sourceFile || currentDetailEditor.audioPath;
+  if (!rangeSourceFile) return;
+  const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || currentDetailEditor.audioPath) !== rangeSourceFile);
+  if (mixedSources) return;
+  const rangeStart = Number(currentDetailEditor.words[detailSelStart].start);
+  const rangeEnd = Number(currentDetailEditor.words[endIdx2].end);
   try {
-    await loadDetailForRange(rangeStart, rangeEnd);
+    await loadDetailForRange(rangeSourceFile, rangeStart, rangeEnd);
   } catch (err: unknown) {
     console.error("Failed to refresh detail view:", err);
   }
@@ -824,34 +836,34 @@ function updateEditButtonStates() {
  * adjustments are persisted.
  */
 function writebackRegionBounds() {
-  if (!importedEditor.pieceTable || !detailRegion || detailSelStart == null) return;
+  if (!detailEditor?.pieceTable || !detailRegion || !detailEditor.words || detailSelStart == null) return;
 
   const absStart = detailWinStartAbs + detailRegion.start;
   const absEnd = detailWinStartAbs + detailRegion.end;
-  const viewEntries = getViewEntries(importedEditor.pieceTable);
+  const viewEntries = getViewEntries(detailEditor.pieceTable);
 
   if (detailSelStart === detailSelEnd) {
     const ve = viewEntries[detailSelStart];
     if (ve) {
       ve.entry.sourceStart = absStart;
       ve.entry.sourceEnd = absEnd;
-      importedEditor.words[detailSelStart].start = absStart;
-      importedEditor.words[detailSelStart].end = absEnd;
+      detailEditor.words[detailSelStart].start = absStart;
+      detailEditor.words[detailSelStart].end = absEnd;
     }
   } else if (detailSelEnd != null) {
     const veStart = viewEntries[detailSelStart];
     const veEnd = viewEntries[detailSelEnd];
     if (veStart) {
       veStart.entry.sourceStart = absStart;
-      importedEditor.words[detailSelStart].start = absStart;
+      detailEditor.words[detailSelStart].start = absStart;
     }
     if (veEnd) {
       veEnd.entry.sourceEnd = absEnd;
-      importedEditor.words[detailSelEnd].end = absEnd;
+      detailEditor.words[detailSelEnd].end = absEnd;
     }
   }
 
-  importedEditor.pieceTable.modifiedAt = new Date().toISOString();
+  detailEditor.pieceTable.modifiedAt = new Date().toISOString();
 }
 
 
@@ -909,6 +921,10 @@ const btnRecord = mustGetEl<HTMLButtonElement>("btnRecord");
 const btnRecordPause = mustGetEl<HTMLButtonElement>("btnRecordPause");
 const btnRecordStop = mustGetEl<HTMLButtonElement>("btnRecordStop");
 const btnAddRecordedToTranscript = mustGetEl<HTMLButtonElement>("btnAddRecordedToTranscript");
+const btnImportedSelectMode = mustGetEl<HTMLButtonElement>("btnImportedSelectMode");
+const btnImportedMoveMode = mustGetEl<HTMLButtonElement>("btnImportedMoveMode");
+const btnRecordedSelectMode = mustGetEl<HTMLButtonElement>("btnRecordedSelectMode");
+const btnRecordedMoveMode = mustGetEl<HTMLButtonElement>("btnRecordedMoveMode");
 const statusEl = mustGetEl<HTMLDivElement>("status");
 
 importedEditor = {
@@ -923,6 +939,7 @@ importedEditor = {
   selectionEnd: null,
   selectionAnchor: null,
   selectedIndices: [],
+  interactionMode: "select",
 };
 
 recordedEditor = {
@@ -937,6 +954,7 @@ recordedEditor = {
   selectionEnd: null,
   selectionAnchor: null,
   selectedIndices: [],
+  interactionMode: "select",
 };
 
 activeEditor = importedEditor;
@@ -944,7 +962,9 @@ activeEditor = importedEditor;
 
 function attachTranscriptPaneDnD(pane: HTMLDivElement, editor: EditorState) {
   pane.addEventListener("dragover", (event: DragEvent) => {
+    if (editor.interactionMode !== "move") return;
     if (dragMoveSourceIndices.length === 0) return;
+    if (dragMoveEditorKind !== editor.kind) return;
     if ((event.target as HTMLElement).closest(".word")) return;
     event.preventDefault();
     setActiveEditor(editor);
@@ -952,19 +972,63 @@ function attachTranscriptPaneDnD(pane: HTMLDivElement, editor: EditorState) {
   });
 
   pane.addEventListener("drop", (event: DragEvent) => {
+    if (editor.interactionMode !== "move") return;
     if (dragMoveSourceIndices.length === 0) return;
+    if (dragMoveEditorKind !== editor.kind) return;
     if ((event.target as HTMLElement).closest(".word")) return;
     event.preventDefault();
     setActiveEditor(editor);
     clearDropIndicators();
     moveCurrentSelection(editor, editor.words.length);
     dragMoveSourceIndices = [];
+    dragMoveEditorKind = null;
     pane.classList.remove("dragging-words");
   });
 }
 
 attachTranscriptPaneDnD(transcriptImportedEl, importedEditor);
 attachTranscriptPaneDnD(transcriptRecordedEl, recordedEditor);
+
+function updateInteractionModeButtons() {
+  const buttonPairs = [
+    { editor: importedEditor, selectBtn: btnImportedSelectMode, moveBtn: btnImportedMoveMode },
+    { editor: recordedEditor, selectBtn: btnRecordedSelectMode, moveBtn: btnRecordedMoveMode },
+  ];
+
+  for (const { editor, selectBtn, moveBtn } of buttonPairs) {
+    const selectActive = editor.interactionMode === "select";
+    selectBtn.classList.toggle("isActive", selectActive);
+    moveBtn.classList.toggle("isActive", !selectActive);
+    selectBtn.setAttribute("aria-pressed", String(selectActive));
+    moveBtn.setAttribute("aria-pressed", String(!selectActive));
+    editor.paneEl.classList.toggle("moveMode", editor.interactionMode === "move");
+  }
+}
+
+function setInteractionMode(editor: EditorState, nextMode: InteractionMode) {
+  if (editor.interactionMode === nextMode) return;
+  editor.interactionMode = nextMode;
+
+  if (nextMode === "select") {
+    isDragging = false;
+    dragMoveSourceIndices = [];
+    dragMoveEditorKind = null;
+    clearDropIndicators();
+    editor.paneEl.classList.remove("dragging-words");
+  } else {
+    isMouseSelecting = false;
+    mouseSelectionMoved = false;
+  }
+
+  updateInteractionModeButtons();
+  renderTranscript(editor);
+}
+
+btnImportedSelectMode.addEventListener("click", () => setInteractionMode(importedEditor, "select"));
+btnImportedMoveMode.addEventListener("click", () => setInteractionMode(importedEditor, "move"));
+btnRecordedSelectMode.addEventListener("click", () => setInteractionMode(recordedEditor, "select"));
+btnRecordedMoveMode.addEventListener("click", () => setInteractionMode(recordedEditor, "move"));
+updateInteractionModeButtons();
 
 let isPaused = false;
 
@@ -1313,12 +1377,15 @@ function moveCurrentSelection(editor: EditorState, toIndex: number) {
   if (editor.kind === "imported" && movedSelection.length === 1) {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[0];
+    detailEditor = editor;
   } else if (editor.kind === "imported" && isContiguousSelection(movedSelection)) {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[movedSelection.length - 1];
+    detailEditor = editor;
   } else if (editor.kind === "imported") {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[0];
+    detailEditor = editor;
   }
 
   renderTranscript(editor);
@@ -1343,9 +1410,13 @@ function buildPreviewWordTimesFromActiveEntries(activeEntries: ViewEntry[]): Arr
 }
 
 async function loadMainWaveFromPath(filePath: string) {
+  btnPlay.disabled = true;
+  if (ws.isPlaying()) ws.pause();
   const ab = await otter.readFileAsArrayBuffer(filePath);
   const blob = new Blob([ab]);
   await ws.loadBlob(blob);
+  btnPlay.disabled = false;
+  setPlayIcon(false);
 }
 
 async function refreshMainWavePreviewFromEdits() {
@@ -1468,12 +1539,12 @@ function computeDetailWindow(start: number, end: number) {
  * The detail view exists to demonstrate that ASR word boundaries are approximate
  * and that precise editing may require user refinement.
  */
-async function loadDetailForRange(start: number, end: number) {
-  if (!importedEditor.audioPath) throw new Error("No audio loaded");
+async function loadDetailForRange(sourceFile: string, start: number, end: number) {
+  if (!sourceFile) throw new Error("No audio loaded");
   const { winStart, winDur } = computeDetailWindow(start, end);
 
   // Create a short WAV snippet around the selected word (main process uses ffmpeg)
-  const snippetPath = await otter.makeSnippet(importedEditor.audioPath, winStart, winDur);
+  const snippetPath = await otter.makeSnippet(sourceFile, winStart, winDur);
 
   // If the detail waveform is currently playing, stop it before swapping media
   if (wsDetail.isPlaying()) wsDetail.pause();
@@ -1532,6 +1603,7 @@ async function loadDetailForRange(start: number, end: number) {
 function renderTranscript(editor: EditorState) {
   const pane = editor.paneEl;
   pane.innerHTML = "";
+  pane.classList.toggle("moveMode", editor.interactionMode === "move");
   const viewEntries = editor.pieceTable ? getViewEntries(editor.pieceTable) : [];
 
   for (let i = 0; i < editor.words.length; i++) {
@@ -1541,7 +1613,7 @@ function renderTranscript(editor: EditorState) {
     span.className = "word";
     span.textContent = w.word + " ";
     span.dataset.index = String(i);
-    span.draggable = true;
+    span.draggable = editor.interactionMode === "move";
 
     const ve = viewEntries[i];
     if (ve) {
@@ -1551,6 +1623,7 @@ function renderTranscript(editor: EditorState) {
     }
 
     span.addEventListener("mousedown", (event: MouseEvent) => {
+      if (editor.interactionMode !== "select") return;
       if (event.button !== 0) return;
       if (event.ctrlKey || event.metaKey) return;
 
@@ -1569,6 +1642,7 @@ function renderTranscript(editor: EditorState) {
     });
 
     span.addEventListener("mouseenter", () => {
+      if (editor.interactionMode !== "select") return;
       if (!isMouseSelecting || editor.selectionAnchor == null) return;
       if (editor.selectionEnd !== i || editor.selectionStart !== editor.selectionAnchor) {
         mouseSelectionMoved = true;
@@ -1577,6 +1651,10 @@ function renderTranscript(editor: EditorState) {
     });
 
     span.addEventListener("dragstart", (event: DragEvent) => {
+      if (editor.interactionMode !== "move") {
+        event.preventDefault();
+        return;
+      }
       setActiveEditor(editor);
       if (editor.selectedIndices.includes(i) && editor.selectedIndices.length > 0) {
         dragMoveSourceIndices = editor.selectedIndices.slice();
@@ -1584,6 +1662,7 @@ function renderTranscript(editor: EditorState) {
         setSelectedIndices(editor, [i], i);
         dragMoveSourceIndices = [i];
       }
+      dragMoveEditorKind = editor.kind;
 
       pane.classList.add("dragging-words");
       if (event.dataTransfer) {
@@ -1593,7 +1672,9 @@ function renderTranscript(editor: EditorState) {
     });
 
     span.addEventListener("dragover", (event: DragEvent) => {
+      if (editor.interactionMode !== "move") return;
       if (dragMoveSourceIndices.length === 0) return;
+      if (dragMoveEditorKind !== editor.kind) return;
       event.preventDefault();
 
       const rect = span.getBoundingClientRect();
@@ -1604,7 +1685,9 @@ function renderTranscript(editor: EditorState) {
     });
 
     span.addEventListener("drop", (event: DragEvent) => {
+      if (editor.interactionMode !== "move") return;
       if (dragMoveSourceIndices.length === 0) return;
+      if (dragMoveEditorKind !== editor.kind) return;
       event.preventDefault();
       event.stopPropagation();
 
@@ -1615,12 +1698,14 @@ function renderTranscript(editor: EditorState) {
       clearDropIndicators();
       moveCurrentSelection(editor, targetIndex);
       dragMoveSourceIndices = [];
+      dragMoveEditorKind = null;
       pane.classList.remove("dragging-words");
     });
 
     span.addEventListener("dragend", () => {
       clearDropIndicators();
       dragMoveSourceIndices = [];
+      dragMoveEditorKind = null;
       pane.classList.remove("dragging-words");
     });
 
@@ -1632,13 +1717,13 @@ function renderTranscript(editor: EditorState) {
       setActiveEditor(editor);
 
       // Transcript click = select word + seek main audio
-      if (event.ctrlKey || event.metaKey) {
+      if (editor.interactionMode === "select" && (event.ctrlKey || event.metaKey)) {
         if (editor.selectedIndices.includes(i)) {
           setSelectedIndices(editor, editor.selectedIndices.filter((idx) => idx !== i), editor.selectionAnchor);
         } else {
           setSelectedIndices(editor, editor.selectedIndices.concat(i), i);
         }
-      } else if (event.shiftKey && editor.selectionAnchor != null) {
+      } else if (editor.interactionMode === "select" && event.shiftKey && editor.selectionAnchor != null) {
         setSelectionRange(editor, editor.selectionAnchor, i);
       } else {
         editor.selectionAnchor = i;
@@ -1647,14 +1732,20 @@ function renderTranscript(editor: EditorState) {
 
       if (!editor.selectedIndices.includes(i)) return;
 
-      // Only the imported transcript drives the detail waveform + seeking for now.
-      if (editor.kind !== "imported") return;
+      const selectedViewEntries = editor.pieceTable ? getViewEntries(editor.pieceTable) : [];
+      const clickedEntry = selectedViewEntries[i]?.entry;
+      const clickedSourceFile = clickedEntry?.sourceFile || editor.audioPath;
+      if (!clickedSourceFile) return;
 
-      const seekTime = isEditedPreviewMode && previewWordTimes[i]
-        ? previewWordTimes[i].start
-        : Number(w.start);
-      ws.setTime(seekTime + SEEK_EPS);
-      setPlayheadIndex(i);
+      if (editor.kind === "imported") {
+        const seekTime = isEditedPreviewMode && previewWordTimes[i]
+          ? previewWordTimes[i].start
+          : Number(w.start);
+        ws.setTime(seekTime + SEEK_EPS);
+        setPlayheadIndex(i);
+      } else {
+        wsRecorded.setTime(Number(w.start) + SEEK_EPS);
+      }
 
       // Load the detail waveform snippet centered on the selected range
       let rangeStartIdx = i;
@@ -1663,14 +1754,22 @@ function renderTranscript(editor: EditorState) {
         rangeStartIdx = editor.selectedIndices[0];
         rangeEndIdx = editor.selectedIndices[editor.selectedIndices.length - 1];
       }
+      const rangeEntries = selectedViewEntries.slice(rangeStartIdx, rangeEndIdx + 1);
+      const rangeSourceFile = rangeEntries[0]?.entry.sourceFile || clickedSourceFile;
+      const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || editor.audioPath) !== rangeSourceFile);
+      if (mixedSources) {
+        appendLog("INFO:Detail playback is only available for selections from a single source audio.\n");
+        return;
+      }
       const rangeStart = Number(editor.words[rangeStartIdx].start);
       const rangeEnd = Number(editor.words[rangeEndIdx].end);
 
+      detailEditor = editor;
       detailSelStart = rangeStartIdx;
       detailSelEnd = rangeEndIdx;
 
       try {
-        await loadDetailForRange(rangeStart, rangeEnd);
+        await loadDetailForRange(rangeSourceFile, rangeStart, rangeEnd);
       } catch (err: unknown) {
         console.error("Failed to load detail snippet:", err);
       }
@@ -1682,6 +1781,7 @@ function renderTranscript(editor: EditorState) {
     //   • Record selectionAnchor as the origin point (never changes during drag)
     //   • Highlight the starting word immediately
     span.addEventListener("mousedown", (event: MouseEvent) => {
+      if (editor.interactionMode !== "select") return;
       event.preventDefault();
       setActiveEditor(editor);
       isDragging = true;
@@ -1697,6 +1797,7 @@ function renderTranscript(editor: EditorState) {
     //   • Both forward and backward drag work because setSelectionRange()
     //     normalizes the range order internally
     span.addEventListener("mouseover", (event: MouseEvent) => {
+      if (editor.interactionMode !== "select") return;
       if (!isDragging) return;
       const hoveredIndex = Number((event.target as HTMLElement).dataset.index);
       if (editor.selectionAnchor != null && !isNaN(hoveredIndex)) {
@@ -2340,6 +2441,7 @@ btnTranscribeRecorded.addEventListener("click", async () => {
 });
 
 btnStopRecorded.addEventListener("click", async () => {
+  appendLog("INFO:Cancel requested for recording transcription.\n");
   await otter.cancelTranscription();
 });
 
@@ -2440,8 +2542,8 @@ const SPEC_FRIENDLY_LABELS: Record<string, string> = {
   "fw.json":          "Fast (no cleanup)",
   "fw_cwt.json":      "Balanced",
   "fw_asw_cwt.json":  "Refined",
-  "default_spec.json":"Best (WhisperX)",
-  "wx_asw_cwt.json":  "Best (WhisperX alt)",
+  "default_spec.json":"Recommended",
+  "wx_asw_cwt.json":  "WhisperX (slowest)",
 };
 
 const SPEC_ORDER: string[] = [
@@ -2631,8 +2733,9 @@ function removeSelection() {
   let changedAny = false;
   const ranges = getSelectedRanges(uniqueSortedIndices(activeEditor.selectedIndices));
   for (const r of ranges) {
-    const changed = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "active", "deleted");
-    if (changed) changedAny = true;
+    const changedActive = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "active", "deleted");
+    const changedAdded = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "added", "deleted");
+    if (changedActive || changedAdded) changedAny = true;
   }
   if (!changedAny) {
     // Nothing was active in that range — pop the undo we just pushed
@@ -2953,6 +3056,32 @@ btnLoadEdl.addEventListener("click", async () => {
     transcriptRecordedEl.innerHTML = "";
     if (importedEditor.pieceTable) renderTranscript(importedEditor);
     if (recordedEditor.pieceTable) renderTranscript(recordedEditor);
+
+    if (recordedEditor.audioPath) {
+      recordedWavePane.hidden = false;
+      recordedWaveDivider.hidden = false;
+      btnRecordedPlay.disabled = true;
+      btnTranscribeRecorded.disabled = false;
+      btnStopRecorded.hidden = true;
+      try {
+        const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
+        await wsRecorded.loadBlob(new Blob([recAb]));
+        btnRecordedPlay.disabled = false;
+        setRecordedPlayIcon(false);
+      } catch (err: unknown) {
+        recordedWavePane.hidden = true;
+        recordedWaveDivider.hidden = true;
+        btnRecordedPlay.disabled = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        appendLog(`ERROR: failed to load recorded waveform from EDL audio path: ${msg}\n`);
+      }
+    } else {
+      recordedWavePane.hidden = true;
+      recordedWaveDivider.hidden = true;
+      btnRecordedPlay.disabled = true;
+      btnTranscribeRecorded.disabled = true;
+      btnStopRecorded.hidden = true;
+    }
 
     // Load base waveform from imported audio if available, else recorded.
     const baseAudio = importedEditor.audioPath || recordedEditor.audioPath;

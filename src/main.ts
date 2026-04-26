@@ -30,10 +30,10 @@
  * (macOS apps normally remain running with zero windows.)
  */
 
-import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions, WebContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
 import path from "path";
 import fs from "fs";
-import { spawn, spawnSync, ChildProcessWithoutNullStreams } from "child_process";
+import { spawn, spawnSync, ChildProcess } from "child_process";
 
 type TranscribeSpec =
   | { mode: "file"; name: string }
@@ -67,19 +67,13 @@ type TranscriptionControlCommand =
 /**
  * 
  */
-type ManagedTranscriptionProcess = ChildProcessWithoutNullStreams & {
+type ManagedTranscriptionProcess = ChildProcess & {
   otterState?: "running" | "paused" | "cancelling";
   otterCancelled?: boolean;
 };
 
 let win: BrowserWindow | null = null;
 let activeProcess: ManagedTranscriptionProcess | null = null;
-let workerProcess: ManagedTranscriptionProcess | null = null;
-let workerStdoutBuf = "";
-let workerStderrLineBuf = "";
-let workerCurrentResolve: ((value: unknown) => void) | null = null;
-let workerCurrentReject: ((err: Error) => void) | null = null;
-let workerCurrentSender: WebContents | null = null;
 const repoRoot = path.join(__dirname, "..");
 
 function ensureDir(p: string) {
@@ -375,108 +369,6 @@ function buildPythonWorkerEnv(): { env: typeof process.env; logLine: string } {
   return { env, logLine };
 }
 
-function ensureWorkerProcess() {
-  if (workerProcess && workerProcess.pid && !workerProcess.killed) return workerProcess;
-
-  const python = getPythonPath();
-  const argv = ["-m", "otter_py.worker"];
-  const cwd = repoRoot;
-  const { env } = buildPythonWorkerEnv();
-
-  const child = spawn(python, argv, {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env,
-  }) as ManagedTranscriptionProcess;
-
-  workerProcess = child;
-  workerStdoutBuf = "";
-  workerStderrLineBuf = "";
-
-  const handleStderrLine = (rawLine: string) => {
-    const line = rawLine.replace(/\r$/, "").trim();
-    if (!line) return;
-
-    const sender = workerCurrentSender;
-    if (!sender) return;
-
-    const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
-    if (progressMatch) {
-      sender.send("transcribe-progress", Number(progressMatch[1]));
-      return;
-    }
-    if (line === "CONTROL:PAUSED") {
-      child.otterState = "paused";
-      sender.send("transcribe-state", { state: "paused" });
-      return;
-    }
-    if (line === "CONTROL:RESUMED") {
-      child.otterState = "running";
-      sender.send("transcribe-state", { state: "running" });
-      return;
-    }
-    if (line === "CONTROL:CANCELLING") {
-      child.otterState = "cancelling";
-      sender.send("transcribe-state", { state: "cancelling" });
-      return;
-    }
-    sender.send("transcribe-log", line + "\n");
-  };
-
-  child.stderr.on("data", (d: Buffer) => {
-    const chunk = d.toString();
-    workerStderrLineBuf += chunk;
-    let nl: number;
-    while ((nl = workerStderrLineBuf.indexOf("\n")) >= 0) {
-      const line = workerStderrLineBuf.slice(0, nl);
-      workerStderrLineBuf = workerStderrLineBuf.slice(nl + 1);
-      handleStderrLine(line);
-    }
-    if (workerStderrLineBuf.length > 256 * 1024) {
-      workerStderrLineBuf = workerStderrLineBuf.slice(-64 * 1024);
-    }
-  });
-
-  child.stdout.on("data", (d: Buffer) => {
-    workerStdoutBuf += d.toString();
-    let nl: number;
-    while ((nl = workerStdoutBuf.indexOf("\n")) >= 0) {
-      const line = workerStdoutBuf.slice(0, nl).trim();
-      workerStdoutBuf = workerStdoutBuf.slice(nl + 1);
-      if (!line) continue;
-      if (workerCurrentResolve) {
-        try {
-          const parsed = JSON.parse(line);
-          workerCurrentResolve(parsed);
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          workerCurrentReject?.(new Error(`Failed to parse worker JSON: ${msg}\n${line}`));
-        } finally {
-          workerCurrentResolve = null;
-          workerCurrentReject = null;
-          workerCurrentSender = null;
-          if (activeProcess === child) activeProcess = null;
-        }
-      }
-    }
-  });
-
-  child.on("close", () => {
-    if (workerProcess === child) workerProcess = null;
-    if (activeProcess === child) activeProcess = null;
-    if (workerCurrentReject) {
-      workerCurrentReject(new Error("Worker process exited"));
-      workerCurrentResolve = null;
-      workerCurrentReject = null;
-      workerCurrentSender = null;
-    }
-  });
-
-  return child;
-}
-
-
-
 /**
  * IPC: Transcribe an audio file by spawning a local Python script (Whisper-based).
  *
@@ -500,17 +392,10 @@ ipcMain.handle(
     event: IpcMainInvokeEvent,
     audioPath: string,
     spec?: TranscribeSpec
-  ) => { 
+  ) => {
     if (activeProcess) {
       throw new Error("A transcription is already running.");
     }
-
-    const worker = ensureWorkerProcess();
-    activeProcess = worker;
-    worker.otterState = "running";
-    worker.otterCancelled = false;
-
-    workerCurrentSender = event.sender;
     event.sender.send("transcribe-progress", 0);
 
     // Resolve spec for worker message
@@ -534,32 +419,152 @@ ipcMain.handle(
       `INFO:PythonWorker=enabled | Audio=${audioPath}\n` + workerCacheLog
     );
 
+    const python = getPythonPath();
+    const argv = ["-m", "otter_py.transcribe", "run", "--audio", audioPath];
+    if (specFile) argv.push("--spec-file", specFile);
+    if (specJson) argv.push("--spec-json", specJson);
+
+    const { env } = buildPythonWorkerEnv();
+    const child = spawn(python, argv, {
+      cwd: repoRoot,
+      // Important: leaving stdin open as a pipe can cause local transcription
+      // backends to hang indefinitely on Windows. This one-shot path does not
+      // need stdin for control messages, so close it up front.
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+    }) as ManagedTranscriptionProcess;
+
+    activeProcess = child;
+    child.otterState = "running";
+    child.otterCancelled = false;
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    if (!childStdout || !childStderr) {
+      activeProcess = null;
+      throw new Error("Transcription process did not expose stdout/stderr pipes.");
+    }
+
     return await new Promise((resolve, reject) => {
-      workerCurrentResolve = resolve;
-      workerCurrentReject = reject;
-      const payload: any = { type: "run", audio_path: audioPath };
-      if (specFile) payload.spec_file = specFile;
-      if (specJson) payload.spec_json = specJson;
-      worker.stdin.write(JSON.stringify(payload) + "\n");
+      let stdoutBuf = "";
+      let stderrLineBuf = "";
+      let settled = false;
+      let gotTerminalJson = false;
+      let lastStderrLine = "";
+
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (activeProcess === child) activeProcess = null;
+        fn();
+      };
+
+      const handleStderrLine = (rawLine: string) => {
+        const line = rawLine.replace(/\r$/, "").trim();
+        if (!line) return;
+        lastStderrLine = line;
+
+        const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
+        if (progressMatch) {
+          event.sender.send("transcribe-progress", Number(progressMatch[1]));
+          return;
+        }
+        if (line === "CONTROL:PAUSED") {
+          child.otterState = "paused";
+          event.sender.send("transcribe-state", { state: "paused" });
+          return;
+        }
+        if (line === "CONTROL:RESUMED") {
+          child.otterState = "running";
+          event.sender.send("transcribe-state", { state: "running" });
+          return;
+        }
+        if (line === "CONTROL:CANCELLING") {
+          child.otterState = "cancelling";
+          event.sender.send("transcribe-state", { state: "cancelling" });
+          return;
+        }
+        event.sender.send("transcribe-log", line + "\n");
+      };
+
+      childStderr.on("data", (d: Buffer) => {
+        const chunk = d.toString();
+        stderrLineBuf += chunk;
+        let nl: number;
+        while ((nl = stderrLineBuf.indexOf("\n")) >= 0) {
+          const line = stderrLineBuf.slice(0, nl);
+          stderrLineBuf = stderrLineBuf.slice(nl + 1);
+          handleStderrLine(line);
+        }
+        if (stderrLineBuf.length > 256 * 1024) {
+          stderrLineBuf = stderrLineBuf.slice(-64 * 1024);
+        }
+      });
+
+      childStdout.on("data", (d: Buffer) => {
+        stdoutBuf += d.toString();
+        let nl: number;
+        while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
+          const line = stdoutBuf.slice(0, nl).trim();
+          stdoutBuf = stdoutBuf.slice(nl + 1);
+          if (!line) continue;
+
+          try {
+            const parsed = JSON.parse(line) as Record<string, unknown>;
+            gotTerminalJson = true;
+
+            if (parsed.error === "Cancelled") {
+              finish(() => resolve({ cancelled: true }));
+              return;
+            }
+            if (typeof parsed.error === "string") {
+              const message =
+                typeof parsed.message === "string" && parsed.message.trim()
+                  ? parsed.message
+                  : parsed.error;
+              finish(() => reject(new Error(message)));
+              return;
+            }
+
+            finish(() => resolve(parsed));
+            return;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            finish(() => reject(new Error(`Failed to parse transcription JSON: ${msg}\n${line}`)));
+            return;
+          }
+        }
+      });
+
+      child.on("error", (err) => {
+        finish(() => reject(err));
+      });
+
+      child.on("close", (code, signal) => {
+        if (stderrLineBuf.trim()) handleStderrLine(stderrLineBuf);
+        if (gotTerminalJson) return;
+        if (child.otterCancelled || lastStderrLine === "CONTROL:CANCELLING") {
+          finish(() => resolve({ cancelled: true }));
+          return;
+        }
+
+        const detail = lastStderrLine ? `\nLast log: ${lastStderrLine}` : "";
+        finish(() =>
+          reject(
+            new Error(
+              `Worker process exited (code=${code ?? "null"}, signal=${signal ?? "none"})${detail}`
+            )
+          )
+        );
+      });
     });
   });
 
 ipcMain.handle("pause-transcription", async () => {
-  if (!activeProcess) return false;
-  if (activeProcess.otterState === "paused") return true;
-  if (activeProcess.otterState === "cancelling") return false;
-
-  const ok = sendControlCommand(activeProcess, { type: "pause" });
-  return ok;
+  return false;
 });
 
 ipcMain.handle("resume-transcription", async () => {
-  if (!activeProcess) return false;
-  if (activeProcess.otterState === "running") return true;
-  if (activeProcess.otterState === "cancelling") return false;
-
-  const ok = sendControlCommand(activeProcess, { type: "resume" });
-  return ok;
+  return false;
 });
 
 /**
@@ -568,20 +573,10 @@ ipcMain.handle("resume-transcription", async () => {
 ipcMain.handle("cancel-transcription", async () => {
   if (!activeProcess) return false;
 
-  activeProcess.otterCancelled = true;
-  activeProcess.otterState = "cancelling";
-
-  // First ask Python to shut itself down cleanly.
-  const sent = sendControlCommand(activeProcess, { type: "cancel" });
-
-  // Fallback: hard terminate if it does not exit.
-  setTimeout(() => {
-    if (activeProcess && activeProcess.otterCancelled) {
-      terminateProcess(activeProcess);
-    }
-  }, 1000);
-
-  return sent || terminateProcess(activeProcess);
+  const proc = activeProcess;
+  proc.otterCancelled = true;
+  proc.otterState = "cancelling";
+  return terminateProcess(proc);
 });
 
 ipcMain.handle("get-transcription-state", async () => {
