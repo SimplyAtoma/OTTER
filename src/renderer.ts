@@ -281,6 +281,20 @@ let activeEditor: EditorState;
 let playheadIndex = -1;
 let isDragging = false;
 
+/**
+ * Undo/redo snapshot for a single transcript editor pane.
+ *
+ * What we snapshot:
+ * - **Transcript content state**: piece-table buffers + pieces (when present) and `editor.words`.
+ * - **Audio association**: `audioPath` (used to rehydrate waveforms / source file mapping).
+ * - **Optional side snapshots**: during "append to main", we also capture the source pane so
+ *   a single undo step can restore the cleared pane (transcript + waveform).
+ *
+ * What we intentionally do NOT snapshot:
+ * - WaveSurfer internal playback state (playhead time, zoom, etc.). Those are derived from
+ *   `audioPath` + transcript and are reloaded by UI code after undo/redo.
+ * - UI-only DOM state (highlight spans, drop indicators). Those are regenerated on render.
+ */
 type UndoSnapshot =
   | {
       kind: "empty";
@@ -311,6 +325,8 @@ let dragMoveEditorKind: EditorKind | null = null;
 let isEditedPreviewMode = false;
 let previewWordTimes: Array<{ start: number; end: number }> = [];
 let previewRefreshToken = 0;
+// Used to gate UI behaviors / debugging; kept for future progress UI.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 let isRefreshingPreview = false;
 
 function setActiveEditor(next: EditorState) {
@@ -1053,8 +1069,18 @@ activeEditor = importedEditor;
 // NOTE: don't call setActiveEditor() yet; it touches edit buttons that are declared later.
 
 function attachTranscriptPaneDnD(pane: HTMLDivElement, editor: EditorState) {
-  // Make the pane itself clickable so the user can "focus" an editor
-  // without having to click a specific word.
+  /**
+   * Attach pane-level behavior for a transcript editor.
+   *
+   * Responsibilities:
+   * - **Focus/activation**: clicking in the pane (including empty space) sets the active editor.
+   * - **Move-mode drop target**: when in Move Words mode, allow dropping a dragged selection
+   *   into whitespace to append at end.
+   *
+   * Deliberate boundaries:
+   * - Word-level interactions (select, drag-select, seek, etc.) are handled in `renderTranscript()`.
+   * - We ignore clicks on nested interactive elements to avoid stealing focus from controls.
+   */
   pane.addEventListener("mousedown", (event: MouseEvent) => {
     // Ignore clicks on interactive controls nested inside the pane (if any)
     const target = event.target as HTMLElement | null;
@@ -1165,6 +1191,17 @@ function resetEditorState(editor: EditorState) {
   editor.selectionEnd = null;
 }
 
+/**
+ * Clear the "Imported Transcript" (pending-import) pane and its waveform.
+ *
+ * This is used when:
+ * - The user chooses a new file (staging should reset), or
+ * - The user appends the staged transcript into the main transcript.
+ *
+ * Invariants after this returns:
+ * - `pendingImportEditor` has no audioPath, words, pieceTable, or undo history.
+ * - Imported waveform pane is hidden and playback controls are disabled.
+ */
 function clearPendingImportedView() {
   resetEditorState(pendingImportEditor);
   transcriptPendingImportedEl.innerHTML = "";
@@ -1177,6 +1214,16 @@ function clearPendingImportedView() {
   setImportedPlayIcon(false);
 }
 
+/**
+ * Clear the "Recorded Transcript" pane and its waveform.
+ *
+ * This is used after successfully appending the recorded transcript into main,
+ * or when resetting the recorded state due to workflow changes.
+ *
+ * Invariants after this returns:
+ * - `recordedEditor` has no audioPath, words, pieceTable, or undo history.
+ * - Recorded waveform pane is hidden and playback/transcribe controls are disabled.
+ */
 function clearRecordedView() {
   resetEditorState(recordedEditor);
   transcriptRecordedEl.innerHTML = "";
@@ -1560,6 +1607,17 @@ function buildPreviewWordTimesFromActiveEntries(activeEntries: ViewEntry[]): Arr
   return out;
 }
 
+/**
+ * Load the main WaveSurfer instance from a file path.
+ *
+ * This is used for:
+ * - Loading the original source audio (when a project/main transcript is present)
+ * - Loading a rendered "edited preview" WAV produced from the current main transcript edits
+ *
+ * Side effects:
+ * - Pauses any current playback before loading.
+ * - Enables/disables the main play control based on load completion.
+ */
 async function loadMainWaveFromPath(filePath: string) {
   btnPlay.disabled = true;
   if (ws.isPlaying()) ws.pause();
@@ -1570,6 +1628,22 @@ async function loadMainWaveFromPath(filePath: string) {
   setPlayIcon(false);
 }
 
+/**
+ * Refresh the main waveform to reflect the edited transcript (main/imported editor).
+ *
+ * The main transcript (`importedEditor`) is the source of truth for "what plays" in the
+ * primary waveform. We derive a lightweight EDL-like payload from the piece table's
+ * **active** entries, ask the backend to render a temporary WAV preview, then load it
+ * into WaveSurfer.
+ *
+ * Concurrency:
+ * - Uses `previewRefreshToken` to make refreshes "last-write-wins" so rapid edits don't
+ *   flicker or race.
+ *
+ * Derived state:
+ * - Updates `previewWordTimes` so transcript highlighting can map playback time back to
+ *   word indices while in edited preview mode.
+ */
 async function refreshMainWavePreviewFromEdits() {
   const baseAudio = importedEditor.audioPath;
   if (!baseAudio || !importedEditor.pieceTable) {
@@ -2031,7 +2105,17 @@ function setPlayIcon(isPlaying: boolean) {
 // Create a Regions plugin instance for the main waveform (deleted-region overlays)
 const mainRegions = WaveSurfer.Regions.create();
 
-// Create the waveform visualization object
+/**
+ * WaveSurfer instances in this UI:
+ * - `ws`: primary waveform for the **main transcript** (importedEditor). This is the waveform
+ *   users primarily scrub/play against, and it is also where the edited-preview waveform loads.
+ * - `wsImported`: waveform for the **staged imported audio** (pendingImportEditor). This is a
+ *   "preview/staging" lane until its transcript is appended into main.
+ * - `wsRecorded`: waveform for the **recorded audio clip** (recordedEditor). Users can playback
+ *   the recording and optionally transcribe it into a transcript pane.
+ * - `wsDetail`: short waveform snippet used for **fine-grained selection/boundary adjustment**
+ *   around the current selection (detailEditor + detailSelStart/detailSelEnd).
+ */
 const ws = WaveSurfer.create({
   container: "#waveform",
   height: 80,
@@ -2360,12 +2444,28 @@ type TranscriptionJob = {
 let transcriptionQueue: TranscriptionJob[] = [];
 let isTranscriptionRunning = false;
 
+/**
+ * Human-friendly description for logs/status.
+ * Intentionally avoids dumping full paths into the UI.
+ */
 function describeJob(job: TranscriptionJob): string {
   const label = job.kind === "pending-import" ? "Imported audio" : "Recorded audio";
   const fname = job.audioPath.split("/").pop() ?? job.audioPath;
   return `${label} (${fname})`;
 }
 
+/**
+ * Drain the transcription queue sequentially (FIFO).
+ *
+ * Guarantees:
+ * - Only one transcription runs at a time (`isTranscriptionRunning` guard).
+ * - Jobs run in the exact order they were enqueued (button press order).
+ * - If a job is cancelled, we simply return from that job and continue to the next.
+ *
+ * Note:
+ * - Each queued job carries its own `specArg` snapshot so model/pipeline choice is
+ *   deterministic even if the user changes the UI spec before the job starts.
+ */
 async function runTranscriptionQueue(): Promise<void> {
   if (isTranscriptionRunning) return;
   isTranscriptionRunning = true;
@@ -2392,6 +2492,13 @@ async function runTranscriptionQueue(): Promise<void> {
   }
 }
 
+/**
+ * Enqueue a transcription request and kick the runner.
+ *
+ * UX behavior:
+ * - If another job is running (or already queued), we immediately notify the user
+ *   that this job is waiting.
+ */
 function enqueueTranscription(kind: TranscriptionJobKind, audioPath: string, specArg: TranscribeSpec): void {
   const job: TranscriptionJob = {
     id: crypto.randomUUID(),
@@ -2413,6 +2520,16 @@ function enqueueTranscription(kind: TranscriptionJobKind, audioPath: string, spe
   void runTranscriptionQueue();
 }
 
+/**
+ * Transcribe an imported (staged) audio file into the pending-import editor pane.
+ *
+ * Responsibilities:
+ * - Drive UI state for the imported transcription flow (progress, buttons).
+ * - Commit results atomically into `pendingImportEditor` (words + piece table).
+ *
+ * Input:
+ * - `specArg` is a snapshot taken at the time the user clicked Transcribe.
+ */
 async function transcribePendingImportAudio(toTranscribe: string, specArg: TranscribeSpec): Promise<void> {
   resetEditedPreviewState();
   btnTranscribe.disabled = true;
@@ -2466,6 +2583,17 @@ async function transcribePendingImportAudio(toTranscribe: string, specArg: Trans
   }
 }
 
+/**
+ * Transcribe a recorded WAV into the recorded editor pane.
+ *
+ * Guardrails:
+ * - If the user records a new clip while a prior recorded job is queued, we do not
+ *   overwrite the UI with a transcript for an older audio path. (We still allow the
+ *   job to complete for stability, but we skip applying results.)
+ *
+ * Input:
+ * - `specArg` is a snapshot taken at the time the user clicked Transcribe Rec.
+ */
 async function transcribeRecordedAudio(audioPath: string, specArg: TranscribeSpec): Promise<void> {
   btnTranscribeRecorded.disabled = true;
   setRecordedTranscribingState(true);
@@ -2795,6 +2923,17 @@ function showCustomArea(show: boolean) {
 /**
  * Spec argument passed to main.ts when transcribing.
  */
+/**
+ * Build the transcription pipeline argument from the current UI state.
+ *
+ * Semantics:
+ * - If "Customize JSON" is enabled, we send the textarea contents verbatim (`mode: "json"`).
+ * - Otherwise we send the selected preset filename (`mode: "file"`).
+ *
+ * Queueing note:
+ * - Callers that enqueue background work should snapshot this return value at click time,
+ *   rather than reading it later, so the chosen model/pipeline is stable per job.
+ */
 function getActiveSpecArg(): TranscribeSpec {
   if (chkCustomSpec.checked) {
     return { mode: "json", jsonText: specJsonEl.value || "" };
@@ -3008,7 +3147,7 @@ btnUndo.addEventListener("click", () => {
           await wsImported.loadBlob(new Blob([importAb]));
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
-        } catch (err: unknown) {
+        } catch {
           importedWavePane.hidden = true;
           importedWaveDivider.hidden = true;
           btnImportedPlay.disabled = true;
@@ -3031,7 +3170,7 @@ btnUndo.addEventListener("click", () => {
           await wsRecorded.loadBlob(new Blob([recAb]));
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
-        } catch (err: unknown) {
+        } catch {
           recordedWavePane.hidden = true;
           recordedWaveDivider.hidden = true;
           btnRecordedPlay.disabled = true;
@@ -3077,7 +3216,7 @@ btnRedo.addEventListener("click", () => {
           await wsImported.loadBlob(new Blob([importAb]));
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
-        } catch (err: unknown) {
+        } catch {
           importedWavePane.hidden = true;
           importedWaveDivider.hidden = true;
           btnImportedPlay.disabled = true;
@@ -3100,7 +3239,7 @@ btnRedo.addEventListener("click", () => {
           await wsRecorded.loadBlob(new Blob([recAb]));
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
-        } catch (err: unknown) {
+        } catch {
           recordedWavePane.hidden = true;
           recordedWaveDivider.hidden = true;
           btnRecordedPlay.disabled = true;
@@ -3124,6 +3263,21 @@ btnRedo.addEventListener("click", () => {
   }
 });
 
+/**
+ * Append the active (non-deleted) words from a source editor into the main transcript.
+ *
+ * Source editors:
+ * - `pendingImportEditor` (Imported Transcript)
+ * - `recordedEditor` (Recorded Transcript)
+ *
+ * Behavior:
+ * - If the main transcript is empty, we "promote" the source transcript into main.
+ * - Otherwise we append the source's active view entries as newly-added words in main.
+ *
+ * Undo/redo:
+ * - This function ensures the append is undoable and that undo restores the source pane
+ *   state (transcript + waveform) that the UI will clear immediately after the append.
+ */
 function appendEditorToMain(sourceEditor: EditorState, sourcePrefix: string, successMessage: string) {
   if (!sourceEditor.pieceTable || sourceEditor.words.length === 0) return;
 
@@ -3213,6 +3367,7 @@ btnAddRecordedToTranscript.addEventListener("click", () => {
   updateEditButtonStates();
   return;
 
+  /* eslint-disable no-unreachable */
   // If there is no imported transcript yet, promote recorded → imported.
   if (!importedEditor.pieceTable) {
     importedEditor.audioPath = importedEditor.audioPath || recordedEditor.audioPath;
@@ -3300,6 +3455,7 @@ btnAddRecordedToTranscript.addEventListener("click", () => {
   void refreshMainWavePreviewFromEdits();
   updateEditButtonStates();
   setStatus("Recorded transcript appended to main transcript.", "success");
+  /* eslint-enable no-unreachable */
 });
 
 document.addEventListener("keydown", (e: KeyboardEvent) => {

@@ -56,7 +56,13 @@ type Edl = {
 };
 
 /**
- * 
+ * Control messages that (in the long-lived worker mode) can be sent to the Python
+ * transcription process over stdin as line-delimited JSON.
+ *
+ * Important: This PoC currently uses a one-shot process invocation for transcription
+ * (`stdio: ["ignore", ...]` below), so pause/resume are not wired through. The types
+ * remain here because the Python side supports cooperative control and the Electron
+ * UI already models the states.
  */
 type TranscriptionControlCommand =
   | { type: "pause" }
@@ -65,7 +71,12 @@ type TranscriptionControlCommand =
   | { type: "ping" };
 
 /**
- * 
+ * Managed child process used for transcription.
+ *
+ * We attach small bits of UI-facing state to the Node ChildProcess object so we can:
+ * - guard against overlapping transcriptions (`activeProcess`)
+ * - interpret stderr control lines (paused/resumed/cancelling)
+ * - short-circuit resolution as `{ cancelled: true }` on cancellation
  */
 type ManagedTranscriptionProcess = ChildProcess & {
   otterState?: "running" | "paused" | "cancelling";
@@ -196,7 +207,15 @@ ipcMain.handle("probe-audio", async (_event: IpcMainInvokeEvent, inputPath: stri
 });
 
 /**
- * 
+ * Resolve the Python interpreter used for transcription.
+ *
+ * Order of preference:
+ * - Explicit environment override (OTTER_PYTHON / OTTER_PYTHON_PATH / PYTHON_EXECUTABLE)
+ * - The currently activated venv (VIRTUAL_ENV)
+ * - Repo-local `.venv`
+ * - PATH fallback (python3/python)
+ *
+ * We also validate candidates by attempting to import `otter_py.transcribe`.
  */
 function getPythonPath() {
   // Allow explicit override (recommended) so Electron uses the same interpreter
@@ -260,6 +279,8 @@ function getPythonPath() {
 /**
  * 
  */
+// Used by earlier refactors; retained for future control routing.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function sendControlCommand(
   proc: ManagedTranscriptionProcess,
   cmd: TranscriptionControlCommand
@@ -372,12 +393,18 @@ function buildPythonWorkerEnv(): { env: typeof process.env; logLine: string } {
 /**
  * IPC: Transcribe an audio file by spawning a local Python script (Whisper-based).
  *
- * The Python script writes the final transcript as JSON to stdout. We also stream
- * log output to the renderer so the UI can display progress and diagnostics.
+ * Contract with Python (`otter_py.transcribe run`):
+ * - **STDOUT**: one terminal JSON object (either words[] or {words, language/meta} depending on flags).
+ * - **STDERR**: human-readable logs + structured progress lines: `PROGRESS:<0-100>`.
+ * - **Cancellation**: if the process is terminated, we resolve `{ cancelled: true }` as long
+ *   as we can detect cancellation state (either by explicit marker or by our own cancel flag).
+ *
+ * Why this separation matters:
+ * - The renderer expects STDOUT to be parseable JSON with no extra chatter.
+ * - Any library output that might be noisy should go to STDERR on the Python side.
  *
  * Progress convention:
- *   The script may emit lines like: "PROGRESS 37" to stderr, which we parse and
- *   forward to the renderer as a numeric percentage.
+ *   The script emits lines like: `PROGRESS:37` to stderr, which we parse and forward to the renderer.
  *
  * Virtual environment support:
  *   If a local .venv exists, we prefer its python binary; otherwise we fall back
@@ -620,6 +647,9 @@ ipcMain.handle("read-spec-file", async (_event: IpcMainInvokeEvent, name: string
  *
  * Used by make-snippet and export-edl-audio to avoid duplicating the
  * spawn-and-wait pattern.
+ *
+ * Failure mode:
+ * - Rejects with stderr output included; callers should surface this to the renderer log/status.
  */
 function runFfmpeg(args: string[]): Promise<void> {
   return new Promise<void>((resolve, reject) => {

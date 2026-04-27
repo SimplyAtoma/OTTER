@@ -213,6 +213,16 @@ contextBridge.exposeInMainWorld("otter", {
 
   renderEditedPreview: (edlJson: string): Promise<string> =>
     ipcRenderer.invoke("render-edited-preview", edlJson),
+  /**
+   * Render an "edited preview" WAV for fast playback in the renderer.
+   *
+   * This is intentionally a preview-only artifact:
+   * - It is derived from the current transcript/EDL state
+   * - It can be discarded and regenerated at any time
+   *
+   * The renderer uses this to update the main waveform after edits, without
+   * permanently exporting audio.
+   */
 
   /**
    * Save a microphone recording to disk and return a WAV path.
