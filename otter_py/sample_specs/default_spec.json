@@ -1,36 +1,24 @@
 {
   "transcriber": {
-    "id": "whisperx_vad",
+    "id": "faster_whisper",
     "opts": {
       "model": "small",
       "device": "cpu",
       "compute_type": "int8"
     }
   },
-  "postprocessors": [
-    {
-      "id": "clean_word_timings",
-      "opts": {
-        "tiny_gap_ms": 300.0
-      }
-    },
-    {
-      "id": "filter_fillers",
-      "opts": {
-        "min_conf": 0.10
-      }
-    },
-    {
-      "id": "filter_low_confidence_words",
-      "opts": {
-        "min_conf": 0.4
-      }
-    },
+  "post": [
     {
       "id": "adjust_short_words",
       "opts": {
         "max_len": 0.30,
         "min_extend": 0.10
+      }
+    },
+    {
+      "id": "clean_word_timings",
+      "opts": {
+        "tiny_gap_ms": 300.0
       }
     }
   ]

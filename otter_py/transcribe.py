@@ -4,8 +4,17 @@ transcribe.py
 
 CLI wrapper for the OTTER PoC pipeline system.
 
-This script is meant to be called from Electron (main process), and communicates
-results via STDOUT (JSON). Diagnostic output (progress, logs) goes to STDERR.
+This script is meant to be called from Electron (main process).
+
+## Electron ↔ Python contract (important)
+
+- **STDOUT**: machine-readable JSON only (no logs). Electron treats this as the return value.
+- **STDERR**: logs + progress markers. Electron listens for:
+  - `PROGRESS:<N>` lines where \(0 \le N \le 100\) and forwards them to the UI progress bar.
+  - optional `CONTROL:*` lines emitted by `ControlManager` (pause/resume/cancel acknowledgements).
+
+To keep this reliable, we redirect any third-party stdout chatter to stderr
+(see `run_with_stdout_redirect`) so it cannot corrupt the JSON channel.
 
 Supported commands:
   - list: print available transcribers and post-processors (with option schemas)
@@ -29,7 +38,7 @@ from typing import Any, Dict, Optional
 
 from pydash import get as deep_get
 from otter_py.exceptions import TranscriptionCancelled
-from otter_py.util import eprint, run_with_stdout_redirect
+from otter_py.util import _start_elapsed_timer, eprint, run_with_stdout_redirect
 from otter_py.cacheUtil import _cache_key, _cache_dir, _load_cache, _save_cache
 
 
@@ -111,7 +120,16 @@ class ControlManager:
         return wrapped
 
 def read_spec(spec_json: Optional[str], spec_file: Optional[str]) -> Dict[str, Any]:
-    """Load the pipeline spec from a JSON string or file."""
+    """
+    Load the pipeline spec from a JSON string or file.
+
+    Accepted shapes (high level):
+    - {"transcriber": {"id": "...", "opts": {...}}, "post": [...]}  (canonical)
+    - {"transcriber": {...}, "postprocessors": [...]}              (legacy alias)
+
+    Each post entry is:
+      {"id": "<postprocessor_id>", "opts": {...}}
+    """
     if spec_json and spec_file:
         raise ValueError("Provide only one of --spec-json or --spec-file")
 
@@ -200,6 +218,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             result = cached
         else:
             eprint("INFO:cache miss, running pipeline")
+            timer_stop = _start_elapsed_timer(label="transcription")
             try:
                 import soundfile as sf
                 duration = sf.info(audio_path).duration
@@ -270,15 +289,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                         lambda: run_pipeline(audio_path=audio_path, spec=spec, ctx=ctx)
                     )
             except TranscriptionCancelled as e:
+                timer_stop.set()
                 eprint(f"INFO:cancelled:{e}")
                 json.dump({"error": "Cancelled", "message": str(e)}, sys.stdout)
                 sys.stdout.write("\n")
                 return 2
             except Exception as e:
+                timer_stop.set()
                 eprint(f"ERROR:{type(e).__name__}:{e}")
                 json.dump({"error": type(e).__name__, "message": str(e)}, sys.stdout)
                 sys.stdout.write("\n")
                 return 1
+            timer_stop.set()
             controller.checkpoint()
             _save_cache(cache_key, result)
 

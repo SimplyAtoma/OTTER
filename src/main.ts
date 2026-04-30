@@ -33,7 +33,7 @@
 import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
 import path from "path";
 import fs from "fs";
-import { spawn, spawnSync, ChildProcessWithoutNullStreams } from "child_process";
+import { spawn, spawnSync, ChildProcess } from "child_process";
 
 type TranscribeSpec =
   | { mode: "file"; name: string }
@@ -56,7 +56,13 @@ type Edl = {
 };
 
 /**
- * 
+ * Control messages that (in the long-lived worker mode) can be sent to the Python
+ * transcription process over stdin as line-delimited JSON.
+ *
+ * Important: This PoC currently uses a one-shot process invocation for transcription
+ * (`stdio: ["ignore", ...]` below), so pause/resume are not wired through. The types
+ * remain here because the Python side supports cooperative control and the Electron
+ * UI already models the states.
  */
 type TranscriptionControlCommand =
   | { type: "pause" }
@@ -65,9 +71,14 @@ type TranscriptionControlCommand =
   | { type: "ping" };
 
 /**
- * 
+ * Managed child process used for transcription.
+ *
+ * We attach small bits of UI-facing state to the Node ChildProcess object so we can:
+ * - guard against overlapping transcriptions (`activeProcess`)
+ * - interpret stderr control lines (paused/resumed/cancelling)
+ * - short-circuit resolution as `{ cancelled: true }` on cancellation
  */
-type ManagedTranscriptionProcess = ChildProcessWithoutNullStreams & {
+type ManagedTranscriptionProcess = ChildProcess & {
   otterState?: "running" | "paused" | "cancelling";
   otterCancelled?: boolean;
 };
@@ -75,6 +86,10 @@ type ManagedTranscriptionProcess = ChildProcessWithoutNullStreams & {
 let win: BrowserWindow | null = null;
 let activeProcess: ManagedTranscriptionProcess | null = null;
 const repoRoot = path.join(__dirname, "..");
+
+function ensureDir(p: string) {
+  fs.mkdirSync(p, { recursive: true });
+}
 
 /**
  * Create the main application window and load the UI.
@@ -192,7 +207,15 @@ ipcMain.handle("probe-audio", async (_event: IpcMainInvokeEvent, inputPath: stri
 });
 
 /**
- * 
+ * Resolve the Python interpreter used for transcription.
+ *
+ * Order of preference:
+ * - Explicit environment override (OTTER_PYTHON / OTTER_PYTHON_PATH / PYTHON_EXECUTABLE)
+ * - The currently activated venv (VIRTUAL_ENV)
+ * - Repo-local `.venv`
+ * - PATH fallback (python3/python)
+ *
+ * We also validate candidates by attempting to import `otter_py.transcribe`.
  */
 function getPythonPath() {
   // Allow explicit override (recommended) so Electron uses the same interpreter
@@ -256,6 +279,8 @@ function getPythonPath() {
 /**
  * 
  */
+// Used by earlier refactors; retained for future control routing.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function sendControlCommand(
   proc: ManagedTranscriptionProcess,
   cmd: TranscriptionControlCommand
@@ -283,17 +308,103 @@ function terminateProcess(proc: ManagedTranscriptionProcess): boolean {
   }
 }
 
+function directoryHasFiles(dir: string): boolean {
+  try {
+    if (!fs.existsSync(dir)) return false;
+    return fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
 
+/**
+ * Default faster-whisper / WhisperX weight directory when the user did not set
+ * OTTER_WHISPERX_DOWNLOAD_ROOT. Prefer an existing non-empty cache (AppData from
+ * older OTTER builds, or .cache/huggingface/whisperx) so we do not point at an
+ * empty folder and force a multi‑GB re-download.
+ */
+function defaultWhisperxDownloadRoot(userHf: string, hasUserHf: boolean, userDataWx: string): string {
+  if (!hasUserHf) return userDataWx;
+  const underHf = path.join(userHf, "whisperx");
+  if (directoryHasFiles(underHf)) return underHf;
+  if (directoryHasFiles(userDataWx)) return userDataWx;
+  return underHf;
+}
+
+/**
+ * Env passed to the persistent Python worker so Hugging Face / WhisperX on-disk
+ * caches match a typical CLI install: prefer %USER%\.cache\huggingface when it
+ * exists, otherwise use AppData. Explicit OTTER_* / HF_* env always wins.
+ */
+function buildPythonWorkerEnv(): { env: typeof process.env; logLine: string } {
+  const home = app.getPath("home");
+  const userData = app.getPath("userData");
+  const userHf = path.join(home, ".cache", "huggingface");
+  const hasUserHf = fs.existsSync(userHf);
+  const userDataHf = path.join(userData, "hf_home");
+  const userDataWx = path.join(userData, "whisperx_download");
+
+  const hfHomeExplicit = Boolean(process.env.OTTER_HF_HOME || process.env.HF_HOME);
+
+  const hfHome =
+    process.env.OTTER_HF_HOME ||
+    process.env.HF_HOME ||
+    (hasUserHf ? userHf : userDataHf);
+
+  const huggingfaceHubCache =
+    process.env.HUGGINGFACE_HUB_CACHE ||
+    (!hfHomeExplicit && hasUserHf ? path.join(userHf, "hub") : undefined);
+
+  const transformersCache =
+    process.env.TRANSFORMERS_CACHE ||
+    (!hfHomeExplicit && hasUserHf ? path.join(userHf, "transformers") : undefined);
+
+  const wxRoot =
+    process.env.OTTER_WHISPERX_DOWNLOAD_ROOT ||
+    process.env.WHISPERX_DOWNLOAD_ROOT ||
+    defaultWhisperxDownloadRoot(userHf, hasUserHf, userDataWx);
+
+  for (const p of [hfHome, huggingfaceHubCache, transformersCache, wxRoot]) {
+    if (p) {
+      try {
+        if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+      } catch {
+        // best-effort; Python may still fail with a clear error
+      }
+    }
+  }
+
+  const env: typeof process.env = {
+    ...process.env,
+    PYTHONUNBUFFERED: "1",
+    HF_HOME: hfHome,
+    OTTER_WHISPERX_DOWNLOAD_ROOT: wxRoot,
+    HF_HUB_DISABLE_TELEMETRY: process.env.HF_HUB_DISABLE_TELEMETRY ?? "1",
+  };
+  if (huggingfaceHubCache) env.HUGGINGFACE_HUB_CACHE = huggingfaceHubCache;
+  if (transformersCache) env.TRANSFORMERS_CACHE = transformersCache;
+
+  const logLine =
+    `INFO:HF_HOME=${hfHome} | HUGGINGFACE_HUB_CACHE=${huggingfaceHubCache ?? "(unset)"} | ` +
+    `TRANSFORMERS_CACHE=${transformersCache ?? "(unset)"} | OTTER_WHISPERX_DOWNLOAD_ROOT=${wxRoot}\n`;
+  return { env, logLine };
+}
 
 /**
  * IPC: Transcribe an audio file by spawning a local Python script (Whisper-based).
  *
- * The Python script writes the final transcript as JSON to stdout. We also stream
- * log output to the renderer so the UI can display progress and diagnostics.
+ * Contract with Python (`otter_py.transcribe run`):
+ * - **STDOUT**: one terminal JSON object (either words[] or {words, language/meta} depending on flags).
+ * - **STDERR**: human-readable logs + structured progress lines: `PROGRESS:<0-100>`.
+ * - **Cancellation**: if the process is terminated, we resolve `{ cancelled: true }` as long
+ *   as we can detect cancellation state (either by explicit marker or by our own cancel flag).
+ *
+ * Why this separation matters:
+ * - The renderer expects STDOUT to be parseable JSON with no extra chatter.
+ * - Any library output that might be noisy should go to STDERR on the Python side.
  *
  * Progress convention:
- *   The script may emit lines like: "PROGRESS 37" to stderr, which we parse and
- *   forward to the renderer as a numeric percentage.
+ *   The script emits lines like: `PROGRESS:37` to stderr, which we parse and forward to the renderer.
  *
  * Virtual environment support:
  *   If a local .venv exists, we prefer its python binary; otherwise we fall back
@@ -308,85 +419,76 @@ ipcMain.handle(
     event: IpcMainInvokeEvent,
     audioPath: string,
     spec?: TranscribeSpec
-  ) => { 
-    if( activeProcess){
+  ) => {
+    if (activeProcess) {
       throw new Error("A transcription is already running.");
     }
+    event.sender.send("transcribe-progress", 0);
 
-    // Run from the repo root so "python -m otter_py.transcribe" works.
-    const cwd = repoRoot;
-
-    // Build argv for: python -m otter_py.transcribe run --audio ... --spec-...
-    const python = getPythonPath();
-    const argv = ["-m", "otter_py.transcribe", "run", "--audio", audioPath];
-    event.sender.send("transcribe-log", `INFO:Python=${python} | CWD=${cwd} | ARGS=${argv.join(" ")}\n`);
-
-    // Choose spec source
+    // Resolve spec for worker message
+    let specFile: string | undefined;
+    let specJson: string | undefined;
     if (spec?.mode === "file") {
-      // All presets live here; only pass a filename from renderer for safety.
       const safeName = path.basename(spec.name);
-      if (safeName !== spec.name){
+      if (safeName !== spec.name) {
         throw new Error("Invalid spec file name");
       }
-      const specPath = path.join(repoRoot, "otter_py", "sample_specs", safeName);
-      argv.push("--spec-file", specPath);
+      specFile = path.join(repoRoot, "otter_py", "sample_specs", safeName);
     } else if (spec?.mode === "json") {
-      argv.push("--spec-json", spec.jsonText);
+      specJson = spec.jsonText;
     } else {
-      // Default: use default_spec.json
-      const specPath = path.join(repoRoot, "otter_py", "sample_specs", "default_spec.json");
-      argv.push("--spec-file", specPath);
+      specFile = path.join(repoRoot, "otter_py", "sample_specs", "default_spec.json");
     }
 
-    // Optional: if you want meta sometimes
-    // argv.push("--emit-meta");
+    const { logLine: workerCacheLog } = buildPythonWorkerEnv();
+    event.sender.send(
+      "transcribe-log",
+      `INFO:PythonWorker=enabled | Audio=${audioPath}\n` + workerCacheLog
+    );
 
-    return await new Promise((resolve, reject) => {
-      const child = spawn(python, argv, { 
-        cwd,
-        stdio: ["pipe","pipe","pipe"],
-        env: {...process.env, PYTHONUNBUFFERED: "1"}
+    const python = getPythonPath();
+    const argv = ["-m", "otter_py.transcribe", "run", "--audio", audioPath];
+    if (specFile) argv.push("--spec-file", specFile);
+    if (specJson) argv.push("--spec-json", specJson);
+
+    const { env } = buildPythonWorkerEnv();
+    const child = spawn(python, argv, {
+      cwd: repoRoot,
+      // Important: leaving stdin open as a pipe can cause local transcription
+      // backends to hang indefinitely on Windows. This one-shot path does not
+      // need stdin for control messages, so close it up front.
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
     }) as ManagedTranscriptionProcess;
 
-      activeProcess = child;
-      child.otterState = "running";
-      child.otterCancelled= false;
+    activeProcess = child;
+    child.otterState = "running";
+    child.otterCancelled = false;
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    if (!childStdout || !childStderr) {
+      activeProcess = null;
+      throw new Error("Transcription process did not expose stdout/stderr pipes.");
+    }
 
-      event.sender.send("transcribe-progress", 0);
-
-      let stdout = "";
-      let stderr = "";
-      /** Incomplete stderr line from last chunk (avoids losing PROGRESS:NN split across reads). */
+    return await new Promise((resolve, reject) => {
+      let stdoutBuf = "";
       let stderrLineBuf = "";
       let settled = false;
+      let gotTerminalJson = false;
+      let lastStderrLine = "";
 
-      const cleanup = ()=> {
-        if(activeProcess === child){
-          activeProcess = null;
-        }
-      }
-
-      const failOnce = (err: Error) => {
+      const finish = (fn: () => void) => {
         if (settled) return;
         settled = true;
-        cleanup();
-        reject(err);
+        if (activeProcess === child) activeProcess = null;
+        fn();
       };
-
-      const resolveOnce = (value: unknown) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(value);
-      };
-
-      child.stdout.on("data", (d: Buffer) => {
-        stdout += d.toString();
-      });
 
       const handleStderrLine = (rawLine: string) => {
         const line = rawLine.replace(/\r$/, "").trim();
         if (!line) return;
+        lastStderrLine = line;
 
         const progressMatch = line.match(/^PROGRESS:(\d{1,3})\s*$/);
         if (progressMatch) {
@@ -411,11 +513,9 @@ ipcMain.handle(
         event.sender.send("transcribe-log", line + "\n");
       };
 
-      child.stderr.on("data", (d: Buffer) => {
+      childStderr.on("data", (d: Buffer) => {
         const chunk = d.toString();
-        stderr += chunk;
         stderrLineBuf += chunk;
-
         let nl: number;
         while ((nl = stderrLineBuf.indexOf("\n")) >= 0) {
           const line = stderrLineBuf.slice(0, nl);
@@ -427,73 +527,71 @@ ipcMain.handle(
         }
       });
 
+      childStdout.on("data", (d: Buffer) => {
+        stdoutBuf += d.toString();
+        let nl: number;
+        while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
+          const line = stdoutBuf.slice(0, nl).trim();
+          stdoutBuf = stdoutBuf.slice(nl + 1);
+          if (!line) continue;
+
+          try {
+            const parsed = JSON.parse(line) as Record<string, unknown>;
+            gotTerminalJson = true;
+
+            if (parsed.error === "Cancelled") {
+              finish(() => resolve({ cancelled: true }));
+              return;
+            }
+            if (typeof parsed.error === "string") {
+              const message =
+                typeof parsed.message === "string" && parsed.message.trim()
+                  ? parsed.message
+                  : parsed.error;
+              finish(() => reject(new Error(message)));
+              return;
+            }
+
+            finish(() => resolve(parsed));
+            return;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            finish(() => reject(new Error(`Failed to parse transcription JSON: ${msg}\n${line}`)));
+            return;
+          }
+        }
+      });
+
       child.on("error", (err) => {
-        failOnce(err instanceof Error ? err : new Error(String(err)));
+        finish(() => reject(err));
       });
 
       child.on("close", (code, signal) => {
-        if (stderrLineBuf.trim()) {
-          handleStderrLine(stderrLineBuf);
-          stderrLineBuf = "";
-        }
-
-        cleanup();
-
-        // User clicked Stop (or cancel IPC). Resolve — do not reject — so Electron
-        // does not log this as an IPC handler error in the main process console.
-        if (child.otterCancelled) {
-          resolveOnce({ cancelled: true as const });
-          return;
-        }
-        if (signal) {
-          failOnce(new Error(`transcription exited due to signal: ${signal}`));
+        if (stderrLineBuf.trim()) handleStderrLine(stderrLineBuf);
+        if (gotTerminalJson) return;
+        if (child.otterCancelled || lastStderrLine === "CONTROL:CANCELLING") {
+          finish(() => resolve({ cancelled: true }));
           return;
         }
 
-        // Cooperative cancel from Python (exit 2 + error JSON) without Node flag
-        if (code === 2) {
-          try {
-            const parsed = JSON.parse(stdout) as { error?: string };
-            if (parsed?.error === "Cancelled") {
-              resolveOnce({ cancelled: true as const });
-              return;
-            }
-          } catch {
-            // fall through to generic non-zero handling
-          }
-        }
-
-        if (code !== 0) {
-          failOnce(new Error(`transcribe exited with ${code}\n${stderr}`));
-          return;
-        }
-        try {
-          const parsed = JSON.parse(stdout);
-          resolveOnce(parsed);
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          reject(new Error(`Failed to parse JSON from transcribe:\n${stdout}\n\n${stderr}\n${msg}`));
-        }
+        const detail = lastStderrLine ? `\nLast log: ${lastStderrLine}` : "";
+        finish(() =>
+          reject(
+            new Error(
+              `Worker process exited (code=${code ?? "null"}, signal=${signal ?? "none"})${detail}`
+            )
+          )
+        );
       });
     });
   });
 
 ipcMain.handle("pause-transcription", async () => {
-  if (!activeProcess) return false;
-  if (activeProcess.otterState === "paused") return true;
-  if (activeProcess.otterState === "cancelling") return false;
-
-  const ok = sendControlCommand(activeProcess, { type: "pause" });
-  return ok;
+  return false;
 });
 
 ipcMain.handle("resume-transcription", async () => {
-  if (!activeProcess) return false;
-  if (activeProcess.otterState === "running") return true;
-  if (activeProcess.otterState === "cancelling") return false;
-
-  const ok = sendControlCommand(activeProcess, { type: "resume" });
-  return ok;
+  return false;
 });
 
 /**
@@ -502,20 +600,10 @@ ipcMain.handle("resume-transcription", async () => {
 ipcMain.handle("cancel-transcription", async () => {
   if (!activeProcess) return false;
 
-  activeProcess.otterCancelled = true;
-  activeProcess.otterState = "cancelling";
-
-  // First ask Python to shut itself down cleanly.
-  const sent = sendControlCommand(activeProcess, { type: "cancel" });
-
-  // Fallback: hard terminate if it does not exit.
-  setTimeout(() => {
-    if (activeProcess && activeProcess.otterCancelled) {
-      terminateProcess(activeProcess);
-    }
-  }, 1000);
-
-  return sent || terminateProcess(activeProcess);
+  const proc = activeProcess;
+  proc.otterCancelled = true;
+  proc.otterState = "cancelling";
+  return terminateProcess(proc);
 });
 
 ipcMain.handle("get-transcription-state", async () => {
@@ -559,6 +647,9 @@ ipcMain.handle("read-spec-file", async (_event: IpcMainInvokeEvent, name: string
  *
  * Used by make-snippet and export-edl-audio to avoid duplicating the
  * spawn-and-wait pattern.
+ *
+ * Failure mode:
+ * - Rejects with stderr output included; callers should surface this to the renderer log/status.
  */
 function runFfmpeg(args: string[]): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -572,6 +663,81 @@ function runFfmpeg(args: string[]): Promise<void> {
     });
   });
 }
+
+// =============================================================================
+// Mic recording: save + convert to WAV
+// =============================================================================
+
+ipcMain.handle(
+  "save-mic-recording",
+  async (_event: IpcMainInvokeEvent, data: Buffer, mimeType: string) => {
+    const recDir = path.join(app.getPath("userData"), "recordings");
+    ensureDir(recDir);
+
+    const stamp = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const mt = (mimeType || "").toLowerCase();
+    const ext =
+      mt.includes("ogg") ? "ogg" :
+      mt.includes("webm") ? "webm" :
+      mt.includes("wav") ? "wav" :
+      "webm";
+
+    const rawPath = path.join(recDir, `mic_${stamp}.${ext}`);
+    fs.writeFileSync(rawPath, data);
+
+    const wavPath = path.join(recDir, `mic_${stamp}.wav`);
+    const args = [
+      "-hide_banner",
+      "-y",
+      "-i", rawPath,
+      "-c:a", "pcm_s16le",
+      wavPath,
+    ];
+    await runFfmpeg(args);
+    return wavPath;
+  }
+);
+
+ipcMain.handle(
+  "save-mic-recording-as",
+  async (_event: IpcMainInvokeEvent, data: Buffer, mimeType: string) => {
+    const options = {
+      title: "Save Recording",
+      defaultPath: `recording_${new Date().toISOString().replace(/[:.]/g, "-")}.wav`,
+      filters: [{ name: "WAV Audio", extensions: ["wav"] }],
+    };
+
+    const result = win
+      ? await dialog.showSaveDialog(win, options)
+      : await dialog.showSaveDialog(options);
+
+    if (result.canceled || !result.filePath) return null;
+
+    const recDir = path.join(app.getPath("userData"), "recordings");
+    ensureDir(recDir);
+
+    const stamp = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const mt = (mimeType || "").toLowerCase();
+    const ext =
+      mt.includes("ogg") ? "ogg" :
+      mt.includes("webm") ? "webm" :
+      mt.includes("wav") ? "wav" :
+      "webm";
+
+    const rawPath = path.join(recDir, `mic_${stamp}.${ext}`);
+    fs.writeFileSync(rawPath, data);
+
+    const args = [
+      "-hide_banner",
+      "-y",
+      "-i", rawPath,
+      "-c:a", "pcm_s16le",
+      result.filePath,
+    ];
+    await runFfmpeg(args);
+    return result.filePath;
+  }
+);
 
 /**
  * IPC: Create a short WAV snippet from a source audio file using ffmpeg.
@@ -695,14 +861,23 @@ ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJs
     throw new Error("No non-muted segments to preview.");
   }
 
-  const sourceFile = edl.sourceFile;
+  const getSource = (e: any) => (typeof e.sourceFile === "string" ? e.sourceFile : edl.sourceFile);
+  const sources = Array.from(new Set(entries.map(getSource)));
+
+  const inputArgs: string[] = [];
+  for (const src of sources) {
+    inputArgs.push("-i", src);
+  }
+
   const filterParts: string[] = [];
   const concatInputs: string[] = [];
 
   for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
+    const e: any = entries[i];
+    const src = getSource(e);
+    const inputIndex = Math.max(0, sources.indexOf(src));
     filterParts.push(
-      `[0]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
+      `[${inputIndex}:a]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
     );
     concatInputs.push(`[a${i}]`);
   }
@@ -723,7 +898,7 @@ ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJs
   const args = [
     "-hide_banner",
     "-y",
-    "-i", sourceFile,
+    ...inputArgs,
     "-filter_complex", filterComplex,
     "-map", "[out]",
     "-c:a", "pcm_s16le",
@@ -770,14 +945,23 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
   //   [0]atrim=start=S0:end=E0,asetpts=PTS-STARTPTS[a0];
   //   [0]atrim=start=S1:end=E1,asetpts=PTS-STARTPTS[a1];
   //   [a0][a1]concat=n=2:v=0:a=1[out]
-  const sourceFile = edl.sourceFile;
+  const getSource = (e: any) => (typeof e.sourceFile === "string" ? e.sourceFile : edl.sourceFile);
+  const sources = Array.from(new Set(entries.map(getSource)));
+
+  const inputArgs: string[] = [];
+  for (const src of sources) {
+    inputArgs.push("-i", src);
+  }
+
   const filterParts: string[] = [];
   const concatInputs: string[] = [];
 
   for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
+    const e: any = entries[i];
+    const src = getSource(e);
+    const inputIndex = Math.max(0, sources.indexOf(src));
     filterParts.push(
-      `[0]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
+      `[${inputIndex}:a]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
     );
     concatInputs.push(`[a${i}]`);
   }
@@ -791,7 +975,7 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
   const args = [
     "-hide_banner",
     "-y",
-    "-i", sourceFile,
+    ...inputArgs,
     "-filter_complex", filterComplex,
     "-map", "[out]",
     "-c:a", "pcm_s16le",

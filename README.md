@@ -63,7 +63,7 @@ To keep the focus clear, this prototype does not attempt to:
 + Package into a self-contained application
 + Provide a polished end-user experience
 
-These are deliberate omissions and are appropriate topics for the full capstone project. Additional documentation lives under [`doc/`](doc/) (for example [`UnderstandingElectron.md`](doc/UnderstandingElectron.md) and [`User_Stories.md`](doc/User_Stories.md)).
+These are deliberate omissions and are appropriate topics for the full capstone project. Additional documentation lives under [`doc/`](doc/) (for example [`UnderstandingElectron.md`](doc/UnderstandingElectron.md), [`Feature_Implementation_Guide.md`](doc/Feature_Implementation_Guide.md), and [`User_Stories.md`](doc/User_Stories.md)).
 
 ### Languages
 

@@ -94,16 +94,17 @@ def run_in_thread_with_timeout(
             pool.shutdown(wait=True)
 
 
-def _start_elapsed_timer() -> threading.Event:
+def _start_elapsed_timer(*, label: str = "pipeline") -> threading.Event:
     stop_event = threading.Event()
     start = time.time()
+    interval = float(os.environ.get("OTTER_ELAPSED_TICK_SEC", "5"))
 
     def _tick():
-        while not stop_event.wait(timeout=1.0):
+        while not stop_event.wait(timeout=interval):
             elapsed = time.time() - start
             m = int(elapsed // 60)
             s = int(elapsed % 60)
-            eprint(f"ELAPSED:{m:02d}:{s:02d}")
+            eprint(f"INFO:{label} still working ({m:02d}:{s:02d} elapsed)")
 
     threading.Thread(target=_tick, daemon=True).start()
     return stop_event

@@ -89,6 +89,7 @@ type PieceEntry = {
   sourceStart: number;
   sourceEnd: number;
   breakAfter?: number;
+  sourceFile?: string;
 };
 
 type Piece = {
@@ -119,6 +120,7 @@ type EdlV1Entry = {
   sourceEnd: number;
   label: string;
   muted: boolean;
+  sourceFile?: string;
 };
 
 type OtterApi = {
@@ -136,6 +138,8 @@ type OtterApi = {
   loadEdl: () => Promise<{ path: string; content: string } | null>;
   exportEdlAudio: (edlJson: string) => Promise<string | null>;
   renderEditedPreview: (edlJson: string) => Promise<string>;
+  saveMicRecording: (data: ArrayBuffer, mimeType: string) => Promise<string>;
+  saveMicRecordingAs: (data: ArrayBuffer, mimeType: string) => Promise<string | null>;
   pauseTranscription: () => Promise<boolean>;
   resumeTranscription: () => Promise<boolean>;
   cancelTranscription: () => Promise<boolean>;
@@ -162,35 +166,179 @@ const DETAIL_PAD_AFTER  = 0.25; // seconds
 const WaveSurfer = window.WaveSurfer as any;
 const otter = window.otter;
 
-let audioPath: string | null = null;
-let words: TranscriptWord[] = [];
-let selectionStart: number | null = null;
-let selectionEnd: number | null = null;
-let selectionAnchor: number | null = null;
-let selectedIndices: number[] = [];
+// Always-available diagnostics pane (so early crashes still show details).
+function ensureDiagPane(): HTMLPreElement {
+  let pre = document.getElementById("otterDiag") as HTMLPreElement | null;
+  if (pre) return pre;
+  pre = document.createElement("pre");
+  pre.id = "otterDiag";
+  pre.style.position = "fixed";
+  pre.style.left = "10px";
+  pre.style.right = "10px";
+  pre.style.bottom = "10px";
+  pre.style.maxHeight = "40vh";
+  pre.style.overflow = "auto";
+  pre.style.margin = "0";
+  pre.style.padding = "10px";
+  pre.style.border = "1px solid #ef4444";
+  pre.style.borderRadius = "8px";
+  pre.style.background = "#0b0b0b";
+  pre.style.color = "#e8e8e8";
+  pre.style.fontSize = "12px";
+  pre.style.lineHeight = "1.35";
+  pre.style.whiteSpace = "pre-wrap";
+  pre.style.zIndex = "9999";
+  pre.hidden = true;
+  document.body.appendChild(pre);
+  return pre;
+}
+
+function diag(msg: string) {
+  const pre = ensureDiagPane();
+  pre.hidden = false;
+  pre.textContent += msg;
+  pre.scrollTop = pre.scrollHeight;
+}
+
+if (!otter) {
+  const s = document.getElementById("status");
+  if (s) {
+    s.textContent = "Bridge API (window.otter) is missing. UI cannot function.";
+    s.className = "error";
+    (s as HTMLElement).style.display = "inline-block";
+  }
+  diag("\nFATAL: window.otter is missing (preload bridge not available)\n");
+  // Do not throw here; we want the diagnostics pane to remain visible.
+}
+
+// Surface runtime errors into the in-app log/status (Electron users may not have devtools open).
+const earlyLogBuffer: string[] = [];
+
+function bufferOrLog(msg: string) {
+  const logger = (window as any).__otterAppendLog as ((m: string) => void) | undefined;
+  if (logger) logger(msg);
+  else earlyLogBuffer.push(msg);
+  diag(msg);
+}
+
+function openDevPanelIfPresent() {
+  const devPanel = document.getElementById("devPanel") as HTMLDetailsElement | null;
+  if (devPanel) devPanel.open = true;
+}
+
+window.addEventListener("error", (ev) => {
+  try {
+    const msg = (ev as ErrorEvent).error instanceof Error
+      ? (ev as ErrorEvent).error.stack || (ev as ErrorEvent).error.message
+      : (ev as ErrorEvent).message || String(ev);
+    const safe = msg || "Unknown error";
+    bufferOrLog(`\nRUNTIME ERROR:\n${safe}\n`);
+    openDevPanelIfPresent();
+    const statusEl = document.getElementById("status");
+    if (statusEl) {
+      statusEl.textContent = "UI error (see log).";
+      statusEl.className = "error";
+      (statusEl as HTMLElement).style.display = "inline-block";
+    }
+  } catch {
+    // ignore
+  }
+});
+
+window.addEventListener("unhandledrejection", (ev) => {
+  try {
+    const reason = (ev as PromiseRejectionEvent).reason;
+    const msg = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+    bufferOrLog(`\nUNHANDLED REJECTION:\n${msg}\n`);
+    openDevPanelIfPresent();
+  } catch {
+    // ignore
+  }
+});
+
+type EditorKind = "imported" | "pending-import" | "recorded";
+type InteractionMode = "select" | "move";
+
+type EditorState = {
+  kind: EditorKind;
+  paneEl: HTMLDivElement;
+  audioPath: string | null;
+  words: TranscriptWord[];
+  pieceTable: PieceTableData | null;
+  undoStack: UndoSnapshot[];
+  redoStack: UndoSnapshot[];
+  selectionStart: number | null;
+  selectionEnd: number | null;
+  selectionAnchor: number | null;
+  selectedIndices: number[];
+  interactionMode: InteractionMode;
+};
+
+let importedEditor: EditorState;
+let pendingImportEditor: EditorState;
+let recordedEditor: EditorState;
+let activeEditor: EditorState;
 let playheadIndex = -1;
 let isDragging = false;
 
-type UndoSnapshot = {
-  pieces: Piece[];
-  originalBuffer: PieceEntry[];
-  addBuffer: PieceEntry[];
-  words: TranscriptWord[];
-};
-
-let pieceTable: PieceTableData | null = null;
-let undoStack: UndoSnapshot[] = [];
-let redoStack: UndoSnapshot[] = [];
+/**
+ * Undo/redo snapshot for a single transcript editor pane.
+ *
+ * What we snapshot:
+ * - **Transcript content state**: piece-table buffers + pieces (when present) and `editor.words`.
+ * - **Audio association**: `audioPath` (used to rehydrate waveforms / source file mapping).
+ * - **Optional side snapshots**: during "append to main", we also capture the source pane so
+ *   a single undo step can restore the cleared pane (transcript + waveform).
+ *
+ * What we intentionally do NOT snapshot:
+ * - WaveSurfer internal playback state (playhead time, zoom, etc.). Those are derived from
+ *   `audioPath` + transcript and are reloaded by UI code after undo/redo.
+ * - UI-only DOM state (highlight spans, drop indicators). Those are regenerated on render.
+ */
+type UndoSnapshot =
+  | {
+      kind: "empty";
+      audioPath: string | null;
+      words: TranscriptWord[];
+      side?: Partial<Record<EditorKind, UndoSnapshot>>;
+    }
+  | {
+      kind: "pt";
+      audioPath: string | null;
+      pieces: Piece[];
+      originalBuffer: PieceEntry[];
+      addBuffer: PieceEntry[];
+      ptSourceFile: string;
+      ptCreatedAt: string;
+      ptModifiedAt: string;
+      words: TranscriptWord[];
+      side?: Partial<Record<EditorKind, UndoSnapshot>>;
+    };
 
 let detailSelStart: number | null = null;
 let detailSelEnd: number | null = null;
+let detailEditor: EditorState | null = null;
 let isMouseSelecting = false;
 let mouseSelectionMoved = false;
 let dragMoveSourceIndices: number[] = [];
+let dragMoveEditorKind: EditorKind | null = null;
 let isEditedPreviewMode = false;
 let previewWordTimes: Array<{ start: number; end: number }> = [];
 let previewRefreshToken = 0;
+// Used to gate UI behaviors / debugging; kept for future progress UI.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 let isRefreshingPreview = false;
+
+function setActiveEditor(next: EditorState) {
+  activeEditor = next;
+  transcriptImportedEl.classList.toggle("isActive", activeEditor.kind === "imported");
+  transcriptPendingImportedEl.classList.toggle("isActive", activeEditor.kind === "pending-import");
+  transcriptRecordedEl.classList.toggle("isActive", activeEditor.kind === "recorded");
+  updateEditButtonStates();
+}
+
+// The most recently chosen audio file to transcribe (import flow).
+let pendingImportAudioPath: string | null = null;
 
 //
 // Utility Functions
@@ -334,56 +482,111 @@ function mergePieces(pieces: Piece[]): Piece[] {
   return merged;
 }
 
-function snapshotState(pt: PieceTableData): UndoSnapshot {
+function snapshotState(editor: EditorState): UndoSnapshot {
+  if (!editor.pieceTable) {
+    return {
+      kind: "empty",
+      audioPath: editor.audioPath,
+      words: editor.words.map(w => ({ ...w })),
+    };
+  }
+  const pt = editor.pieceTable;
   return {
+    kind: "pt",
+    audioPath: editor.audioPath,
     pieces: pt.pieces.map(p => ({ ...p })),
     originalBuffer: pt.originalBuffer.map(e => ({ ...e })),
     addBuffer: pt.addBuffer.map(e => ({ ...e })),
-    words: words.map(w => ({ ...w })),
+    ptSourceFile: pt.sourceFile,
+    ptCreatedAt: pt.createdAt,
+    ptModifiedAt: pt.modifiedAt,
+    words: editor.words.map(w => ({ ...w })),
   };
 }
 
-function pushUndo(): void {
-  if (!pieceTable) return;
-  undoStack.push(snapshotState(pieceTable));
-  redoStack = [];
+function pushUndo(editor: EditorState): void {
+  if (!editor.pieceTable) return;
+  editor.undoStack.push(snapshotState(editor));
+  editor.redoStack = [];
 }
 
-function restoreSnapshot(pt: PieceTableData, snap: UndoSnapshot): void {
-  pt.pieces = snap.pieces.map(p => ({ ...p }));
-  pt.originalBuffer = snap.originalBuffer.map(e => ({ ...e }));
-  pt.addBuffer = snap.addBuffer.map(e => ({ ...e }));
-  words = snap.words.map(w => ({ ...w }));
-  pt.modifiedAt = new Date().toISOString();
+function restoreSnapshot(editor: EditorState, snap: UndoSnapshot): void {
+  editor.audioPath = snap.audioPath ?? null;
+  editor.words = snap.words.map(w => ({ ...w }));
+  if (snap.kind === "empty") {
+    editor.pieceTable = null;
+    editor.selectedIndices = [];
+    editor.selectionAnchor = null;
+    editor.selectionStart = null;
+    editor.selectionEnd = null;
+    return;
+  }
+
+  editor.pieceTable = {
+    pieces: snap.pieces.map(p => ({ ...p })),
+    originalBuffer: snap.originalBuffer.map(e => ({ ...e })),
+    addBuffer: snap.addBuffer.map(e => ({ ...e })),
+    sourceFile: snap.ptSourceFile,
+    createdAt: snap.ptCreatedAt,
+    modifiedAt: new Date().toISOString(),
+  };
 }
 
-function performUndo(): boolean {
-  if (!pieceTable || undoStack.length === 0) return false;
-  redoStack.push(snapshotState(pieceTable));
-  restoreSnapshot(pieceTable, undoStack.pop()!);
+function performUndo(editor: EditorState): boolean {
+  if (editor.undoStack.length === 0) return false;
+  const snap = editor.undoStack.pop()!;
+  const redoSnap = snapshotState(editor);
+  if (snap.side) {
+    redoSnap.side = {};
+    for (const k of Object.keys(snap.side) as EditorKind[]) {
+      const kindSnap = snap.side[k];
+      if (!kindSnap) continue;
+      if (k === "pending-import") redoSnap.side[k] = snapshotState(pendingImportEditor);
+      if (k === "recorded") redoSnap.side[k] = snapshotState(recordedEditor);
+      if (k === "imported") redoSnap.side[k] = snapshotState(importedEditor);
+    }
+  }
+  editor.redoStack.push(redoSnap);
+  restoreSnapshot(editor, snap);
+  if (snap.side?.["pending-import"]) restoreSnapshot(pendingImportEditor, snap.side["pending-import"]);
+  if (snap.side?.recorded) restoreSnapshot(recordedEditor, snap.side.recorded);
   return true;
 }
 
-function performRedo(): boolean {
-  if (!pieceTable || redoStack.length === 0) return false;
-  undoStack.push(snapshotState(pieceTable));
-  restoreSnapshot(pieceTable, redoStack.pop()!);
+function performRedo(editor: EditorState): boolean {
+  if (editor.redoStack.length === 0) return false;
+  const snap = editor.redoStack.pop()!;
+  const undoSnap = snapshotState(editor);
+  if (snap.side) {
+    undoSnap.side = {};
+    for (const k of Object.keys(snap.side) as EditorKind[]) {
+      const kindSnap = snap.side[k];
+      if (!kindSnap) continue;
+      if (k === "pending-import") undoSnap.side[k] = snapshotState(pendingImportEditor);
+      if (k === "recorded") undoSnap.side[k] = snapshotState(recordedEditor);
+      if (k === "imported") undoSnap.side[k] = snapshotState(importedEditor);
+    }
+  }
+  editor.undoStack.push(undoSnap);
+  restoreSnapshot(editor, snap);
+  if (snap.side?.["pending-import"]) restoreSnapshot(pendingImportEditor, snap.side["pending-import"]);
+  if (snap.side?.recorded) restoreSnapshot(recordedEditor, snap.side.recorded);
   return true;
 }
 
-function syncBreakAfterToPieceTable(): void {
-  if (!pieceTable) return;
-  const viewEntries = getViewEntries(pieceTable);
-  for (let i = 0; i < viewEntries.length && i < words.length; i++) {
-    viewEntries[i].entry.breakAfter = words[i].breakAfter;
+function syncBreakAfterToPieceTable(editor: EditorState): void {
+  if (!editor.pieceTable) return;
+  const viewEntries = getViewEntries(editor.pieceTable);
+  for (let i = 0; i < viewEntries.length && i < editor.words.length; i++) {
+    viewEntries[i].entry.breakAfter = editor.words[i].breakAfter;
   }
 }
 
-function syncWordsFromPieceTable(): void {
-  if (!pieceTable) return;
+function syncWordsFromPieceTable(editor: EditorState): void {
+  if (!editor.pieceTable) return;
 
-  const oldWords = words;
-  const viewEntries = getViewEntries(pieceTable);
+  const oldWords = editor.words;
+  const viewEntries = getViewEntries(editor.pieceTable);
 
   const newWords: TranscriptWord[] = viewEntries.map(ve => ({
     word: ve.entry.word,
@@ -397,17 +600,25 @@ function syncWordsFromPieceTable(): void {
     }
   }
 
-  words = newWords;
+  editor.words = newWords;
 }
 
 async function refreshDetailIfActive(): Promise<void> {
+  if (!detailEditor) return;
+  const currentDetailEditor = detailEditor;
   if (detailSelStart == null || detailSelEnd == null) return;
-  if (detailSelStart >= words.length) { detailSelStart = null; detailSelEnd = null; return; }
-  const endIdx = Math.min(detailSelEnd, words.length - 1);
-  const rangeStart = Number(words[detailSelStart].start);
-  const rangeEnd = Number(words[endIdx].end);
+  if (detailSelStart >= currentDetailEditor.words.length) { detailSelStart = null; detailSelEnd = null; detailEditor = null; return; }
+  const endIdx2 = Math.min(detailSelEnd, currentDetailEditor.words.length - 1);
+  const viewEntries = currentDetailEditor.pieceTable ? getViewEntries(currentDetailEditor.pieceTable) : [];
+  const rangeEntries = viewEntries.slice(detailSelStart, endIdx2 + 1);
+  const rangeSourceFile = rangeEntries[0]?.entry.sourceFile || currentDetailEditor.audioPath;
+  if (!rangeSourceFile) return;
+  const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || currentDetailEditor.audioPath) !== rangeSourceFile);
+  if (mixedSources) return;
+  const rangeStart = Number(currentDetailEditor.words[detailSelStart].start);
+  const rangeEnd = Number(currentDetailEditor.words[endIdx2].end);
   try {
-    await loadDetailForRange(rangeStart, rangeEnd);
+    await loadDetailForRange(rangeSourceFile, rangeStart, rangeEnd);
   } catch (err: unknown) {
     console.error("Failed to refresh detail view:", err);
   }
@@ -692,15 +903,20 @@ function convertV1ToV2(v1: { sourceFile: string; entries: EdlV1Entry[]; createdA
  * Enable or disable editing buttons based on current piece table and selection state.
  */
 function updateEditButtonStates() {
-  const hasPt = pieceTable != null;
-  const hasSel = selectedIndices.length > 0;
+  const hasSel = activeEditor.selectedIndices.length > 0;
+  const hasAnyTranscript = importedEditor.pieceTable != null || pendingImportEditor.pieceTable != null || recordedEditor.pieceTable != null;
+  const hasMainTranscript = importedEditor.pieceTable != null;
+  const hasPt = activeEditor.pieceTable != null;
 
   btnRemove.disabled = !hasPt || !hasSel;
   btnRestore.disabled = !hasPt || !hasSel;
-  btnUndo.disabled = !hasPt || undoStack.length === 0;
-  btnRedo.disabled = !hasPt || redoStack.length === 0;
-  btnSaveEdl.disabled = !hasPt;
-  btnSaveEdits.disabled = !hasPt;
+  btnUndo.disabled = activeEditor.undoStack.length === 0;
+  btnRedo.disabled = activeEditor.redoStack.length === 0;
+  btnSaveEdl.disabled = !hasAnyTranscript;
+  btnSaveEdits.disabled = !hasMainTranscript;
+
+  btnAddImportedToTranscript.disabled = pendingImportEditor.pieceTable == null || pendingImportEditor.words.length === 0;
+  btnAddRecordedToTranscript.disabled = recordedEditor.pieceTable == null || recordedEditor.words.length === 0;
 }
 
 /**
@@ -709,34 +925,34 @@ function updateEditButtonStates() {
  * adjustments are persisted.
  */
 function writebackRegionBounds() {
-  if (!pieceTable || !detailRegion || detailSelStart == null) return;
+  if (!detailEditor?.pieceTable || !detailRegion || !detailEditor.words || detailSelStart == null) return;
 
   const absStart = detailWinStartAbs + detailRegion.start;
   const absEnd = detailWinStartAbs + detailRegion.end;
-  const viewEntries = getViewEntries(pieceTable);
+  const viewEntries = getViewEntries(detailEditor.pieceTable);
 
   if (detailSelStart === detailSelEnd) {
     const ve = viewEntries[detailSelStart];
     if (ve) {
       ve.entry.sourceStart = absStart;
       ve.entry.sourceEnd = absEnd;
-      words[detailSelStart].start = absStart;
-      words[detailSelStart].end = absEnd;
+      detailEditor.words[detailSelStart].start = absStart;
+      detailEditor.words[detailSelStart].end = absEnd;
     }
   } else if (detailSelEnd != null) {
     const veStart = viewEntries[detailSelStart];
     const veEnd = viewEntries[detailSelEnd];
     if (veStart) {
       veStart.entry.sourceStart = absStart;
-      words[detailSelStart].start = absStart;
+      detailEditor.words[detailSelStart].start = absStart;
     }
     if (veEnd) {
       veEnd.entry.sourceEnd = absEnd;
-      words[detailSelEnd].end = absEnd;
+      detailEditor.words[detailSelEnd].end = absEnd;
     }
   }
 
-  pieceTable.modifiedAt = new Date().toISOString();
+  detailEditor.pieceTable.modifiedAt = new Date().toISOString();
 }
 
 
@@ -749,9 +965,9 @@ const DELETED_REGION_COLOR = "rgba(180, 180, 180, 0.45)";
  */
 function updateDeletedRegions() {
   mainRegions.clearRegions();
-  if (!pieceTable) return;
+  if (!importedEditor.pieceTable) return;
 
-  const viewEntries = getViewEntries(pieceTable);
+  const viewEntries = getViewEntries(importedEditor.pieceTable);
   let i = 0;
   while (i < viewEntries.length) {
     if (viewEntries[i].status !== "deleted") { i++; continue; }
@@ -780,29 +996,171 @@ function updateDeletedRegions() {
 //
 //==============================================================================
 
-const transcriptEl = mustGetEl<HTMLDivElement>("transcript");
+const transcriptImportedEl = mustGetEl<HTMLDivElement>("transcriptImported");
+const transcriptPendingImportedEl = mustGetEl<HTMLDivElement>("transcriptPendingImported");
+const transcriptRecordedEl = mustGetEl<HTMLDivElement>("transcriptRecorded");
+// Back-compat for existing transcript logic; will be extended to support both panes.
+const transcriptEl = transcriptImportedEl;
 const btnChoose = mustGetEl<HTMLButtonElement>("btnChoose");
 const btnTranscribe = mustGetEl<HTMLButtonElement>("btnTranscribe");
 const btnPause = mustGetEl<HTMLButtonElement>("btnPause");
 const btnStop = mustGetEl<HTMLButtonElement>("btnStop");
+const micSelect = mustGetEl<HTMLSelectElement>("micSelect");
+const btnRefreshMics = mustGetEl<HTMLButtonElement>("btnRefreshMics");
+const btnRecord = mustGetEl<HTMLButtonElement>("btnRecord");
+const btnRecordPause = mustGetEl<HTMLButtonElement>("btnRecordPause");
+const btnRecordStop = mustGetEl<HTMLButtonElement>("btnRecordStop");
+const btnAddImportedToTranscript = mustGetEl<HTMLButtonElement>("btnAddImportedToTranscript");
+const btnAddRecordedToTranscript = mustGetEl<HTMLButtonElement>("btnAddRecordedToTranscript");
+const btnImportedSelectMode = mustGetEl<HTMLButtonElement>("btnImportedSelectMode");
+const btnImportedMoveMode = mustGetEl<HTMLButtonElement>("btnImportedMoveMode");
+const btnPendingImportSelectMode = mustGetEl<HTMLButtonElement>("btnPendingImportSelectMode");
+const btnPendingImportMoveMode = mustGetEl<HTMLButtonElement>("btnPendingImportMoveMode");
+const btnRecordedSelectMode = mustGetEl<HTMLButtonElement>("btnRecordedSelectMode");
+const btnRecordedMoveMode = mustGetEl<HTMLButtonElement>("btnRecordedMoveMode");
 const statusEl = mustGetEl<HTMLDivElement>("status");
 
-transcriptEl.addEventListener("dragover", (event: DragEvent) => {
-  if (dragMoveSourceIndices.length === 0) return;
-  if ((event.target as HTMLElement).closest(".word")) return;
-  event.preventDefault();
-  clearDropIndicators();
-});
+importedEditor = {
+  kind: "imported",
+  paneEl: transcriptImportedEl,
+  audioPath: null,
+  words: [],
+  pieceTable: null,
+  undoStack: [],
+  redoStack: [],
+  selectionStart: null,
+  selectionEnd: null,
+  selectionAnchor: null,
+  selectedIndices: [],
+  interactionMode: "select",
+};
 
-transcriptEl.addEventListener("drop", (event: DragEvent) => {
-  if (dragMoveSourceIndices.length === 0) return;
-  if ((event.target as HTMLElement).closest(".word")) return;
-  event.preventDefault();
-  clearDropIndicators();
-  moveCurrentSelection(words.length);
-  dragMoveSourceIndices = [];
-  transcriptEl.classList.remove("dragging-words");
-});
+pendingImportEditor = {
+  kind: "pending-import",
+  paneEl: transcriptPendingImportedEl,
+  audioPath: null,
+  words: [],
+  pieceTable: null,
+  undoStack: [],
+  redoStack: [],
+  selectionStart: null,
+  selectionEnd: null,
+  selectionAnchor: null,
+  selectedIndices: [],
+  interactionMode: "select",
+};
+
+recordedEditor = {
+  kind: "recorded",
+  paneEl: transcriptRecordedEl,
+  audioPath: null,
+  words: [],
+  pieceTable: null,
+  undoStack: [],
+  redoStack: [],
+  selectionStart: null,
+  selectionEnd: null,
+  selectionAnchor: null,
+  selectedIndices: [],
+  interactionMode: "select",
+};
+
+activeEditor = importedEditor;
+// NOTE: don't call setActiveEditor() yet; it touches edit buttons that are declared later.
+
+function attachTranscriptPaneDnD(pane: HTMLDivElement, editor: EditorState) {
+  /**
+   * Attach pane-level behavior for a transcript editor.
+   *
+   * Responsibilities:
+   * - **Focus/activation**: clicking in the pane (including empty space) sets the active editor.
+   * - **Move-mode drop target**: when in Move Words mode, allow dropping a dragged selection
+   *   into whitespace to append at end.
+   *
+   * Deliberate boundaries:
+   * - Word-level interactions (select, drag-select, seek, etc.) are handled in `renderTranscript()`.
+   * - We ignore clicks on nested interactive elements to avoid stealing focus from controls.
+   */
+  pane.addEventListener("mousedown", (event: MouseEvent) => {
+    // Ignore clicks on interactive controls nested inside the pane (if any)
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest("button, a, input, textarea, select")) return;
+    setActiveEditor(editor);
+  });
+
+  pane.addEventListener("dragover", (event: DragEvent) => {
+    if (editor.interactionMode !== "move") return;
+    if (dragMoveSourceIndices.length === 0) return;
+    if (dragMoveEditorKind !== editor.kind) return;
+    if ((event.target as HTMLElement).closest(".word")) return;
+    event.preventDefault();
+    setActiveEditor(editor);
+    clearDropIndicators();
+  });
+
+  pane.addEventListener("drop", (event: DragEvent) => {
+    if (editor.interactionMode !== "move") return;
+    if (dragMoveSourceIndices.length === 0) return;
+    if (dragMoveEditorKind !== editor.kind) return;
+    if ((event.target as HTMLElement).closest(".word")) return;
+    event.preventDefault();
+    setActiveEditor(editor);
+    clearDropIndicators();
+    moveCurrentSelection(editor, editor.words.length);
+    dragMoveSourceIndices = [];
+    dragMoveEditorKind = null;
+    pane.classList.remove("dragging-words");
+  });
+}
+
+attachTranscriptPaneDnD(transcriptImportedEl, importedEditor);
+attachTranscriptPaneDnD(transcriptPendingImportedEl, pendingImportEditor);
+attachTranscriptPaneDnD(transcriptRecordedEl, recordedEditor);
+
+function updateInteractionModeButtons() {
+  const buttonPairs = [
+    { editor: importedEditor, selectBtn: btnImportedSelectMode, moveBtn: btnImportedMoveMode },
+    { editor: pendingImportEditor, selectBtn: btnPendingImportSelectMode, moveBtn: btnPendingImportMoveMode },
+    { editor: recordedEditor, selectBtn: btnRecordedSelectMode, moveBtn: btnRecordedMoveMode },
+  ];
+
+  for (const { editor, selectBtn, moveBtn } of buttonPairs) {
+    const selectActive = editor.interactionMode === "select";
+    selectBtn.classList.toggle("isActive", selectActive);
+    moveBtn.classList.toggle("isActive", !selectActive);
+    selectBtn.setAttribute("aria-pressed", String(selectActive));
+    moveBtn.setAttribute("aria-pressed", String(!selectActive));
+    editor.paneEl.classList.toggle("moveMode", editor.interactionMode === "move");
+  }
+}
+
+function setInteractionMode(editor: EditorState, nextMode: InteractionMode) {
+  if (editor.interactionMode === nextMode) return;
+  editor.interactionMode = nextMode;
+
+  if (nextMode === "select") {
+    isDragging = false;
+    dragMoveSourceIndices = [];
+    dragMoveEditorKind = null;
+    clearDropIndicators();
+    editor.paneEl.classList.remove("dragging-words");
+  } else {
+    isMouseSelecting = false;
+    mouseSelectionMoved = false;
+  }
+
+  updateInteractionModeButtons();
+  renderTranscript(editor);
+}
+
+btnImportedSelectMode.addEventListener("click", () => setInteractionMode(importedEditor, "select"));
+btnImportedMoveMode.addEventListener("click", () => setInteractionMode(importedEditor, "move"));
+btnPendingImportSelectMode.addEventListener("click", () => setInteractionMode(pendingImportEditor, "select"));
+btnPendingImportMoveMode.addEventListener("click", () => setInteractionMode(pendingImportEditor, "move"));
+btnRecordedSelectMode.addEventListener("click", () => setInteractionMode(recordedEditor, "select"));
+btnRecordedMoveMode.addEventListener("click", () => setInteractionMode(recordedEditor, "move"));
+updateInteractionModeButtons();
 
 let isPaused = false;
 
@@ -814,6 +1172,171 @@ function setTranscribingState(active: boolean) {
     isPaused = false;
     btnPause.textContent = "⏸ Pause";
   }
+}
+
+function setRecordedTranscribingState(active: boolean) {
+  btnTranscribeRecorded.hidden = active;
+  btnStopRecorded.hidden = !active;
+}
+
+function resetEditorState(editor: EditorState) {
+  editor.audioPath = null;
+  editor.words = [];
+  editor.pieceTable = null;
+  editor.undoStack = [];
+  editor.redoStack = [];
+  editor.selectedIndices = [];
+  editor.selectionAnchor = null;
+  editor.selectionStart = null;
+  editor.selectionEnd = null;
+}
+
+/**
+ * Clear the "Imported Transcript" (pending-import) pane and its waveform.
+ *
+ * This is used when:
+ * - The user chooses a new file (staging should reset), or
+ * - The user appends the staged transcript into the main transcript.
+ *
+ * Invariants after this returns:
+ * - `pendingImportEditor` has no audioPath, words, pieceTable, or undo history.
+ * - Imported waveform pane is hidden and playback controls are disabled.
+ */
+function clearPendingImportedView() {
+  resetEditorState(pendingImportEditor);
+  transcriptPendingImportedEl.innerHTML = "";
+  importedWavePane.hidden = true;
+  importedWaveDivider.hidden = true;
+  btnImportedPlay.disabled = true;
+  importedLoadedFileEl.textContent = "No imported audio staged";
+  importedTimeEl.textContent = "0.00";
+  if (typeof wsImported.empty === "function") wsImported.empty();
+  setImportedPlayIcon(false);
+}
+
+/**
+ * Clear the "Recorded Transcript" pane and its waveform.
+ *
+ * This is used after successfully appending the recorded transcript into main,
+ * or when resetting the recorded state due to workflow changes.
+ *
+ * Invariants after this returns:
+ * - `recordedEditor` has no audioPath, words, pieceTable, or undo history.
+ * - Recorded waveform pane is hidden and playback/transcribe controls are disabled.
+ */
+function clearRecordedView() {
+  resetEditorState(recordedEditor);
+  transcriptRecordedEl.innerHTML = "";
+  recordedWavePane.hidden = true;
+  recordedWaveDivider.hidden = true;
+  btnRecordedPlay.disabled = true;
+  btnTranscribeRecorded.disabled = true;
+  btnStopRecorded.hidden = true;
+  recordedTimeEl.textContent = "0.00";
+  if (typeof wsRecorded.empty === "function") wsRecorded.empty();
+  setRecordedPlayIcon(false);
+}
+
+// ---------------------------------------------------------------------------
+// Mic recording (MediaRecorder) state
+// ---------------------------------------------------------------------------
+
+let micStream: MediaStream | null = null;
+let micRecorder: MediaRecorder | null = null;
+let micChunks: Blob[] = [];
+let micRecordingStartedAt = 0;
+
+function setRecordingState(active: boolean) {
+  btnRecord.hidden = active;
+  btnRecordPause.hidden = !active;
+  btnRecordStop.hidden = !active;
+  micSelect.disabled = active;
+  btnRefreshMics.disabled = active;
+}
+
+/**
+ * List audio input devices. Labels are empty until the user has granted microphone
+ * permission at least once in this session; use ensureMicPermissionForLabels() first.
+ */
+async function refreshMicDeviceList(): Promise<void> {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const inputs = devices.filter((d) => d.kind === "audioinput");
+  const previous = micSelect.value;
+
+  micSelect.innerHTML = "";
+  const defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "Default (system)";
+  micSelect.appendChild(defaultOpt);
+
+  inputs.forEach((d, i) => {
+    const opt = document.createElement("option");
+    opt.value = d.deviceId;
+    opt.textContent = d.label?.trim() || `Microphone ${i + 1}`;
+    micSelect.appendChild(opt);
+  });
+
+  const stillValid =
+    previous === "" || Array.from(micSelect.options).some((o) => o.value === previous);
+  micSelect.value = stillValid ? previous : "";
+}
+
+/**
+ * Request transient mic access so enumerateDevices() can return real device labels.
+ */
+async function ensureMicPermissionForLabels(): Promise<void> {
+  if (!navigator.mediaDevices?.getUserMedia) return;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    s.getTracks().forEach((t) => t.stop());
+  } catch {
+    // User denied or no device — list may still work with generic names
+  }
+}
+
+async function initMicDeviceList(): Promise<void> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((d) => d.kind === "audioinput");
+    const needLabels = inputs.length > 0 && inputs.every((d) => !d.label);
+    if (needLabels) {
+      await ensureMicPermissionForLabels();
+    }
+    await refreshMicDeviceList();
+  } catch (e) {
+    console.warn("Mic device list failed:", e);
+  }
+}
+
+btnRefreshMics.addEventListener("click", async () => {
+  await ensureMicPermissionForLabels();
+  await refreshMicDeviceList();
+});
+
+if (navigator.mediaDevices?.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    void refreshMicDeviceList();
+  });
+}
+
+void initMicDeviceList();
+
+async function stopMicIfActive() {
+  try {
+    micRecorder?.stop();
+  } catch {
+    // ignore
+  }
+  micRecorder = null;
+
+  try {
+    micStream?.getTracks().forEach((t) => t.stop());
+  } catch {
+    // ignore
+  }
+  micStream = null;
 }
 
 function normalizeRange(a: number, b: number) {
@@ -864,18 +1387,18 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
         lastSearchQuery = searchQuery;
       }
     let found = false;
-    for(let i = lastFoundIndex + 1; i < words.length; i++)
+    for(let i = lastFoundIndex + 1; i < activeEditor.words.length; i++)
     {
-      if(words[i].word.toLowerCase().includes(searchQuery))
+      if(activeEditor.words[i].word.toLowerCase().includes(searchQuery))
       {
         lastFoundIndex=  i;
         found = true;
         lastSearchQuery = searchQuery;
-      const wordFound = words[i];
-      setSelectionRange(i, i);
-      ws.setTime(Number(wordFound.start) + SEEK_EPS);
+      const wordFound = activeEditor.words[i];
+      setSelectionRange(activeEditor, i, i);
+      if (activeEditor.kind === "imported") ws.setTime(Number(wordFound.start) + SEEK_EPS);
 
-      const wordElement = transcriptEl.querySelector(
+      const wordElement = activeEditor.paneEl.querySelector(
       `.word[data-index="${i}"]`
       ) as HTMLElement | null;
 
@@ -889,15 +1412,15 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
     {
       for(let i = 0; i < lastFoundIndex; i++)
       {
-        if(words[i].word.toLowerCase().includes(searchQuery))
+        if(activeEditor.words[i].word.toLowerCase().includes(searchQuery))
         {
           lastFoundIndex = i;
             lastSearchQuery = searchQuery;
-      const wordFound = words[i];
-      setSelectionRange(i, i);
-      ws.setTime(Number(wordFound.start) + SEEK_EPS);
+      const wordFound = activeEditor.words[i];
+      setSelectionRange(activeEditor, i, i);
+      if (activeEditor.kind === "imported") ws.setTime(Number(wordFound.start) + SEEK_EPS);
 
-      const wordElement = transcriptEl.querySelector(
+      const wordElement = activeEditor.paneEl.querySelector(
       `.word[data-index="${i}"]`
       ) as HTMLElement | null;
 
@@ -910,25 +1433,25 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
   });
 
 function clearSearchHighlights() {
-  const transcriptWords = transcriptEl.querySelectorAll(".word");
+  const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
 
   for (let i = 0; i < transcriptWords.length; i++) {
     const wordElement = transcriptWords[i] as HTMLElement;
     const index = Number(wordElement.dataset.index);
-    const wordText = words[index].word;    
+    const wordText = activeEditor.words[index].word;    
     wordElement.innerHTML = wordText + " ";
   }
 }
 
   findInput.addEventListener("input", () =>{
     const searchQuery = findInput.value.trim().toLowerCase();
-    const transcriptWords = transcriptEl.querySelectorAll(".word");
+    const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
    
     for(let i = 0; i < transcriptWords.length; i++)
     {
       const wordElement = transcriptWords[i] as HTMLElement;
       const index = Number(wordElement.dataset.index);
-      const wordText = words[index].word;
+      const wordText = activeEditor.words[index].word;
       wordElement.innerHTML = wordText + " ";
       const matchPosition = wordText.toLowerCase().indexOf(searchQuery)
       if(matchPosition === -1)
@@ -977,21 +1500,21 @@ function getSelectedRanges(indices: number[]): Array<{ start: number; end: numbe
   return ranges;
 }
 
-function setSelectedIndices(indices: number[], anchor: number | null = selectionAnchor) {
-  const next = uniqueSortedIndices(indices).filter((idx) => idx >= 0 && idx < words.length);
-  selectedIndices = next;
-  selectionAnchor = anchor;
+function setSelectedIndices(editor: EditorState, indices: number[], anchor: number | null = editor.selectionAnchor) {
+  const next = uniqueSortedIndices(indices).filter((idx) => idx >= 0 && idx < editor.words.length);
+  editor.selectedIndices = next;
+  editor.selectionAnchor = anchor;
 
   if (next.length > 0 && isContiguousSelection(next)) {
-    selectionStart = next[0];
-    selectionEnd = next[next.length - 1];
+    editor.selectionStart = next[0];
+    editor.selectionEnd = next[next.length - 1];
   } else {
-    selectionStart = null;
-    selectionEnd = null;
+    editor.selectionStart = null;
+    editor.selectionEnd = null;
   }
 
   const selectedSet = new Set(next);
-  const nodes = transcriptEl.querySelectorAll<HTMLElement>(".word");
+  const nodes = editor.paneEl.querySelectorAll<HTMLElement>(".word");
   nodes.forEach((el) => {
     const idx = Number(el.dataset.index);
     el.classList.toggle("selected", selectedSet.has(idx));
@@ -1001,65 +1524,76 @@ function setSelectedIndices(indices: number[], anchor: number | null = selection
 }
 
 function clearDropIndicators() {
-  const nodes = transcriptEl.querySelectorAll<HTMLElement>(".word.drop-before, .word.drop-after");
+  const nodes = document.querySelectorAll<HTMLElement>(".word.drop-before, .word.drop-after");
   nodes.forEach((n) => {
     n.classList.remove("drop-before");
     n.classList.remove("drop-after");
   });
 }
 
-function moveCurrentSelection(toIndex: number) {
-  if (!pieceTable || selectedIndices.length === 0) return;
+function moveCurrentSelection(editor: EditorState, toIndex: number) {
+  if (!editor.pieceTable || editor.selectedIndices.length === 0) return;
 
-  const sorted = uniqueSortedIndices(selectedIndices);
+  const sorted = uniqueSortedIndices(editor.selectedIndices);
   const selectedCount = sorted.length;
   const selectedBefore = sorted.filter((idx) => idx < toIndex).length;
   const insertAt = toIndex - selectedBefore;
 
-  pushUndo();
+  pushUndo(editor);
 
   let changed = false;
-  if (sorted.length === 1 && toIndex < words.length) {
-    changed = moveWord(pieceTable, sorted[0], toIndex);
+  if (sorted.length === 1 && toIndex < editor.words.length) {
+    changed = moveWord(editor.pieceTable, sorted[0], toIndex);
   } else if (isContiguousSelection(sorted)) {
-    changed = moveRange(pieceTable, sorted[0], sorted[sorted.length - 1], toIndex);
+    changed = moveRange(editor.pieceTable, sorted[0], sorted[sorted.length - 1], toIndex);
   } else {
-    changed = moveSelectedIndices(pieceTable, sorted, toIndex);
+    changed = moveSelectedIndices(editor.pieceTable, sorted, toIndex);
   }
 
   if (!changed) {
-    undoStack.pop();
+    editor.undoStack.pop();
     return;
   }
 
-  syncWordsFromPieceTable();
+  syncWordsFromPieceTable(editor);
 
   const movedSelection: number[] = [];
   for (let i = 0; i < selectedCount; i++) {
     movedSelection.push(insertAt + i);
   }
 
-  setSelectedIndices(movedSelection, movedSelection.length > 0 ? movedSelection[0] : null);
+  setSelectedIndices(editor, movedSelection, movedSelection.length > 0 ? movedSelection[0] : null);
 
-  if (movedSelection.length === 1) {
+  if (editor.kind === "imported" && movedSelection.length === 1) {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[0];
-  } else if (isContiguousSelection(movedSelection)) {
+    detailEditor = editor;
+  } else if (editor.kind === "imported" && isContiguousSelection(movedSelection)) {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[movedSelection.length - 1];
-  } else {
+    detailEditor = editor;
+  } else if (editor.kind === "imported") {
     detailSelStart = movedSelection[0];
     detailSelEnd = movedSelection[0];
+    detailEditor = editor;
   }
 
-  renderTranscript(words);
+  renderTranscript(editor);
   void refreshMainWavePreviewFromEdits();
-  refreshDetailIfActive();
+  if (editor.kind === "imported") refreshDetailIfActive();
 }
 
 function resetEditedPreviewState() {
   isEditedPreviewMode = false;
   previewWordTimes = [];
+}
+
+function clearMainWave() {
+  if (ws.isPlaying()) ws.pause();
+  if (typeof ws.empty === "function") ws.empty();
+  btnPlay.disabled = true;
+  fnameEl.textContent = "No file loaded";
+  setPlayIcon(false);
 }
 
 function buildPreviewWordTimesFromActiveEntries(activeEntries: ViewEntry[]): Array<{ start: number; end: number }> {
@@ -1073,44 +1607,76 @@ function buildPreviewWordTimesFromActiveEntries(activeEntries: ViewEntry[]): Arr
   return out;
 }
 
+/**
+ * Load the main WaveSurfer instance from a file path.
+ *
+ * This is used for:
+ * - Loading the original source audio (when a project/main transcript is present)
+ * - Loading a rendered "edited preview" WAV produced from the current main transcript edits
+ *
+ * Side effects:
+ * - Pauses any current playback before loading.
+ * - Enables/disables the main play control based on load completion.
+ */
 async function loadMainWaveFromPath(filePath: string) {
+  btnPlay.disabled = true;
+  if (ws.isPlaying()) ws.pause();
   const ab = await otter.readFileAsArrayBuffer(filePath);
   const blob = new Blob([ab]);
   await ws.loadBlob(blob);
+  btnPlay.disabled = false;
+  setPlayIcon(false);
 }
 
+/**
+ * Refresh the main waveform to reflect the edited transcript (main/imported editor).
+ *
+ * The main transcript (`importedEditor`) is the source of truth for "what plays" in the
+ * primary waveform. We derive a lightweight EDL-like payload from the piece table's
+ * **active** entries, ask the backend to render a temporary WAV preview, then load it
+ * into WaveSurfer.
+ *
+ * Concurrency:
+ * - Uses `previewRefreshToken` to make refreshes "last-write-wins" so rapid edits don't
+ *   flicker or race.
+ *
+ * Derived state:
+ * - Updates `previewWordTimes` so transcript highlighting can map playback time back to
+ *   word indices while in edited preview mode.
+ */
 async function refreshMainWavePreviewFromEdits() {
-  if (!audioPath) return;
+  const baseAudio = importedEditor.audioPath;
+  if (!baseAudio || !importedEditor.pieceTable) {
+    resetEditedPreviewState();
+    clearMainWave();
+    return;
+  }
 
   const token = ++previewRefreshToken;
   isRefreshingPreview = true;
 
   try {
-    if (!pieceTable) {
-      resetEditedPreviewState();
-      await loadMainWaveFromPath(audioPath);
-      return;
-    }
+    const activeImported = importedEditor.pieceTable ? getActiveEntries(importedEditor.pieceTable) : [];
 
-    const activeEntries = getActiveEntries(pieceTable);
-    if (activeEntries.length === 0) {
+    if (activeImported.length === 0) {
       resetEditedPreviewState();
-      await loadMainWaveFromPath(audioPath);
+      clearMainWave();
       return;
     }
 
     const payload = {
       version: 1,
-      sourceFile: pieceTable.sourceFile,
-      entries: activeEntries.map((ve) => ({
+      sourceFile: baseAudio,
+      entries: activeImported.map((ve) => ({
         id: ve.entry.id,
+        sourceFile: ve.entry.sourceFile || baseAudio,
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,
         muted: false,
       })),
-      createdAt: pieceTable.createdAt,
-      modifiedAt: pieceTable.modifiedAt,
+      createdAt: importedEditor.pieceTable?.createdAt || new Date().toISOString(),
+      modifiedAt: importedEditor.pieceTable?.modifiedAt || new Date().toISOString(),
     };
 
     const json = JSON.stringify(payload);
@@ -1120,14 +1686,14 @@ async function refreshMainWavePreviewFromEdits() {
     await loadMainWaveFromPath(previewPath);
     if (token !== previewRefreshToken) return;
 
-    previewWordTimes = buildPreviewWordTimesFromActiveEntries(activeEntries);
+    previewWordTimes = buildPreviewWordTimesFromActiveEntries(activeImported);
     isEditedPreviewMode = true;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     appendLog(`\nWARN: Failed to refresh edited preview: ${msg}\n`);
-    if (token === previewRefreshToken && audioPath) {
+    if (token === previewRefreshToken) {
       resetEditedPreviewState();
-      await loadMainWaveFromPath(audioPath);
+      clearMainWave();
     }
   } finally {
     if (token === previewRefreshToken) {
@@ -1161,14 +1727,14 @@ function setPlayheadIndex(idx: number) {
  * @param {number|null} start - Start index, or null to clear selection.
  * @param {number|null} end   - End index, or null to clear selection.
  */
-function setSelectionRange(start: number | null, end: number | null) {
+function setSelectionRange(editor: EditorState, start: number | null, end: number | null) {
   if (start == null || end == null) {
-    setSelectedIndices([], null);
+    setSelectedIndices(editor, [], null);
   } else {
     const range = normalizeRange(start, end);
     const indices: number[] = [];
     for (let i = range.start; i <= range.end; i++) indices.push(i);
-    setSelectedIndices(indices, selectionAnchor);
+    setSelectedIndices(editor, indices, editor.selectionAnchor);
   }
 }
 
@@ -1193,12 +1759,12 @@ function computeDetailWindow(start: number, end: number) {
  * The detail view exists to demonstrate that ASR word boundaries are approximate
  * and that precise editing may require user refinement.
  */
-async function loadDetailForRange(start: number, end: number) {
-  if (!audioPath) throw new Error("No audio loaded");
+async function loadDetailForRange(sourceFile: string, start: number, end: number) {
+  if (!sourceFile) throw new Error("No audio loaded");
   const { winStart, winDur } = computeDetailWindow(start, end);
 
   // Create a short WAV snippet around the selected word (main process uses ffmpeg)
-  const snippetPath = await otter.makeSnippet(audioPath, winStart, winDur);
+  const snippetPath = await otter.makeSnippet(sourceFile, winStart, winDur);
 
   // If the detail waveform is currently playing, stop it before swapping media
   if (wsDetail.isPlaying()) wsDetail.pause();
@@ -1254,18 +1820,20 @@ async function loadDetailForRange(start: number, end: number) {
  * @param {Array<Object>} words - Transcript words with timing metadata
  *                                (each entry includes at least { word, start, end })
  */
-function renderTranscript(words: TranscriptWord[]) {
-  transcriptEl.innerHTML = "";
-  const viewEntries = pieceTable ? getViewEntries(pieceTable) : [];
+function renderTranscript(editor: EditorState) {
+  const pane = editor.paneEl;
+  pane.innerHTML = "";
+  pane.classList.toggle("moveMode", editor.interactionMode === "move");
+  const viewEntries = editor.pieceTable ? getViewEntries(editor.pieceTable) : [];
 
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
+  for (let i = 0; i < editor.words.length; i++) {
+    const w = editor.words[i];
 
     const span = document.createElement("span");
     span.className = "word";
     span.textContent = w.word + " ";
     span.dataset.index = String(i);
-    span.draggable = true;
+    span.draggable = editor.interactionMode === "move";
 
     const ve = viewEntries[i];
     if (ve) {
@@ -1275,39 +1843,48 @@ function renderTranscript(words: TranscriptWord[]) {
     }
 
     span.addEventListener("mousedown", (event: MouseEvent) => {
+      if (editor.interactionMode !== "select") return;
       if (event.button !== 0) return;
       if (event.ctrlKey || event.metaKey) return;
 
-      const alreadySelected = selectedIndices.includes(i);
-      if (alreadySelected && selectedIndices.length > 0) {
+      setActiveEditor(editor);
+      const alreadySelected = editor.selectedIndices.includes(i);
+      if (alreadySelected && editor.selectedIndices.length > 0) {
         mouseSelectionMoved = false;
         return;
       }
 
-      selectionAnchor = i;
-      setSelectionRange(i, i);
+      editor.selectionAnchor = i;
+      setSelectionRange(editor, i, i);
       isMouseSelecting = true;
       mouseSelectionMoved = false;
       event.preventDefault();
     });
 
     span.addEventListener("mouseenter", () => {
-      if (!isMouseSelecting || selectionAnchor == null) return;
-      if (selectionEnd !== i || selectionStart !== selectionAnchor) {
+      if (editor.interactionMode !== "select") return;
+      if (!isMouseSelecting || editor.selectionAnchor == null) return;
+      if (editor.selectionEnd !== i || editor.selectionStart !== editor.selectionAnchor) {
         mouseSelectionMoved = true;
       }
-      setSelectionRange(selectionAnchor, i);
+      setSelectionRange(editor, editor.selectionAnchor, i);
     });
 
     span.addEventListener("dragstart", (event: DragEvent) => {
-      if (selectedIndices.includes(i) && selectedIndices.length > 0) {
-        dragMoveSourceIndices = selectedIndices.slice();
+      if (editor.interactionMode !== "move") {
+        event.preventDefault();
+        return;
+      }
+      setActiveEditor(editor);
+      if (editor.selectedIndices.includes(i) && editor.selectedIndices.length > 0) {
+        dragMoveSourceIndices = editor.selectedIndices.slice();
       } else {
-        setSelectedIndices([i], i);
+        setSelectedIndices(editor, [i], i);
         dragMoveSourceIndices = [i];
       }
+      dragMoveEditorKind = editor.kind;
 
-      transcriptEl.classList.add("dragging-words");
+      pane.classList.add("dragging-words");
       if (event.dataTransfer) {
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", "move");
@@ -1315,7 +1892,9 @@ function renderTranscript(words: TranscriptWord[]) {
     });
 
     span.addEventListener("dragover", (event: DragEvent) => {
+      if (editor.interactionMode !== "move") return;
       if (dragMoveSourceIndices.length === 0) return;
+      if (dragMoveEditorKind !== editor.kind) return;
       event.preventDefault();
 
       const rect = span.getBoundingClientRect();
@@ -1326,7 +1905,9 @@ function renderTranscript(words: TranscriptWord[]) {
     });
 
     span.addEventListener("drop", (event: DragEvent) => {
+      if (editor.interactionMode !== "move") return;
       if (dragMoveSourceIndices.length === 0) return;
+      if (dragMoveEditorKind !== editor.kind) return;
       event.preventDefault();
       event.stopPropagation();
 
@@ -1335,15 +1916,17 @@ function renderTranscript(words: TranscriptWord[]) {
       const targetIndex = before ? i : i + 1;
 
       clearDropIndicators();
-      moveCurrentSelection(targetIndex);
+      moveCurrentSelection(editor, targetIndex);
       dragMoveSourceIndices = [];
-      transcriptEl.classList.remove("dragging-words");
+      dragMoveEditorKind = null;
+      pane.classList.remove("dragging-words");
     });
 
     span.addEventListener("dragend", () => {
       clearDropIndicators();
       dragMoveSourceIndices = [];
-      transcriptEl.classList.remove("dragging-words");
+      dragMoveEditorKind = null;
+      pane.classList.remove("dragging-words");
     });
 
     span.addEventListener("click", async (event: MouseEvent) => {
@@ -1351,44 +1934,64 @@ function renderTranscript(words: TranscriptWord[]) {
         mouseSelectionMoved = false;
         return;
       }
+      setActiveEditor(editor);
 
       // Transcript click = select word + seek main audio
-      if (event.ctrlKey || event.metaKey) {
-        if (selectedIndices.includes(i)) {
-          setSelectedIndices(selectedIndices.filter((idx) => idx !== i), selectionAnchor);
+      if (editor.interactionMode === "select" && (event.ctrlKey || event.metaKey)) {
+        if (editor.selectedIndices.includes(i)) {
+          setSelectedIndices(editor, editor.selectedIndices.filter((idx) => idx !== i), editor.selectionAnchor);
         } else {
-          setSelectedIndices(selectedIndices.concat(i), i);
+          setSelectedIndices(editor, editor.selectedIndices.concat(i), i);
         }
-      } else if (event.shiftKey && selectionAnchor != null) {
-        setSelectionRange(selectionAnchor, i);
+      } else if (editor.interactionMode === "select" && event.shiftKey && editor.selectionAnchor != null) {
+        setSelectionRange(editor, editor.selectionAnchor, i);
       } else {
-        selectionAnchor = i;
-        setSelectionRange(i, i);
+        editor.selectionAnchor = i;
+        setSelectionRange(editor, i, i);
       }
 
-      if (!selectedIndices.includes(i)) return;
+      if (!editor.selectedIndices.includes(i)) return;
 
-      const seekTime = isEditedPreviewMode && previewWordTimes[i]
-        ? previewWordTimes[i].start
-        : Number(w.start);
-      ws.setTime(seekTime + SEEK_EPS);
-      setPlayheadIndex(i);
+      const selectedViewEntries = editor.pieceTable ? getViewEntries(editor.pieceTable) : [];
+      const clickedEntry = selectedViewEntries[i]?.entry;
+      const clickedSourceFile = clickedEntry?.sourceFile || editor.audioPath;
+      if (!clickedSourceFile) return;
+
+      if (editor.kind === "imported") {
+        const seekTime = isEditedPreviewMode && previewWordTimes[i]
+          ? previewWordTimes[i].start
+          : Number(w.start);
+        ws.setTime(seekTime + SEEK_EPS);
+        setPlayheadIndex(i);
+      } else if (editor.kind === "pending-import") {
+        wsImported.setTime(Number(w.start) + SEEK_EPS);
+      } else {
+        wsRecorded.setTime(Number(w.start) + SEEK_EPS);
+      }
 
       // Load the detail waveform snippet centered on the selected range
       let rangeStartIdx = i;
       let rangeEndIdx = i;
-      if (selectedIndices.length > 1 && isContiguousSelection(selectedIndices)) {
-        rangeStartIdx = selectedIndices[0];
-        rangeEndIdx = selectedIndices[selectedIndices.length - 1];
+      if (editor.selectedIndices.length > 1 && isContiguousSelection(editor.selectedIndices)) {
+        rangeStartIdx = editor.selectedIndices[0];
+        rangeEndIdx = editor.selectedIndices[editor.selectedIndices.length - 1];
       }
-      const rangeStart = Number(words[rangeStartIdx].start);
-      const rangeEnd = Number(words[rangeEndIdx].end);
+      const rangeEntries = selectedViewEntries.slice(rangeStartIdx, rangeEndIdx + 1);
+      const rangeSourceFile = rangeEntries[0]?.entry.sourceFile || clickedSourceFile;
+      const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || editor.audioPath) !== rangeSourceFile);
+      if (mixedSources) {
+        appendLog("INFO:Detail playback is only available for selections from a single source audio.\n");
+        return;
+      }
+      const rangeStart = Number(editor.words[rangeStartIdx].start);
+      const rangeEnd = Number(editor.words[rangeEndIdx].end);
 
+      detailEditor = editor;
       detailSelStart = rangeStartIdx;
       detailSelEnd = rangeEndIdx;
 
       try {
-        await loadDetailForRange(rangeStart, rangeEnd);
+        await loadDetailForRange(rangeSourceFile, rangeStart, rangeEnd);
       } catch (err: unknown) {
         console.error("Failed to load detail snippet:", err);
       }
@@ -1400,10 +2003,12 @@ function renderTranscript(words: TranscriptWord[]) {
     //   • Record selectionAnchor as the origin point (never changes during drag)
     //   • Highlight the starting word immediately
     span.addEventListener("mousedown", (event: MouseEvent) => {
+      if (editor.interactionMode !== "select") return;
       event.preventDefault();
+      setActiveEditor(editor);
       isDragging = true;
-      selectionAnchor = i;
-      setSelectionRange(i, i);
+      editor.selectionAnchor = i;
+      setSelectionRange(editor, i, i);
     });
 
     // Drag Selection: mouseover while dragging
@@ -1414,31 +2019,32 @@ function renderTranscript(words: TranscriptWord[]) {
     //   • Both forward and backward drag work because setSelectionRange()
     //     normalizes the range order internally
     span.addEventListener("mouseover", (event: MouseEvent) => {
+      if (editor.interactionMode !== "select") return;
       if (!isDragging) return;
       const hoveredIndex = Number((event.target as HTMLElement).dataset.index);
-      if (selectionAnchor != null && !isNaN(hoveredIndex)) {
-        setSelectionRange(selectionAnchor, hoveredIndex);
+      if (editor.selectionAnchor != null && !isNaN(hoveredIndex)) {
+        setSelectionRange(editor, editor.selectionAnchor, hoveredIndex);
       }
     });
 
-    transcriptEl.appendChild(span);
+    pane.appendChild(span);
 
-    const breakCount = words[i].breakAfter ?? 0;
+    const breakCount = editor.words[i].breakAfter ?? 0;
     for (let j = 0; j < breakCount; j++) 
     {
-      transcriptEl.appendChild(document.createElement("br"));
+      pane.appendChild(document.createElement("br"));
     }
 
     
   }
 
   // Re-apply selection and playhead after re-render (e.g., new transcript)
-  const keptSelection = selectedIndices.filter((idx) => idx >= 0 && idx < words.length);
-  setSelectedIndices(keptSelection, selectionAnchor);
+  const keptSelection = editor.selectedIndices.filter((idx) => idx >= 0 && idx < editor.words.length);
+  setSelectedIndices(editor, keptSelection, editor.selectionAnchor);
 
-  if (playheadIndex >= 0 && playheadIndex < words.length) {
+  if (editor.kind === "imported" && playheadIndex >= 0 && playheadIndex < editor.words.length) {
     setPlayheadIndex(playheadIndex);
-  } else {
+  } else if (editor.kind === "imported") {
     setPlayheadIndex(-1);
   }
 
@@ -1455,7 +2061,7 @@ function renderTranscript(words: TranscriptWord[]) {
  * preventing a "stuck" drag state.
  */
 function initializeDragEnd() {
-  window.addEventListener("mouseup", (_event: MouseEvent) => {
+  window.addEventListener("mouseup", () => {
     if (isDragging) {
       isDragging = false;
       // Selection remains as-is; do not modify it further
@@ -1474,6 +2080,21 @@ const timeEl = mustGetEl<HTMLSpanElement>("time");
 const progressEl = mustGetEl<HTMLProgressElement>("transcribeProgress");
 const fnameEl = mustGetEl<HTMLSpanElement>("loadedFile");
 
+// Pending imported waveform UI
+const importedWavePane = mustGetEl<HTMLDivElement>("importedWavePane");
+const importedWaveDivider = mustGetEl<HTMLHRElement>("importedWaveDivider");
+const btnImportedPlay = mustGetEl<HTMLButtonElement>("btnImportedPlay");
+const importedTimeEl = mustGetEl<HTMLSpanElement>("importedTime");
+const importedLoadedFileEl = mustGetEl<HTMLSpanElement>("importedLoadedFile");
+
+// Recorded waveform UI
+const recordedWavePane = mustGetEl<HTMLDivElement>("recordedWavePane");
+const recordedWaveDivider = mustGetEl<HTMLHRElement>("recordedWaveDivider");
+const btnRecordedPlay = mustGetEl<HTMLButtonElement>("btnRecordedPlay");
+const recordedTimeEl = mustGetEl<HTMLSpanElement>("recordedTime");
+const btnTranscribeRecorded = mustGetEl<HTMLButtonElement>("btnTranscribeRecorded");
+const btnStopRecorded = mustGetEl<HTMLButtonElement>("btnStopRecorded");
+
 // Switch between play and pause icons
 function setPlayIcon(isPlaying: boolean) {
   btnPlay.textContent = isPlaying ? "⏸︎" : "▶︎";
@@ -1484,12 +2105,70 @@ function setPlayIcon(isPlaying: boolean) {
 // Create a Regions plugin instance for the main waveform (deleted-region overlays)
 const mainRegions = WaveSurfer.Regions.create();
 
-// Create the waveform visualization object
+/**
+ * WaveSurfer instances in this UI:
+ * - `ws`: primary waveform for the **main transcript** (importedEditor). This is the waveform
+ *   users primarily scrub/play against, and it is also where the edited-preview waveform loads.
+ * - `wsImported`: waveform for the **staged imported audio** (pendingImportEditor). This is a
+ *   "preview/staging" lane until its transcript is appended into main.
+ * - `wsRecorded`: waveform for the **recorded audio clip** (recordedEditor). Users can playback
+ *   the recording and optionally transcribe it into a transcript pane.
+ * - `wsDetail`: short waveform snippet used for **fine-grained selection/boundary adjustment**
+ *   around the current selection (detailEditor + detailSelStart/detailSelEnd).
+ */
 const ws = WaveSurfer.create({
   container: "#waveform",
   height: 80,
   normalize: true,
   plugins: [mainRegions]
+});
+
+const wsImported = WaveSurfer.create({
+  container: "#waveformImported",
+  height: 80,
+  normalize: true,
+});
+
+// Recorded waveform (separate from project waveform)
+const wsRecorded = WaveSurfer.create({
+  container: "#waveformRecorded",
+  height: 80,
+  normalize: true,
+});
+
+function setImportedPlayIcon(isPlaying: boolean) {
+  btnImportedPlay.textContent = "Play";
+  btnImportedPlay.title = isPlaying ? "Pause Imported Audio" : "Play Imported Audio";
+  btnImportedPlay.setAttribute("aria-label", isPlaying ? "Pause Imported Audio" : "Play Imported Audio");
+}
+
+wsImported.on("play", () => setImportedPlayIcon(true));
+wsImported.on("pause", () => setImportedPlayIcon(false));
+wsImported.on("finish", () => setImportedPlayIcon(false));
+wsImported.on("timeupdate", (t: number) => {
+  importedTimeEl.textContent = `${t.toFixed(2)}s`;
+});
+
+btnImportedPlay.addEventListener("click", () => {
+  wsImported.playPause();
+});
+
+function setRecordedPlayIcon(isPlaying: boolean) {
+  btnRecordedPlay.textContent = isPlaying ? "⏸︎" : "▶︎";
+  btnRecordedPlay.title = isPlaying ? "Pause Recording" : "Play Recording";
+  btnRecordedPlay.setAttribute("aria-label", isPlaying ? "Pause Recording" : "Play Recording");
+}
+
+wsRecorded.on("play", () => setRecordedPlayIcon(true));
+wsRecorded.on("pause", () => setRecordedPlayIcon(false));
+wsRecorded.on("finish", () => setRecordedPlayIcon(false));
+
+wsRecorded.on("timeupdate", (t: number) => {
+  recordedTimeEl.textContent = `${t.toFixed(2)}s`;
+});
+
+btnRecordedPlay.addEventListener("click", () => {
+  wsRecorded.playPause();
 });
 
 // Keep the play/pause button icon in sync with the current status of playback
@@ -1529,13 +2208,13 @@ ws.on("timeupdate", (t: number) => {
   // We use a simple linear scan for this PoC, but
   // a real implementation should be smarter (e.g. binary search)
   let idx = -1;
-  for (let i = 0; i < words.length; i++) {
+  for (let i = 0; i < importedEditor.words.length; i++) {
     const start = isEditedPreviewMode && previewWordTimes[i]
       ? previewWordTimes[i].start
-      : words[i].start;
+      : importedEditor.words[i].start;
     const end = isEditedPreviewMode && previewWordTimes[i]
       ? previewWordTimes[i].end
-      : words[i].end;
+      : importedEditor.words[i].end;
     if (te >= start && te < end) { idx = i; break; }
   }
   setPlayheadIndex(idx);
@@ -1617,7 +2296,7 @@ function setDetailWordRegion(localStart: number, localEnd: number) {
   let regionUndoPushed = false;
   detailRegion.on("update", () => {
     if (!regionUndoPushed) {
-      pushUndo();
+      pushUndo(importedEditor);
       regionUndoPushed = true;
     }
   });
@@ -1734,6 +2413,18 @@ function setDetailPlayIcon(isPlaying: boolean) {
   btnDetailPlay.setAttribute("aria-label", isPlaying ? "Pause Detail" : "Play Detail");
 }
 
+// Initial record UI state
+setRecordingState(false);
+importedWavePane.hidden = true;
+importedWaveDivider.hidden = true;
+btnImportedPlay.disabled = true;
+setImportedPlayIcon(false);
+recordedWavePane.hidden = true;
+recordedWaveDivider.hidden = true;
+btnRecordedPlay.disabled = true;
+btnTranscribeRecorded.disabled = true;
+btnStopRecorded.hidden = true;
+
 
 //==============================================================================
 //
@@ -1741,9 +2432,105 @@ function setDetailPlayIcon(isPlaying: boolean) {
 //
 //==============================================================================
 
-// Handle the "Transcribe" button
-btnTranscribe.addEventListener("click", async () => {
-  if (!audioPath) return;
+type TranscriptionJobKind = "pending-import" | "recorded";
+type TranscriptionJob = {
+  id: string;
+  kind: TranscriptionJobKind;
+  audioPath: string;
+  specArg: TranscribeSpec;
+  enqueuedAt: number;
+};
+
+let transcriptionQueue: TranscriptionJob[] = [];
+let isTranscriptionRunning = false;
+
+/**
+ * Human-friendly description for logs/status.
+ * Intentionally avoids dumping full paths into the UI.
+ */
+function describeJob(job: TranscriptionJob): string {
+  const label = job.kind === "pending-import" ? "Imported audio" : "Recorded audio";
+  const fname = job.audioPath.split("/").pop() ?? job.audioPath;
+  return `${label} (${fname})`;
+}
+
+/**
+ * Drain the transcription queue sequentially (FIFO).
+ *
+ * Guarantees:
+ * - Only one transcription runs at a time (`isTranscriptionRunning` guard).
+ * - Jobs run in the exact order they were enqueued (button press order).
+ * - If a job is cancelled, we simply return from that job and continue to the next.
+ *
+ * Note:
+ * - Each queued job carries its own `specArg` snapshot so model/pipeline choice is
+ *   deterministic even if the user changes the UI spec before the job starts.
+ */
+async function runTranscriptionQueue(): Promise<void> {
+  if (isTranscriptionRunning) return;
+  isTranscriptionRunning = true;
+  try {
+    while (transcriptionQueue.length > 0) {
+      const job = transcriptionQueue.shift()!;
+      const remaining = transcriptionQueue.length;
+      setStatus(
+        remaining > 0
+          ? `Starting transcription: ${describeJob(job)} (${remaining} queued after this)…`
+          : `Starting transcription: ${describeJob(job)}…`,
+        "working"
+      );
+      appendLog(`\n=== Transcription job started: ${describeJob(job)} ===\n`);
+
+      if (job.kind === "pending-import") {
+        await transcribePendingImportAudio(job.audioPath, job.specArg);
+      } else {
+        await transcribeRecordedAudio(job.audioPath, job.specArg);
+      }
+    }
+  } finally {
+    isTranscriptionRunning = false;
+  }
+}
+
+/**
+ * Enqueue a transcription request and kick the runner.
+ *
+ * UX behavior:
+ * - If another job is running (or already queued), we immediately notify the user
+ *   that this job is waiting.
+ */
+function enqueueTranscription(kind: TranscriptionJobKind, audioPath: string, specArg: TranscribeSpec): void {
+  const job: TranscriptionJob = {
+    id: crypto.randomUUID(),
+    kind,
+    audioPath,
+    specArg,
+    enqueuedAt: Date.now(),
+  };
+
+  const wasRunning = isTranscriptionRunning || transcriptionQueue.length > 0;
+  transcriptionQueue.push(job);
+
+  if (wasRunning) {
+    const pos = transcriptionQueue.length;
+    setStatus(`Transcription queued (#${pos}). Waiting for current transcription to finish…`, "info");
+    appendLog(`INFO: queued transcription job #${pos}: ${describeJob(job)}\n`);
+  }
+
+  void runTranscriptionQueue();
+}
+
+/**
+ * Transcribe an imported (staged) audio file into the pending-import editor pane.
+ *
+ * Responsibilities:
+ * - Drive UI state for the imported transcription flow (progress, buttons).
+ * - Commit results atomically into `pendingImportEditor` (words + piece table).
+ *
+ * Input:
+ * - `specArg` is a snapshot taken at the time the user clicked Transcribe.
+ */
+async function transcribePendingImportAudio(toTranscribe: string, specArg: TranscribeSpec): Promise<void> {
   resetEditedPreviewState();
   btnTranscribe.disabled = true;
   setStatus("Starting transcription...", "working");
@@ -1755,26 +2542,31 @@ btnTranscribe.addEventListener("click", async () => {
     progressEl.hidden = false;
     setTranscribingState(true);
 
-    const result = await otter.transcribeAudio(audioPath, getActiveSpecArg());
+    const result = await otter.transcribeAudio(toTranscribe, specArg);
     if (result && typeof result === "object" && "cancelled" in result && result.cancelled) {
       setStatus("Transcription cancelled.", "info");
       return;
     }
     const transcript: TranscriptResult = result as TranscriptResult;
-    words = Array.isArray(transcript) ? transcript : (transcript.words || []);
+    const newWords = Array.isArray(transcript) ? transcript : (transcript.words || []);
     const lang = Array.isArray(transcript) ? undefined : transcript.language;
     const langSuffix = lang ? `, lang=${lang}` : "";
-    setStatus(`Transcript ready (${words.length} words${langSuffix})`, "success");
+    setStatus(`Transcript ready (${newWords.length} words${langSuffix})`, "success");
 
-    pieceTable = buildPieceTableFromTranscript(words, audioPath!);
-    undoStack = [];
-    redoStack = [];
+    pendingImportEditor.audioPath = toTranscribe;
+    pendingImportEditor.words = newWords;
+    pendingImportEditor.pieceTable = buildPieceTableFromTranscript(newWords, toTranscribe);
+    pendingImportEditor.undoStack = [];
+    pendingImportEditor.redoStack = [];
+    pendingImportEditor.selectedIndices = [];
+    pendingImportEditor.selectionAnchor = null;
+    pendingImportEditor.selectionStart = null;
+    pendingImportEditor.selectionEnd = null;
     updateEditButtonStates();
 
-    renderTranscript(words);
-    if (!isRefreshingPreview) {
-      await refreshMainWavePreviewFromEdits();
-    }
+    renderTranscript(pendingImportEditor);
+    setActiveEditor(pendingImportEditor);
+    pendingImportAudioPath = null;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.toLowerCase().includes("cancelled")) {
@@ -1785,10 +2577,79 @@ btnTranscribe.addEventListener("click", async () => {
     }
   } finally {
     btnChoose.disabled = false;
-    btnTranscribe.disabled = false;
+    btnTranscribe.disabled = pendingImportAudioPath == null;
     setTranscribingState(false);
     progressEl.hidden = true;
   }
+}
+
+/**
+ * Transcribe a recorded WAV into the recorded editor pane.
+ *
+ * Guardrails:
+ * - If the user records a new clip while a prior recorded job is queued, we do not
+ *   overwrite the UI with a transcript for an older audio path. (We still allow the
+ *   job to complete for stability, but we skip applying results.)
+ *
+ * Input:
+ * - `specArg` is a snapshot taken at the time the user clicked Transcribe Rec.
+ */
+async function transcribeRecordedAudio(audioPath: string, specArg: TranscribeSpec): Promise<void> {
+  btnTranscribeRecorded.disabled = true;
+  setRecordedTranscribingState(true);
+  setStatus("Transcribing recording…", "working");
+  progressEl.value = 0;
+  progressEl.hidden = false;
+
+  try {
+    const result = await otter.transcribeAudio(audioPath, specArg);
+    if (result && typeof result === "object" && "cancelled" in result && (result as any).cancelled) {
+      setStatus("Recording transcription cancelled.", "info");
+      return;
+    }
+    const transcript: TranscriptResult = result as TranscriptResult;
+    const newWords = Array.isArray(transcript) ? transcript : (transcript.words || []);
+    if (newWords.length === 0) {
+      setStatus("No words transcribed from recording.", "info");
+      return;
+    }
+
+    // Only apply if this recording is still the current one in the UI.
+    // (User may have recorded a new clip while this job was queued.)
+    if (recordedEditor.audioPath !== audioPath) {
+      appendLog(`INFO: recorded transcription finished for a stale audioPath; ignoring UI apply.\n`);
+      return;
+    }
+
+    recordedEditor.words = newWords;
+    recordedEditor.pieceTable = buildPieceTableFromTranscript(newWords, audioPath);
+    recordedEditor.undoStack = [];
+    recordedEditor.redoStack = [];
+    recordedEditor.selectedIndices = [];
+    recordedEditor.selectionAnchor = null;
+    recordedEditor.selectionStart = null;
+    recordedEditor.selectionEnd = null;
+
+    renderTranscript(recordedEditor);
+    setActiveEditor(recordedEditor);
+    updateEditButtonStates();
+    setStatus(`Recording transcript ready (${newWords.length} words).`, "success");
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setStatus("Recording transcription failed (see logs).", "error");
+    appendLog("\nERROR recording transcription:\n" + msg + "\n");
+  } finally {
+    btnTranscribeRecorded.disabled = false;
+    setRecordedTranscribingState(false);
+    progressEl.hidden = true;
+  }
+}
+
+// Handle the "Transcribe" button
+btnTranscribe.addEventListener("click", async () => {
+  const toTranscribe = pendingImportAudioPath;
+  if (!toTranscribe) return;
+  enqueueTranscription("pending-import", toTranscribe, getActiveSpecArg());
 });
 
 // Handle the "Pause / Resume" button
@@ -1811,6 +2672,132 @@ btnStop.addEventListener("click", async () => {
   await otter.cancelTranscription();
 });
 
+// Handle the "Record" button
+btnRecord.addEventListener("click", async () => {
+  try {
+    micChunks = [];
+    micRecordingStartedAt = Date.now();
+    setStatus("Requesting microphone…", "working");
+
+    const deviceId = micSelect.value.trim();
+    const audioConstraints = deviceId ? { deviceId: { exact: deviceId } } : true;
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+
+    const mimeCandidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+    ];
+    const mimeType = mimeCandidates.find((t) => (window as any).MediaRecorder?.isTypeSupported?.(t)) || "";
+
+    micRecorder = new MediaRecorder(micStream, mimeType ? { mimeType } : undefined);
+    micRecorder.addEventListener("dataavailable", (ev: BlobEvent) => {
+      if (ev.data && ev.data.size > 0) micChunks.push(ev.data);
+    });
+
+    micRecorder.addEventListener("start", () => {
+      setRecordingState(true);
+      setStatus("Recording…", "working");
+    });
+
+    micRecorder.addEventListener("stop", async () => {
+      setRecordingState(false);
+      btnRecordPause.textContent = "⏸ Pause Rec";
+
+      const durMs = Date.now() - micRecordingStartedAt;
+      if (durMs < 250) {
+        setStatus("Recording too short.", "error");
+        await stopMicIfActive();
+        return;
+      }
+
+      try {
+        setStatus("Saving recording…", "working");
+        const blob = new Blob(micChunks, { type: micRecorder?.mimeType || mimeType || "audio/webm" });
+        const ab = await blob.arrayBuffer();
+        const wavPath = await otter.saveMicRecordingAs(ab, blob.type || mimeType || "");
+        if (!wavPath) {
+          setStatus("Recording save canceled.", "info");
+          return;
+        }
+
+        // Show the recorded waveform + a separate transcribe button.
+        recordedEditor.audioPath = wavPath;
+        recordedEditor.words = [];
+        recordedEditor.pieceTable = null;
+        recordedEditor.undoStack = [];
+        recordedEditor.redoStack = [];
+        recordedEditor.selectedIndices = [];
+        recordedEditor.selectionAnchor = null;
+        recordedEditor.selectionStart = null;
+        recordedEditor.selectionEnd = null;
+
+        transcriptRecordedEl.innerHTML = "";
+        recordedWavePane.hidden = false;
+        recordedWaveDivider.hidden = false;
+        btnRecordedPlay.disabled = true;
+        btnTranscribeRecorded.disabled = false;
+        btnStopRecorded.hidden = true;
+
+        const recAb = await otter.readFileAsArrayBuffer(wavPath);
+        await wsRecorded.loadBlob(new Blob([recAb]));
+        btnRecordedPlay.disabled = false;
+        setRecordedPlayIcon(false);
+
+        updateEditButtonStates();
+        setStatus("Recording saved. Ready to transcribe.", "success");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setStatus("Recording failed (see logs).", "error");
+        appendLog("\nERROR recording:\n" + msg + "\n");
+      } finally {
+        await stopMicIfActive();
+        micChunks = [];
+      }
+    });
+
+    micRecorder.start();
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setRecordingState(false);
+    setStatus("Microphone permission or recording failed.", "error");
+    appendLog("\nERROR mic:\n" + msg + "\n");
+    await stopMicIfActive();
+  }
+});
+
+btnRecordPause.addEventListener("click", () => {
+  if (!micRecorder) return;
+  if (micRecorder.state === "recording") {
+    try { micRecorder.pause(); } catch { /* ignore */ }
+    btnRecordPause.textContent = "▶ Resume Rec";
+    setStatus("Recording paused.", "info");
+  } else if (micRecorder.state === "paused") {
+    try { micRecorder.resume(); } catch { /* ignore */ }
+    btnRecordPause.textContent = "⏸ Pause Rec";
+    setStatus("Recording…", "working");
+  }
+});
+
+btnTranscribeRecorded.addEventListener("click", async () => {
+  if (!recordedEditor.audioPath) return;
+  enqueueTranscription("recorded", recordedEditor.audioPath, getActiveSpecArg());
+});
+
+btnStopRecorded.addEventListener("click", async () => {
+  appendLog("INFO:Cancel requested for recording transcription.\n");
+  await otter.cancelTranscription();
+});
+
+btnRecordStop.addEventListener("click", async () => {
+  try {
+    micRecorder?.stop();
+  } catch {
+    // ignore
+  }
+});
+
 // Handle the "Choose File" button
 btnChoose.addEventListener("click", async () => {
   resetEditedPreviewState();
@@ -1822,35 +2809,24 @@ btnChoose.addEventListener("click", async () => {
     return;
   }
 
-  audioPath = selectedPath;
+  clearPendingImportedView();
+  pendingImportAudioPath = selectedPath;
 
-  transcriptEl.innerHTML = "";
-  logEl.textContent = "";
-  pieceTable = null;
-  undoStack = [];
-  redoStack = [];
-  selectedIndices = [];
-  selectionStart = null;
-  selectionEnd = null;
-  selectionAnchor = null;
-  detailSelStart = null;
-  detailSelEnd = null;
-  updateEditButtonStates();
+  const fname = pendingImportAudioPath.split("/").pop() ?? pendingImportAudioPath;
+  setStatus(`Selected imported audio: ${fname}`, "success");
 
-  btnPlay.disabled = true;
-  let fname = audioPath.split("/").pop() ?? audioPath;
-  setStatus(`Loaded: ${fname}`, "success");
-  setPlayIcon(false);
   btnTranscribe.disabled = false;
 
-  // Load waveform from local file bytes via preload bridge
-  const ab = await otter.readFileAsArrayBuffer(audioPath);
+  importedWavePane.hidden = false;
+  importedWaveDivider.hidden = false;
+  importedLoadedFileEl.textContent = shortenFilenameMiddle(fname);
+  btnImportedPlay.disabled = true;
+  importedTimeEl.textContent = "0.00";
+  const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
   const blob = new Blob([ab]);
-  await ws.loadBlob(blob);
-
-  btnPlay.disabled = false;
-
-  fnameEl.textContent = shortenFilenameMiddle(fname);
+  await wsImported.loadBlob(blob);
+  btnImportedPlay.disabled = false;
+  setImportedPlayIcon(false);
 });
 
 //==============================================================================
@@ -1867,6 +2843,16 @@ function appendLog(msg: string) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// allow early error hooks to log once appendLog exists
+(window as any).__otterAppendLog = appendLog;
+
+// Flush any errors that happened before the log was initialized.
+if (earlyLogBuffer.length) {
+  for (const m of earlyLogBuffer) appendLog(m);
+  earlyLogBuffer.length = 0;
+  openDevPanelIfPresent();
+}
+
 // We've received a normal log message
 otter.onTranscribeLog((msg: string) => appendLog(msg));
 
@@ -1874,7 +2860,10 @@ otter.onTranscribeLog((msg: string) => appendLog(msg));
 otter.onTranscribeProgress((pct: number) => {
   progressEl.value = pct;
   progressEl.hidden = false;
-  statusEl.textContent = "Transcribing…";
+  // Don't override more specific statuses (e.g. "Transcribing recording…")
+  if (!statusEl.textContent || statusEl.textContent === "Transcribing…") {
+    statusEl.textContent = "Transcribing…";
+  }
 });
 
 
@@ -1890,8 +2879,8 @@ const SPEC_FRIENDLY_LABELS: Record<string, string> = {
   "fw.json":          "Fast (no cleanup)",
   "fw_cwt.json":      "Balanced",
   "fw_asw_cwt.json":  "Refined",
-  "default_spec.json":"Best (WhisperX)",
-  "wx_asw_cwt.json":  "Best (WhisperX alt)",
+  "default_spec.json":"Recommended",
+  "wx_asw_cwt.json":  "WhisperX (slowest)",
 };
 
 const SPEC_ORDER: string[] = [
@@ -1933,6 +2922,17 @@ function showCustomArea(show: boolean) {
 
 /**
  * Spec argument passed to main.ts when transcribing.
+ */
+/**
+ * Build the transcription pipeline argument from the current UI state.
+ *
+ * Semantics:
+ * - If "Customize JSON" is enabled, we send the textarea contents verbatim (`mode: "json"`).
+ * - Otherwise we send the selected preset filename (`mode: "file"`).
+ *
+ * Queueing note:
+ * - Callers that enqueue background work should snapshot this return value at click time,
+ *   rather than reading it later, so the chosen model/pipeline is stable per job.
  */
 function getActiveSpecArg(): TranscribeSpec {
   if (chkCustomSpec.checked) {
@@ -2023,11 +3023,16 @@ specSelect.addEventListener("change", async () => {
 
 // Init
 (async function initSpecUi() {
-  await populateSpecSelect();
-
-  // Start state: default selected, Customize unchecked, textarea hidden
-  chkCustomSpec.checked = false;
-  showCustomArea(false);
+  try {
+    await populateSpecSelect();
+    // Start state: default selected, Customize unchecked, textarea hidden
+    chkCustomSpec.checked = false;
+    showCustomArea(false);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    appendLog(`\nERROR: Failed to initialize model dropdown: ${msg}\n`);
+    setStatus("Model dropdown failed (see logs).", "error");
+  }
 })();
 
 //==============================================================================
@@ -2044,18 +3049,21 @@ const btnSaveEdl = mustGetEl<HTMLButtonElement>("btnSaveEdl");
 const btnLoadEdl = mustGetEl<HTMLButtonElement>("btnLoadEdl");
 const btnSaveEdits = mustGetEl<HTMLButtonElement>("btnSaveEdits");
 
+// Now that edit controls exist, it's safe to apply active editor UI state.
+setActiveEditor(activeEditor);
+
 //helper function for removing one breakline
 function removeOneBreakline(): boolean {
-  if (selectedIndices.length === 0) return false;
+  if (activeEditor.selectedIndices.length === 0) return false;
 
-  const lastSelected = selectedIndices[selectedIndices.length - 1];
-  const currentBreaks = words[lastSelected]?.breakAfter ?? 0;
+  const lastSelected = activeEditor.selectedIndices[activeEditor.selectedIndices.length - 1];
+  const currentBreaks = activeEditor.words[lastSelected]?.breakAfter ?? 0;
 
   if (currentBreaks <= 0) return false;
 
-  pushUndo();
-  words[lastSelected].breakAfter = currentBreaks - 1;
-  renderTranscript(words);
+  pushUndo(activeEditor);
+  activeEditor.words[lastSelected].breakAfter = currentBreaks - 1;
+  renderTranscript(activeEditor);
   updateEditButtonStates();
   return true;
 }
@@ -2068,45 +3076,46 @@ function removeOneBreakline(): boolean {
  * remain visible with strikethrough styling so the user can restore them.
  */
 function removeSelection() {
-  if (!pieceTable || selectedIndices.length === 0) return;
-  pushUndo();
+  if (!activeEditor.pieceTable || activeEditor.selectedIndices.length === 0) return;
+  pushUndo(activeEditor);
   let changedAny = false;
-  const ranges = getSelectedRanges(uniqueSortedIndices(selectedIndices));
+  const ranges = getSelectedRanges(uniqueSortedIndices(activeEditor.selectedIndices));
   for (const r of ranges) {
-    const changed = applyStatusToRange(pieceTable, r.start, r.end, "active", "deleted");
-    if (changed) changedAny = true;
+    const changedActive = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "active", "deleted");
+    const changedAdded = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "added", "deleted");
+    if (changedActive || changedAdded) changedAny = true;
   }
   if (!changedAny) {
     // Nothing was active in that range — pop the undo we just pushed
-    undoStack.pop();
+    activeEditor.undoStack.pop();
     return;
   }
-  renderTranscript(words);
+  renderTranscript(activeEditor);
   void refreshMainWavePreviewFromEdits();
   updateEditButtonStates();
-  refreshDetailIfActive();
+  if (activeEditor.kind === "imported") refreshDetailIfActive();
 }
 
 /**
  * Restore previously removed words in the current selection.
  */
 function restoreSelection() {
-  if (!pieceTable || selectedIndices.length === 0) return;
-  pushUndo();
+  if (!activeEditor.pieceTable || activeEditor.selectedIndices.length === 0) return;
+  pushUndo(activeEditor);
   let changedAny = false;
-  const ranges = getSelectedRanges(uniqueSortedIndices(selectedIndices));
+  const ranges = getSelectedRanges(uniqueSortedIndices(activeEditor.selectedIndices));
   for (const r of ranges) {
-    const changed = applyStatusToRange(pieceTable, r.start, r.end, "deleted", "active");
+    const changed = applyStatusToRange(activeEditor.pieceTable, r.start, r.end, "deleted", "active");
     if (changed) changedAny = true;
   }
   if (!changedAny) {
-    undoStack.pop();
+    activeEditor.undoStack.pop();
     return;
   }
-  renderTranscript(words);
+  renderTranscript(activeEditor);
   void refreshMainWavePreviewFromEdits();
   updateEditButtonStates();
-  refreshDetailIfActive();
+  if (activeEditor.kind === "imported") refreshDetailIfActive();
 }
 
 btnRemove.addEventListener("click", () => removeSelection());
@@ -2117,21 +3126,336 @@ window.addEventListener("mouseup", () => {
 });
 
 btnUndo.addEventListener("click", () => {
-  if (performUndo()) {
-    renderTranscript(words);
-    void refreshMainWavePreviewFromEdits();
+  if (performUndo(activeEditor)) {
+    // Re-render panes (undo may restore/clear other editors too)
+    transcriptImportedEl.innerHTML = "";
+    transcriptPendingImportedEl.innerHTML = "";
+    transcriptRecordedEl.innerHTML = "";
+    if (importedEditor.pieceTable) renderTranscript(importedEditor);
+    if (pendingImportEditor.pieceTable) renderTranscript(pendingImportEditor);
+    if (recordedEditor.pieceTable) renderTranscript(recordedEditor);
+
+    // Restore staged/recorded waveforms from current editor state
+    void (async () => {
+      if (pendingImportEditor.audioPath) {
+        importedWavePane.hidden = false;
+        importedWaveDivider.hidden = false;
+        importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
+        btnImportedPlay.disabled = true;
+        try {
+          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
+          await wsImported.loadBlob(new Blob([importAb]));
+          btnImportedPlay.disabled = false;
+          setImportedPlayIcon(false);
+        } catch {
+          importedWavePane.hidden = true;
+          importedWaveDivider.hidden = true;
+          btnImportedPlay.disabled = true;
+        }
+      } else {
+        importedWavePane.hidden = true;
+        importedWaveDivider.hidden = true;
+        btnImportedPlay.disabled = true;
+        importedLoadedFileEl.textContent = "No imported audio staged";
+      }
+
+      if (recordedEditor.audioPath) {
+        recordedWavePane.hidden = false;
+        recordedWaveDivider.hidden = false;
+        btnRecordedPlay.disabled = true;
+        btnTranscribeRecorded.disabled = false;
+        btnStopRecorded.hidden = true;
+        try {
+          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
+          await wsRecorded.loadBlob(new Blob([recAb]));
+          btnRecordedPlay.disabled = false;
+          setRecordedPlayIcon(false);
+        } catch {
+          recordedWavePane.hidden = true;
+          recordedWaveDivider.hidden = true;
+          btnRecordedPlay.disabled = true;
+        }
+      } else {
+        recordedWavePane.hidden = true;
+        recordedWaveDivider.hidden = true;
+        btnRecordedPlay.disabled = true;
+        btnTranscribeRecorded.disabled = true;
+        btnStopRecorded.hidden = true;
+      }
+    })();
+
+    if (importedEditor.audioPath && importedEditor.pieceTable) {
+      void refreshMainWavePreviewFromEdits();
+    } else {
+      clearMainWave();
+    }
     updateEditButtonStates();
-    refreshDetailIfActive();
+    if (activeEditor.kind === "imported") refreshDetailIfActive();
   }
 });
 
 btnRedo.addEventListener("click", () => {
-  if (performRedo()) {
-    renderTranscript(words);
+  if (performRedo(activeEditor)) {
+    // Re-render panes (redo may restore/clear other editors too)
+    transcriptImportedEl.innerHTML = "";
+    transcriptPendingImportedEl.innerHTML = "";
+    transcriptRecordedEl.innerHTML = "";
+    if (importedEditor.pieceTable) renderTranscript(importedEditor);
+    if (pendingImportEditor.pieceTable) renderTranscript(pendingImportEditor);
+    if (recordedEditor.pieceTable) renderTranscript(recordedEditor);
+
+    // Restore staged/recorded waveforms from current editor state
+    void (async () => {
+      if (pendingImportEditor.audioPath) {
+        importedWavePane.hidden = false;
+        importedWaveDivider.hidden = false;
+        importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
+        btnImportedPlay.disabled = true;
+        try {
+          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
+          await wsImported.loadBlob(new Blob([importAb]));
+          btnImportedPlay.disabled = false;
+          setImportedPlayIcon(false);
+        } catch {
+          importedWavePane.hidden = true;
+          importedWaveDivider.hidden = true;
+          btnImportedPlay.disabled = true;
+        }
+      } else {
+        importedWavePane.hidden = true;
+        importedWaveDivider.hidden = true;
+        btnImportedPlay.disabled = true;
+        importedLoadedFileEl.textContent = "No imported audio staged";
+      }
+
+      if (recordedEditor.audioPath) {
+        recordedWavePane.hidden = false;
+        recordedWaveDivider.hidden = false;
+        btnRecordedPlay.disabled = true;
+        btnTranscribeRecorded.disabled = false;
+        btnStopRecorded.hidden = true;
+        try {
+          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
+          await wsRecorded.loadBlob(new Blob([recAb]));
+          btnRecordedPlay.disabled = false;
+          setRecordedPlayIcon(false);
+        } catch {
+          recordedWavePane.hidden = true;
+          recordedWaveDivider.hidden = true;
+          btnRecordedPlay.disabled = true;
+        }
+      } else {
+        recordedWavePane.hidden = true;
+        recordedWaveDivider.hidden = true;
+        btnRecordedPlay.disabled = true;
+        btnTranscribeRecorded.disabled = true;
+        btnStopRecorded.hidden = true;
+      }
+    })();
+
+    if (importedEditor.audioPath && importedEditor.pieceTable) {
+      void refreshMainWavePreviewFromEdits();
+    } else {
+      clearMainWave();
+    }
+    updateEditButtonStates();
+    if (activeEditor.kind === "imported") refreshDetailIfActive();
+  }
+});
+
+/**
+ * Append the active (non-deleted) words from a source editor into the main transcript.
+ *
+ * Source editors:
+ * - `pendingImportEditor` (Imported Transcript)
+ * - `recordedEditor` (Recorded Transcript)
+ *
+ * Behavior:
+ * - If the main transcript is empty, we "promote" the source transcript into main.
+ * - Otherwise we append the source's active view entries as newly-added words in main.
+ *
+ * Undo/redo:
+ * - This function ensures the append is undoable and that undo restores the source pane
+ *   state (transcript + waveform) that the UI will clear immediately after the append.
+ */
+function appendEditorToMain(sourceEditor: EditorState, sourcePrefix: string, successMessage: string) {
+  if (!sourceEditor.pieceTable || sourceEditor.words.length === 0) return;
+
+  if (!importedEditor.pieceTable) {
+    // Make this undoable (restore empty main + restore the source pane we’re about to clear).
+    const emptyMain: UndoSnapshot = {
+      kind: "empty",
+      audioPath: null,
+      words: [],
+      side: {
+        [sourceEditor.kind]: snapshotState(sourceEditor),
+      },
+    };
+    importedEditor.undoStack.push(emptyMain);
+    importedEditor.redoStack = [];
+
+    importedEditor.audioPath = sourceEditor.audioPath;
+    importedEditor.words = sourceEditor.words.map(w => ({ ...w }));
+    // Clone to avoid sharing state between panes (undo can restore source).
+    const srcSnap = snapshotState(sourceEditor);
+    if (srcSnap.kind === "pt") {
+      importedEditor.pieceTable = {
+        pieces: srcSnap.pieces.map(p => ({ ...p })),
+        originalBuffer: srcSnap.originalBuffer.map(e => ({ ...e })),
+        addBuffer: srcSnap.addBuffer.map(e => ({ ...e })),
+        sourceFile: srcSnap.ptSourceFile,
+        createdAt: srcSnap.ptCreatedAt,
+        modifiedAt: new Date().toISOString(),
+      };
+    } else {
+      importedEditor.pieceTable = null;
+    }
+    importedEditor.selectedIndices = [];
+    importedEditor.selectionAnchor = null;
+    importedEditor.selectionStart = null;
+    importedEditor.selectionEnd = null;
+  } else {
+    const mainPt = importedEditor.pieceTable;
+    const sourceView = getViewEntries(sourceEditor.pieceTable);
+    const sourceActive = sourceView.filter(v => v.status !== "deleted");
+
+    // Capture the source pane too so undo can restore it + its waveform.
+    const mainUndo = snapshotState(importedEditor);
+    mainUndo.side = { [sourceEditor.kind]: snapshotState(sourceEditor) };
+    importedEditor.undoStack.push(mainUndo);
+    importedEditor.redoStack = [];
+
+    const addEntries: PieceEntry[] = sourceActive.map((ve) => ({
+      id: `${sourcePrefix}${crypto.randomUUID().slice(0, 8)}`,
+      word: ve.entry.word,
+      sourceStart: ve.entry.sourceStart,
+      sourceEnd: ve.entry.sourceEnd,
+      breakAfter: ve.entry.breakAfter,
+      sourceFile: sourceEditor.audioPath || ve.entry.sourceFile,
+    }));
+
+    const insertOffset = mainPt.addBuffer.length;
+    mainPt.addBuffer.push(...addEntries);
+    mainPt.pieces.push({
+      source: "add",
+      offset: insertOffset,
+      length: addEntries.length,
+      status: "added",
+    });
+    mainPt.pieces = mergePieces(mainPt.pieces);
+    syncWordsFromPieceTable(importedEditor);
+  }
+
+  renderTranscript(importedEditor);
+  setActiveEditor(importedEditor);
+  void refreshMainWavePreviewFromEdits();
+  updateEditButtonStates();
+  setStatus(successMessage, "success");
+}
+
+btnAddImportedToTranscript.addEventListener("click", () => {
+  if (!pendingImportEditor.pieceTable || pendingImportEditor.words.length === 0) return;
+  appendEditorToMain(pendingImportEditor, "i", "Imported transcript added to main transcript.");
+  clearPendingImportedView();
+  updateEditButtonStates();
+});
+
+btnAddRecordedToTranscript.addEventListener("click", () => {
+  if (!recordedEditor.pieceTable || recordedEditor.words.length === 0) return;
+  appendEditorToMain(recordedEditor, "r", "Recorded transcript added to main transcript.");
+  clearRecordedView();
+  updateEditButtonStates();
+  return;
+
+  /* eslint-disable no-unreachable */
+  // If there is no imported transcript yet, promote recorded → imported.
+  if (!importedEditor.pieceTable) {
+    importedEditor.audioPath = importedEditor.audioPath || recordedEditor.audioPath;
+    importedEditor.words = recordedEditor.words.map(w => ({ ...w }));
+    importedEditor.pieceTable = recordedEditor.pieceTable;
+    importedEditor.undoStack = recordedEditor.undoStack.slice();
+    importedEditor.redoStack = recordedEditor.redoStack.slice();
+    importedEditor.selectedIndices = [];
+    importedEditor.selectionAnchor = null;
+    importedEditor.selectionStart = null;
+    importedEditor.selectionEnd = null;
+
+    recordedEditor.audioPath = null;
+    recordedEditor.words = [];
+    recordedEditor.pieceTable = null;
+    recordedEditor.undoStack = [];
+    recordedEditor.redoStack = [];
+    recordedEditor.selectedIndices = [];
+    recordedEditor.selectionAnchor = null;
+    recordedEditor.selectionStart = null;
+    recordedEditor.selectionEnd = null;
+
+    renderTranscript(importedEditor);
+    transcriptRecordedEl.innerHTML = "";
+    recordedWavePane.hidden = true;
+    recordedWaveDivider.hidden = true;
+    btnRecordedPlay.disabled = true;
+    btnTranscribeRecorded.disabled = true;
+    btnStopRecorded.hidden = true;
+    setActiveEditor(importedEditor);
     void refreshMainWavePreviewFromEdits();
     updateEditButtonStates();
-    refreshDetailIfActive();
+    setStatus("Recorded transcript added to main transcript.", "success");
+    return;
   }
+
+  // Merge: append recorded transcript entries as "added" words at the end of imported.
+  const mainPt = importedEditor.pieceTable!;
+  const recPt = recordedEditor.pieceTable!;
+
+  pushUndo(importedEditor);
+
+  const recView = getViewEntries(recPt);
+  const recActive = recView.filter(v => v.status !== "deleted");
+  const addEntries: PieceEntry[] = recActive.map((ve) => ({
+    id: `r${crypto.randomUUID().slice(0, 8)}`,
+    word: ve.entry.word,
+    sourceStart: ve.entry.sourceStart,
+    sourceEnd: ve.entry.sourceEnd,
+    breakAfter: ve.entry.breakAfter,
+    sourceFile: recordedEditor.audioPath || ve.entry.sourceFile,
+  }));
+
+  const insertOffset = mainPt.addBuffer.length;
+  mainPt.addBuffer.push(...addEntries);
+  mainPt.pieces.push({
+    source: "add",
+    offset: insertOffset,
+    length: addEntries.length,
+    status: "added",
+  });
+  mainPt.pieces = mergePieces(mainPt.pieces);
+
+  syncWordsFromPieceTable(importedEditor);
+  renderTranscript(importedEditor);
+
+  // Clear recorded editor after merge
+  recordedEditor.audioPath = null;
+  recordedEditor.words = [];
+  recordedEditor.pieceTable = null;
+  recordedEditor.undoStack = [];
+  recordedEditor.redoStack = [];
+  recordedEditor.selectedIndices = [];
+  recordedEditor.selectionAnchor = null;
+  recordedEditor.selectionStart = null;
+  recordedEditor.selectionEnd = null;
+  transcriptRecordedEl.innerHTML = "";
+  recordedWavePane.hidden = true;
+  recordedWaveDivider.hidden = true;
+  btnRecordedPlay.disabled = true;
+  btnTranscribeRecorded.disabled = true;
+  btnStopRecorded.hidden = true;
+
+  setActiveEditor(importedEditor);
+  void refreshMainWavePreviewFromEdits();
+  updateEditButtonStates();
+  setStatus("Recorded transcript appended to main transcript.", "success");
+  /* eslint-enable no-unreachable */
 });
 
 document.addEventListener("keydown", (e: KeyboardEvent) => {
@@ -2143,30 +3467,30 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
 
   if (isMeta && !e.shiftKey && e.key === "z") {
     e.preventDefault();
-    if (performUndo()) {
-      renderTranscript(words);
+    if (performUndo(activeEditor)) {
+      renderTranscript(activeEditor);
       updateEditButtonStates();
-      refreshDetailIfActive();
+      if (activeEditor.kind === "imported") refreshDetailIfActive();
     }
     return;
   }
 
   if (isMeta && e.shiftKey && e.key === "z") {
     e.preventDefault();
-    if (performRedo()) {
-      renderTranscript(words);
+    if (performRedo(activeEditor)) {
+      renderTranscript(activeEditor);
       updateEditButtonStates();
-      refreshDetailIfActive();
+      if (activeEditor.kind === "imported") refreshDetailIfActive();
     }
     return;
   }
 
   if (isMeta && e.key === "y") {
     e.preventDefault();
-    if (performRedo()) {
-      renderTranscript(words);
+    if (performRedo(activeEditor)) {
+      renderTranscript(activeEditor);
       updateEditButtonStates();
-      refreshDetailIfActive();
+      if (activeEditor.kind === "imported") refreshDetailIfActive();
     }
     return;
   }
@@ -2195,11 +3519,11 @@ if (e.key === "r" || e.key === "R") {
 if (e.key === "Enter") {
   e.preventDefault();
 
-  if (selectedIndices.length > 0) {
-    const lastSelected = selectedIndices[selectedIndices.length - 1];
-    pushUndo();
-    words[lastSelected].breakAfter = (words[lastSelected].breakAfter ?? 0) + 1;
-    renderTranscript(words);
+  if (activeEditor.selectedIndices.length > 0) {
+    const lastSelected = activeEditor.selectedIndices[activeEditor.selectedIndices.length - 1];
+    pushUndo(activeEditor);
+    activeEditor.words[lastSelected].breakAfter = (activeEditor.words[lastSelected].breakAfter ?? 0) + 1;
+    renderTranscript(activeEditor);
     updateEditButtonStates();
   }
   return;
@@ -2207,11 +3531,22 @@ if (e.key === "Enter") {
 });
 
 btnSaveEdl.addEventListener("click", async () => {
-  if (!pieceTable) return;
+  if (!importedEditor.pieceTable && !pendingImportEditor.pieceTable && !recordedEditor.pieceTable) return;
 
   try {
-    syncBreakAfterToPieceTable();
-    const payload = { version: 2, pieceTable };
+    if (importedEditor.pieceTable) syncBreakAfterToPieceTable(importedEditor);
+    if (pendingImportEditor.pieceTable) syncBreakAfterToPieceTable(pendingImportEditor);
+    if (recordedEditor.pieceTable) syncBreakAfterToPieceTable(recordedEditor);
+
+    const payload = {
+      version: 4,
+      imported: importedEditor.pieceTable,
+      pendingImported: pendingImportEditor.pieceTable,
+      recorded: recordedEditor.pieceTable,
+      importedAudioPath: importedEditor.audioPath,
+      pendingImportedAudioPath: pendingImportEditor.audioPath,
+      recordedAudioPath: recordedEditor.audioPath,
+    };
     const json = JSON.stringify(payload, null, 2);
     const savedPath = await otter.saveEdl(json);
     if (savedPath) {
@@ -2234,46 +3569,176 @@ btnLoadEdl.addEventListener("click", async () => {
 
     const parsed = JSON.parse(result.content);
 
+    if (parsed && typeof parsed === "object" && parsed.version === 4) {
+      const p = parsed as any;
+      importedEditor.pieceTable = p.imported ?? null;
+      pendingImportEditor.pieceTable = p.pendingImported ?? null;
+      recordedEditor.pieceTable = p.recorded ?? null;
+      importedEditor.audioPath = typeof p.importedAudioPath === "string" ? p.importedAudioPath : (importedEditor.pieceTable?.sourceFile ?? null);
+      pendingImportEditor.audioPath = typeof p.pendingImportedAudioPath === "string" ? p.pendingImportedAudioPath : (pendingImportEditor.pieceTable?.sourceFile ?? null);
+      recordedEditor.audioPath = typeof p.recordedAudioPath === "string" ? p.recordedAudioPath : (recordedEditor.pieceTable?.sourceFile ?? null);
+    } else if (parsed && typeof parsed === "object" && parsed.version === 3) {
+      const p = parsed as any;
+      importedEditor.pieceTable = p.imported ?? null;
+      pendingImportEditor.pieceTable = null;
+      recordedEditor.pieceTable = p.recorded ?? null;
+      importedEditor.audioPath = typeof p.importedAudioPath === "string" ? p.importedAudioPath : (importedEditor.pieceTable?.sourceFile ?? null);
+      pendingImportEditor.audioPath = null;
+      recordedEditor.audioPath = typeof p.recordedAudioPath === "string" ? p.recordedAudioPath : (recordedEditor.pieceTable?.sourceFile ?? null);
+    } else
     if (isEdlV2(parsed)) {
-      pieceTable = parsed.pieceTable;
+      importedEditor.pieceTable = parsed.pieceTable;
+      pendingImportEditor.pieceTable = null;
+      recordedEditor.pieceTable = null;
+      pendingImportEditor.audioPath = null;
+      recordedEditor.audioPath = null;
     } else if (isEdlV1(parsed)) {
-      pieceTable = convertV1ToV2(parsed);
+      importedEditor.pieceTable = convertV1ToV2(parsed);
+      pendingImportEditor.pieceTable = null;
+      recordedEditor.pieceTable = null;
+      pendingImportEditor.audioPath = null;
+      recordedEditor.audioPath = null;
     } else {
       setStatus("Invalid EDL file.", "error");
       appendLog("\nERROR: file is not a valid OTTER EDL.\n");
       return;
     }
 
-    undoStack = [];
-    redoStack = [];
-    audioPath = pieceTable.sourceFile;
+    importedEditor.undoStack = [];
+    importedEditor.redoStack = [];
+    importedEditor.selectedIndices = [];
+    importedEditor.selectionAnchor = null;
+    importedEditor.selectionStart = null;
+    importedEditor.selectionEnd = null;
 
-    const viewEntries = getViewEntries(pieceTable);
-    words = viewEntries.map(ve => ({
-      word: ve.entry.word,
-      start: ve.entry.sourceStart,
-      end: ve.entry.sourceEnd,
-      breakAfter: ve.entry.breakAfter,
-    }));
+    pendingImportEditor.undoStack = [];
+    pendingImportEditor.redoStack = [];
+    pendingImportEditor.selectedIndices = [];
+    pendingImportEditor.selectionAnchor = null;
+    pendingImportEditor.selectionStart = null;
+    pendingImportEditor.selectionEnd = null;
 
-    // Load the source audio waveform
-    const ab = await otter.readFileAsArrayBuffer(audioPath);
-    const blob = new Blob([ab]);
-    await ws.loadBlob(blob);
+    recordedEditor.undoStack = [];
+    recordedEditor.redoStack = [];
+    recordedEditor.selectedIndices = [];
+    recordedEditor.selectionAnchor = null;
+    recordedEditor.selectionStart = null;
+    recordedEditor.selectionEnd = null;
+
+    if (importedEditor.pieceTable) {
+      importedEditor.audioPath = importedEditor.audioPath || importedEditor.pieceTable.sourceFile;
+      const viewEntries = getViewEntries(importedEditor.pieceTable);
+      importedEditor.words = viewEntries.map(ve => ({
+        word: ve.entry.word,
+        start: ve.entry.sourceStart,
+        end: ve.entry.sourceEnd,
+        breakAfter: ve.entry.breakAfter,
+      }));
+    } else {
+      importedEditor.words = [];
+    }
+
+    if (pendingImportEditor.pieceTable) {
+      pendingImportEditor.audioPath = pendingImportEditor.audioPath || pendingImportEditor.pieceTable.sourceFile;
+      const viewEntries = getViewEntries(pendingImportEditor.pieceTable);
+      pendingImportEditor.words = viewEntries.map(ve => ({
+        word: ve.entry.word,
+        start: ve.entry.sourceStart,
+        end: ve.entry.sourceEnd,
+        breakAfter: ve.entry.breakAfter,
+      }));
+    } else {
+      pendingImportEditor.words = [];
+    }
+
+    if (recordedEditor.pieceTable) {
+      recordedEditor.audioPath = recordedEditor.audioPath || recordedEditor.pieceTable.sourceFile;
+      const viewEntries = getViewEntries(recordedEditor.pieceTable);
+      recordedEditor.words = viewEntries.map(ve => ({
+        word: ve.entry.word,
+        start: ve.entry.sourceStart,
+        end: ve.entry.sourceEnd,
+        breakAfter: ve.entry.breakAfter,
+      }));
+    } else {
+      recordedEditor.words = [];
+    }
+
+    transcriptImportedEl.innerHTML = "";
+    transcriptPendingImportedEl.innerHTML = "";
+    transcriptRecordedEl.innerHTML = "";
+    if (importedEditor.pieceTable) renderTranscript(importedEditor);
+    if (pendingImportEditor.pieceTable) renderTranscript(pendingImportEditor);
+    if (recordedEditor.pieceTable) renderTranscript(recordedEditor);
+
+    if (pendingImportEditor.audioPath) {
+      importedWavePane.hidden = false;
+      importedWaveDivider.hidden = false;
+      importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
+      btnImportedPlay.disabled = true;
+      try {
+        const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
+        await wsImported.loadBlob(new Blob([importAb]));
+        btnImportedPlay.disabled = false;
+        setImportedPlayIcon(false);
+      } catch (err: unknown) {
+        importedWavePane.hidden = true;
+        importedWaveDivider.hidden = true;
+        btnImportedPlay.disabled = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        appendLog(`ERROR: failed to load imported waveform from EDL audio path: ${msg}\n`);
+      }
+    } else {
+      importedWavePane.hidden = true;
+      importedWaveDivider.hidden = true;
+      btnImportedPlay.disabled = true;
+      importedLoadedFileEl.textContent = "No imported audio staged";
+    }
+
+    if (recordedEditor.audioPath) {
+      recordedWavePane.hidden = false;
+      recordedWaveDivider.hidden = false;
+      btnRecordedPlay.disabled = true;
+      btnTranscribeRecorded.disabled = false;
+      btnStopRecorded.hidden = true;
+      try {
+        const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
+        await wsRecorded.loadBlob(new Blob([recAb]));
+        btnRecordedPlay.disabled = false;
+        setRecordedPlayIcon(false);
+      } catch (err: unknown) {
+        recordedWavePane.hidden = true;
+        recordedWaveDivider.hidden = true;
+        btnRecordedPlay.disabled = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        appendLog(`ERROR: failed to load recorded waveform from EDL audio path: ${msg}\n`);
+      }
+    } else {
+      recordedWavePane.hidden = true;
+      recordedWaveDivider.hidden = true;
+      btnRecordedPlay.disabled = true;
+      btnTranscribeRecorded.disabled = true;
+      btnStopRecorded.hidden = true;
+    }
+
+    if (importedEditor.audioPath && importedEditor.pieceTable) {
+      await refreshMainWavePreviewFromEdits();
+    } else {
+      clearMainWave();
+    }
 
     // Update UI state
-    const fname = audioPath.split("/").pop() ?? audioPath;
-    fnameEl.textContent = shortenFilenameMiddle(fname);
-    setStatus(`EDL loaded (${viewEntries.length} entries)`, "success");
+    const fname = (importedEditor.audioPath || "").split("/").pop() ?? "";
+    fnameEl.textContent = fname ? shortenFilenameMiddle(fname) : "No file loaded";
+    setStatus(`EDL loaded`, "success");
     appendLog(`EDL loaded from ${result.path}\n`);
 
-    btnPlay.disabled = false;
-    btnTranscribe.disabled = false;
+    btnPlay.disabled = importedEditor.pieceTable == null;
+    btnTranscribe.disabled = pendingImportAudioPath == null;
+    setActiveEditor(importedEditor.pieceTable ? importedEditor : (pendingImportEditor.pieceTable ? pendingImportEditor : recordedEditor));
     updateEditButtonStates();
-    renderTranscript(words);
     updateDeletedRegions();
     refreshDetailIfActive();
-    await refreshMainWavePreviewFromEdits();
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     setStatus("Failed to load EDL.", "error");
@@ -2282,9 +3747,9 @@ btnLoadEdl.addEventListener("click", async () => {
 });
 
 btnSaveEdits.addEventListener("click", async () => {
-  if (!pieceTable) return;
+  if (!importedEditor.pieceTable) return;
 
-  const activeEntries = getActiveEntries(pieceTable);
+  const activeEntries = getActiveEntries(importedEditor.pieceTable);
   if (activeEntries.length === 0) {
     setStatus("Nothing to export (all words removed).", "error");
     return;
@@ -2295,16 +3760,17 @@ btnSaveEdits.addEventListener("click", async () => {
 
     const exportPayload = {
       version: 1,
-      sourceFile: pieceTable.sourceFile,
+      sourceFile: importedEditor.audioPath || "",
       entries: activeEntries.map(ve => ({
         id: ve.entry.id,
+        sourceFile: ve.entry.sourceFile || importedEditor.audioPath || "",
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,
         muted: false,
       })),
-      createdAt: pieceTable.createdAt,
-      modifiedAt: pieceTable.modifiedAt,
+      createdAt: importedEditor.pieceTable?.createdAt || new Date().toISOString(),
+      modifiedAt: importedEditor.pieceTable?.modifiedAt || new Date().toISOString(),
     };
 
     const json = JSON.stringify(exportPayload, null, 2);
