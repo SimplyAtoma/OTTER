@@ -587,11 +587,27 @@ ipcMain.handle(
   });
 
 ipcMain.handle("pause-transcription", async () => {
-  return false;
+  if (!activeProcess || !activeProcess.pid) return false;
+  if (activeProcess.otterState !== "running") return false;
+  try {
+    process.kill(activeProcess.pid, "SIGSTOP");
+    activeProcess.otterState = "paused";
+    return true;
+  } catch {
+    return false;
+  }
 });
 
 ipcMain.handle("resume-transcription", async () => {
-  return false;
+  if (!activeProcess || !activeProcess.pid) return false;
+  if (activeProcess.otterState !== "paused") return false;
+  try {
+    process.kill(activeProcess.pid, "SIGCONT");
+    activeProcess.otterState = "running";
+    return true;
+  } catch {
+    return false;
+  }
 });
 
 /**

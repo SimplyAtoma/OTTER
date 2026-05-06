@@ -1163,6 +1163,7 @@ btnRecordedMoveMode.addEventListener("click", () => setInteractionMode(recordedE
 updateInteractionModeButtons();
 
 let isPaused = false;
+let copiedSelectionEntries: PieceEntry[] = [];
 
 function setTranscribingState(active: boolean) {
   btnTranscribe.hidden = active;
@@ -2655,12 +2656,20 @@ btnTranscribe.addEventListener("click", async () => {
 // Handle the "Pause / Resume" button
 btnPause.addEventListener("click", async () => {
   if (!isPaused) {
-    await otter.pauseTranscription();
+    const ok = await otter.pauseTranscription();
+    if (!ok) {
+      setStatus("Unable to pause transcription.", "error");
+      return;
+    }
     isPaused = true;
     btnPause.textContent = "▶ Resume";
     setStatus("Transcription paused.", "info");
   } else {
-    await otter.resumeTranscription();
+    const ok = await otter.resumeTranscription();
+    if (!ok) {
+      setStatus("Unable to resume transcription.", "error");
+      return;
+    }
     isPaused = false;
     btnPause.textContent = "⏸ Pause";
     setStatus("Transcribing…", "working");
@@ -3068,6 +3077,68 @@ function removeOneBreakline(): boolean {
   return true;
 }
 
+async function copySelection(): Promise<boolean> {
+  if (!activeEditor.pieceTable || activeEditor.selectedIndices.length === 0) return false;
+  const selected = new Set(uniqueSortedIndices(activeEditor.selectedIndices));
+  const view = getViewEntries(activeEditor.pieceTable);
+  copiedSelectionEntries = view
+    .filter((ve, idx) => selected.has(idx))
+    .map((ve) => ({ ...ve.entry }));
+  if (copiedSelectionEntries.length === 0) return false;
+
+  const clipboardText = copiedSelectionEntries.map((e) => e.word).join(" ").trim();
+  if (clipboardText) {
+    try {
+      await navigator.clipboard.writeText(clipboardText);
+    } catch {
+      // Clipboard access can be denied; keep in-app copy buffer regardless.
+    }
+  }
+  return true;
+}
+
+function pasteSelection(): boolean {
+  if (!activeEditor.pieceTable || copiedSelectionEntries.length === 0) return false;
+  const pt = activeEditor.pieceTable;
+  const currentEntries = getViewEntries(pt);
+  const selected = uniqueSortedIndices(activeEditor.selectedIndices);
+  const insertAt = selected.length ? selected[selected.length - 1] + 1 : currentEntries.length;
+
+  const stamp = Date.now();
+  const clones: PieceEntry[] = copiedSelectionEntries.map((entry, idx) => ({
+    ...entry,
+    id: `${entry.id}_copy_${stamp}_${idx}_${Math.floor(Math.random() * 1e6)}`,
+  }));
+
+  pt.addBuffer.push(...clones);
+  const addedView: ViewEntry[] = clones.map((entry) => ({
+    entry,
+    status: "added" as WordStatus,
+    visualIndex: 0,
+  }));
+  const reordered = currentEntries.slice(0, insertAt).concat(addedView, currentEntries.slice(insertAt));
+
+  const newPieces: Piece[] = [];
+  for (const ve of reordered) {
+    const inOriginal = pt.originalBuffer.indexOf(ve.entry) !== -1;
+    const source = inOriginal ? ("original" as const) : ("add" as const);
+    const buffer = source === "original" ? pt.originalBuffer : pt.addBuffer;
+    const offset = buffer.indexOf(ve.entry);
+    if (offset < 0) continue;
+    newPieces.push({
+      source,
+      offset,
+      length: 1,
+      status: ve.status,
+    });
+  }
+
+  pt.pieces = mergePieces(newPieces);
+  pt.modifiedAt = new Date().toISOString();
+  setSelectionRange(activeEditor, insertAt, insertAt + clones.length - 1);
+  return true;
+}
+
 
 /**
  * Remove (soft-delete) the currently selected words.
@@ -3464,8 +3535,9 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
   const isMeta = e.metaKey || e.ctrlKey;
+  const key = e.key.toLowerCase();
 
-  if (isMeta && !e.shiftKey && e.key === "z") {
+  if (isMeta && !e.shiftKey && key === "z") {
     e.preventDefault();
     if (performUndo(activeEditor)) {
       renderTranscript(activeEditor);
@@ -3475,7 +3547,7 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
     return;
   }
 
-  if (isMeta && e.shiftKey && e.key === "z") {
+  if (isMeta && e.shiftKey && key === "z") {
     e.preventDefault();
     if (performRedo(activeEditor)) {
       renderTranscript(activeEditor);
@@ -3485,13 +3557,35 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
     return;
   }
 
-  if (isMeta && e.key === "y") {
+  if (isMeta && key === "y") {
     e.preventDefault();
     if (performRedo(activeEditor)) {
       renderTranscript(activeEditor);
       updateEditButtonStates();
       if (activeEditor.kind === "imported") refreshDetailIfActive();
     }
+    return;
+  }
+
+  if (isMeta && !e.shiftKey && key === "c") {
+    e.preventDefault();
+    void copySelection();
+    return;
+  }
+
+  if (isMeta && !e.shiftKey && key === "v") {
+    e.preventDefault();
+    if (!activeEditor.pieceTable) return;
+    pushUndo(activeEditor);
+    if (!pasteSelection()) {
+      activeEditor.undoStack.pop();
+      return;
+    }
+    syncWordsFromPieceTable(activeEditor);
+    renderTranscript(activeEditor);
+    void refreshMainWavePreviewFromEdits();
+    updateEditButtonStates();
+    if (activeEditor.kind === "imported") refreshDetailIfActive();
     return;
   }
 
