@@ -66,8 +66,9 @@ class _PostEntry(TypedDict):
     fn: PostProcessorFn
 
 
-_TRANSCIBERS: Dict[str, _TranscriberEntry] = {}
+_TRANSCRIBERS: Dict[str, _TranscriberEntry] = {}
 _POSTS: Dict[str, _PostEntry] = {}
+_LOADED: bool = False  # to prevent double-loading of components
 
 
 # -----------------------------------------------------------------------------
@@ -83,11 +84,11 @@ def register_transcriber(
 ) -> Callable[[TranscriberFn], TranscriberFn]:
     """Decorator to register a transcriber function."""
     def _decorator(fn: TranscriberFn) -> TranscriberFn:
-        if id in _TRANSCIBERS:
+        if id in _TRANSCRIBERS:
             raise KeyError(f"Transcriber '{id}' already registered")
         info = ComponentInfo(id=id, label=label, kind="transcriber",
                              options_schema=options_schema, description=description)
-        _TRANSCIBERS[id] = {"info": info, "fn": fn}
+        _TRANSCRIBERS[id] = {"info": info, "fn": fn}
         return fn
     return _decorator
 
@@ -122,8 +123,12 @@ def load_components() -> None:
     Registration happens at import time as a side effect of importing the
     component modules.
     """
+    global _LOADED
+    if _LOADED:
+        return
     import otter_py.pipelines.transcribers  # noqa: F401
     import otter_py.pipelines.postprocessors  # noqa: F401
+    _LOADED = True
 
 def list_components() -> Dict[str, Any]:
     """
@@ -139,7 +144,7 @@ def list_components() -> Dict[str, Any]:
             "description": e["info"].description,
             "options_schema": e["info"].options_schema,
         }
-        for e in _TRANSCIBERS.values()
+        for e in _TRANSCRIBERS.values()
     ]
     posts = [
         {
@@ -165,7 +170,9 @@ def list_components() -> Dict[str, Any]:
 
 class PipelineSpec(TypedDict, total=False):
     transcriber: Dict[str, Any]  # {"id": "...", "opts": {...}}
+    # Ordered post-processing steps (not "postprocessors"; see otter_py.transcribe.read_spec)
     post: List[Dict[str, Any]]   # [{"id": "...", "opts": {...}}, ...]
+    postprocessors: List[Dict[str, Any]]  # backward-compatible alias for post
 
 
 def run_pipeline(
@@ -195,11 +202,11 @@ def run_pipeline(
     t_opts = t_spec.get("opts") or {}
     if not t_id:
         raise ValueError("Pipeline spec missing transcriber.id")
-    if t_id not in _TRANSCIBERS:
+    if t_id not in _TRANSCRIBERS:
         raise KeyError(f"Unknown transcriber '{t_id}'")
 
     # --- run transcriber
-    t_entry = _TRANSCIBERS[t_id]
+    t_entry = _TRANSCRIBERS[t_id]
     t0 = time.time()
     words, t_meta = t_entry["fn"](audio_path, t_opts, ctx)
     t_runtime = time.time() - t0
@@ -215,7 +222,13 @@ def run_pipeline(
     }
 
     # --- run post-processors in order
-    for p_spec in spec.get("postprocessors") or []:
+    # Support both keys:
+    # - "post" (internal canonical key)
+    # - "postprocessors" (spec file key used by sample JSON specs)
+    post_specs = spec.get("post")
+    if post_specs is None:
+        post_specs = spec.get("postprocessors") or []
+    for p_spec in post_specs:
         p_id = p_spec.get("id")
         p_opts = p_spec.get("opts") or {}
         if not p_id:

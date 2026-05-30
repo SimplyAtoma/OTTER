@@ -15,7 +15,7 @@ Options that take ms are explicitly named *_ms and converted internally.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 from otter_py.pipeline_registry import register_postprocessor, Word
 
@@ -61,11 +61,10 @@ def clean_word_timings(
         # 1) Clamp overlaps (w_end > n_start)
         if w_end > n_start:
             mid = (w_end + n_start) / 2.0
+            mid = max(mid, float(w["start"]))  # don't move start time
             w["end"] = mid
             n["start"] = mid
             overlaps_fixed += 1
-
-            # refresh the locals
             w_end = float(w["end"])
             n_start = float(n["start"])
 

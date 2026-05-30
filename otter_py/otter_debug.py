@@ -16,7 +16,8 @@ class DebugLevel(IntEnum):
 #   OTTER_DEBUG=0..4
 #   OTTER_DEBUG_TAGS=comma,separated,optional
 
-_DEBUG_LEVEL = DebugLevel(int(os.getenv("OTTER_DEBUG", "4")))
+# Default WARNING (2); set OTTER_DEBUG=3 (TRACE) or 4 (DETAIL) for verbose logs
+_DEBUG_LEVEL = DebugLevel(int(os.getenv("OTTER_DEBUG", "2")))
 
 _DEBUG_TAGS = {
     tag.strip()

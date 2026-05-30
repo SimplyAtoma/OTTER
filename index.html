@@ -8,10 +8,13 @@
   </head>
   <body>
     <header>
-      <img src="assets/BannerIcon.png">
-
-      <button id="btnChoose">Choose Audio…</button>
-      <button id="btnTranscribe" disabled>Transcribe</button>
+      <div class="appBrand">
+        <img src="assets/BannerIcon.png" alt="OTTER">
+        <div class="brandText">
+          <div class="brandTitle">OTTER</div>
+          <div class="brandSubtitle">Transcript-Driven Audio Editing</div>
+        </div>
+      </div>
 
       <div class="statusArea">
         <div id="status"></div>
@@ -20,15 +23,46 @@
     </header>
 
     <main>
-      <!-- LEFT COLUMN: Waveforms + Dev Panel -->
       <section class="wavePane">
+        <section class="controlBoard" aria-label="Primary controls">
+          <div class="controlGroup">
+            <div class="controlGroupTitle">Source Audio</div>
+            <div class="controlRow">
+              <button id="btnChoose">Choose Audio...</button>
+              <button id="btnTranscribe" disabled>Transcribe</button>
+              <button id="btnPause" hidden>Pause</button>
+              <button id="btnStop" hidden>Stop</button>
+            </div>
+            <div class="controlRow">
+              <label for="modeSelect">Quality</label>
+              <select id="modeSelect"></select>
+            </div>
+          </div>
+
+          <div class="controlGroup">
+            <div class="controlGroupTitle">Recording</div>
+            <div class="controlRow controlRowWrap">
+              <label for="micSelect">Mic</label>
+              <select id="micSelect" title="Recording input device"></select>
+              <button type="button" id="btnRefreshMics" title="Refresh microphone list (may prompt for permission)">Refresh</button>
+            </div>
+            <div class="controlRow">
+              <button id="btnRecord" title="Record from selected microphone">Record</button>
+              <button id="btnRecordPause" hidden title="Pause recording">Pause Rec</button>
+              <button id="btnRecordStop" hidden title="Stop recording">Stop Rec</button>
+              <button id="btnTranscribeRecorded" disabled title="Transcribe recorded audio">Transcribe Rec</button>
+              <button id="btnStopRecorded" hidden title="Stop recorded transcription">Stop</button>
+            </div>
+          </div>
+        </section>
+
         <div class="waveBlock">
           <div id="waveform"></div>
 
           <div class="transport" id="primaryTransport">
             <div class="transportGroup left">
               <label>Play Track</label>
-              <button id="btnPlay" disabled aria-label="Play/Pause" title="Play/Pause">▶︎</button>
+              <button id="btnPlay" disabled aria-label="Play/Pause" title="Play/Pause">Play</button>
             </div>
             <div class="transportGroup center">
               <span id="time" class="numericReadout">0.00</span>
@@ -40,18 +74,15 @@
         </div>
 
         <hr id="detailDivider" hidden>
-        
+
         <div id="waveDetailPane" hidden>
           <div class="waveBlock">
-
             <div id="waveDetail"></div>
 
             <div class="transport" id="detailTransport">
               <div class="transportGroup left">
                 <label>Play Region</label>
-                <button id="btnDetailPlay" disabled
-                        aria-label="Play/Pause Detail"
-                        title="Play/Pause Detail">▶︎</button>
+                <button id="btnDetailPlay" disabled aria-label="Play/Pause Detail" title="Play/Pause Detail">Play</button>
               </div>
 
               <div class="transportGroup center">
@@ -60,16 +91,53 @@
 
               <div class="transportGroup right">
                 <label>Play Selection</label>
-                <button id="btnRegion" disabled
-                        aria-label="Play Region"
-                        title="Play Region">▷</button>
-                <span id="detailBounds" class="numericReadout">[— - —]</span>
+                <button id="btnRegion" disabled aria-label="Play Region" title="Play Region">Go</button>
+                <span id="detailBounds" class="numericReadout">[-- - --]</span>
               </div>
             </div>
           </div>
         </div>
 
-        <!-- Developer Panel (collapsed by default) -->
+        <hr id="importedWaveDivider" hidden>
+
+        <div id="importedWavePane" hidden>
+          <div class="waveBlock">
+            <div id="waveformImported"></div>
+
+            <div class="transport" id="importedTransport">
+              <div class="transportGroup left">
+                <label>Play Imported</label>
+                <button id="btnImportedPlay" disabled aria-label="Play/Pause Imported" title="Play/Pause Imported">Play</button>
+              </div>
+              <div class="transportGroup center">
+                <span id="importedTime" class="numericReadout">0.00</span>
+              </div>
+              <div class="transportGroup right">
+                <span id="importedLoadedFile">No imported audio staged</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <hr id="recordedWaveDivider" hidden>
+
+        <div id="recordedWavePane" hidden>
+          <div class="waveBlock">
+            <div id="waveformRecorded"></div>
+
+            <div class="transport" id="recordedTransport">
+              <div class="transportGroup left">
+                <label>Play Recording</label>
+                <button id="btnRecordedPlay" disabled aria-label="Play/Pause Recording" title="Play/Pause Recording">Play</button>
+              </div>
+              <div class="transportGroup center">
+                <span id="recordedTime" class="numericReadout">0.00</span>
+              </div>
+              <div class="transportGroup right"></div>
+            </div>
+          </div>
+        </div>
+
         <details id="devPanel" class="devPanel">
           <summary>
             <span class="devTitle">Developer Controls</span>
@@ -77,17 +145,13 @@
           </summary>
 
           <div class="devBody">
-            <!-- Spec controls -->
             <div class="devSection">
               <div class="devSectionTitle">Transcription Pipeline</div>
 
               <div class="devRow">
-                <label for="specSelect">Spec:</label>
-                <select id="specSelect"></select>
-
                 <label class="checkbox">
                   <input type="checkbox" id="chkCustomSpec" />
-                  Customize
+                  Customize JSON
                 </label>
               </div>
 
@@ -96,7 +160,6 @@
               </div>
             </div>
 
-            <!-- Transcription Log -->
             <div class="devSection">
               <div class="devSectionTitle">Transcription Log</div>
               <pre id="log"></pre>
@@ -105,11 +168,82 @@
         </details>
       </section>
 
-      <!-- RIGHT COLUMN: Transcript only -->
       <section class="textPane">
-        <div class="paneTitle">Transcript</div>
-        <div id="transcript"></div>
+        <section class="transcriptToolbar" aria-label="Transcript editing controls">
+          <div class="controlGroup">
+            <div class="controlGroupTitle">Edit Selection</div>
+            <div class="controlRow">
+              <button id="btnRemove" disabled title="Remove selected words (Delete)">Remove</button>
+              <button id="btnRestore" disabled title="Restore removed words">Restore</button>
+              <button id="btnUndo" disabled title="Undo">Undo</button>
+              <button id="btnRedo" disabled title="Redo">Redo</button>
+            </div>
+          </div>
+
+          <div class="controlGroup">
+            <div class="controlGroupTitle">Project Files</div>
+            <div class="controlRow">
+              <button id="btnSaveEdl" disabled title="Save EDL to file">Save EDL</button>
+              <button id="btnLoadEdl" title="Load EDL from file">Load EDL</button>
+              <button id="btnSaveEdits" disabled title="Export edited audio to new file">Save Edits</button>
+            </div>
+          </div>
+        </section>
+
+        <div class="paneTitle paneHeaderRow">
+          <span>Main Transcript</span>
+          <div class="modeToggleGroup" role="group" aria-label="Main transcript interaction mode">
+            <button id="btnImportedSelectMode" class="modeToggle isActive" type="button" aria-pressed="true" title="Highlight one or more words">
+              Select Words
+            </button>
+            <button id="btnImportedMoveMode" class="modeToggle" type="button" aria-pressed="false" title="Drag selected words to a new spot in the main transcript">
+              Move Words
+            </button>
+          </div>
+        </div>
+        <div id="transcriptImported" class="transcriptPane"></div>
+
+        <div class="paneTitle transcriptSubTitleRow">
+          <span>Imported Transcript</span>
+          <div class="paneHeaderActions">
+            <div class="modeToggleGroup" role="group" aria-label="Imported transcript interaction mode">
+              <button id="btnPendingImportSelectMode" class="modeToggle isActive" type="button" aria-pressed="true" title="Highlight one or more imported words">
+                Select Words
+              </button>
+              <button id="btnPendingImportMoveMode" class="modeToggle" type="button" aria-pressed="false" title="Drag selected imported words within the imported transcript">
+                Move Words
+              </button>
+            </div>
+            <button id="btnAddImportedToTranscript" disabled title="Append the edited imported transcript to the end of the main transcript">
+              Add to Transcript
+            </button>
+          </div>
+        </div>
+        <div id="transcriptPendingImported" class="transcriptPane"></div>
+
+        <div class="paneTitle transcriptSubTitleRow">
+          <span>Recorded Transcript</span>
+          <div class="paneHeaderActions">
+            <div class="modeToggleGroup" role="group" aria-label="Recorded transcript interaction mode">
+              <button id="btnRecordedSelectMode" class="modeToggle isActive" type="button" aria-pressed="true" title="Highlight one or more recorded words">
+                Select Words
+              </button>
+              <button id="btnRecordedMoveMode" class="modeToggle" type="button" aria-pressed="false" title="Drag selected recorded words within the recorded transcript">
+                Move Words
+              </button>
+            </div>
+            <button id="btnAddRecordedToTranscript" disabled title="Append the edited recorded transcript to the end of the main transcript">
+              Add to Transcript
+            </button>
+          </div>
+        </div>
+        <div id="transcriptRecorded" class="transcriptPane"></div>
       </section>
+
+      <div id="searchBar" hidden>
+        <input type="text" id="searchInput">
+        <button id="findClose">X</button>
+      </div>
     </main>
 
     <script src="./node_modules/wavesurfer.js/dist/wavesurfer.min.js"></script>

@@ -74,7 +74,7 @@ contextBridge.exposeInMainWorld("otter", {
    *   - { mode: "file", name: "default_spec.json" }
    *   - { mode: "json", jsonText: "{...}" }
    *
-   * @returns {Promise<Object>} Transcript data including word-level timings
+   * @returns {Promise<Object>} Transcript data including word-level timings, or `{ cancelled: true }` if stopped
    */
   transcribeAudio: (audioPath: string, spec?: { mode: "file"; name: string } | { mode: "json"; jsonText: string }) =>
     ipcRenderer.invoke("transcribe-audio", audioPath, spec),
@@ -177,5 +177,74 @@ contextBridge.exposeInMainWorld("otter", {
    */
   readDefaultSpec: (): Promise<string> =>
     ipcRenderer.invoke("read-spec-file", "default_spec.json"),
+
+  // -------------------------------------------------------------------------
+  // EDL (Edit Decision List) operations
+  // -------------------------------------------------------------------------
+
+  /**
+   * Save an EDL to a user-chosen file.
+   *
+   * @param {string} edlJson - Serialized EDL JSON
+   * @returns {Promise<string|null>} File path where saved, or null if canceled
+   */
+  saveEdl: (edlJson: string): Promise<string | null> =>
+    ipcRenderer.invoke("save-edl", edlJson),
+
+  /**
+   * Open a file dialog and load an EDL JSON file from disk.
+   *
+   * @returns {Promise<{path: string, content: string}|null>} EDL file info, or null if canceled
+   */
+  loadEdl: (): Promise<{ path: string; content: string } | null> =>
+    ipcRenderer.invoke("load-edl"),
+
+  /**
+   * Export edited audio from an EDL via ffmpeg.
+   *
+   * The original source audio is never modified — ffmpeg reads it and writes
+   * a new file containing only the non-muted segments in EDL order.
+   *
+   * @param {string} edlJson - Serialized EDL JSON
+   * @returns {Promise<string|null>} Output file path, or null if canceled
+   */
+  exportEdlAudio: (edlJson: string): Promise<string | null> =>
+    ipcRenderer.invoke("export-edl-audio", edlJson),
+
+  renderEditedPreview: (edlJson: string): Promise<string> =>
+    ipcRenderer.invoke("render-edited-preview", edlJson),
+  /**
+   * Render an "edited preview" WAV for fast playback in the renderer.
+   *
+   * This is intentionally a preview-only artifact:
+   * - It is derived from the current transcript/EDL state
+   * - It can be discarded and regenerated at any time
+   *
+   * The renderer uses this to update the main waveform after edits, without
+   * permanently exporting audio.
+   */
+
+  /**
+   * Save a microphone recording to disk and return a WAV path.
+   *
+   * The renderer records audio using MediaRecorder (typically webm/opus).
+   * We write the bytes to disk and convert to PCM WAV in the main process
+   * so the rest of the pipeline (WaveSurfer + transcription) can treat it
+   * like any other audio file.
+   */
+  saveMicRecording: (data: ArrayBuffer, mimeType: string): Promise<string> => {
+    const buf = Buffer.from(new Uint8Array(data));
+    return ipcRenderer.invoke("save-mic-recording", buf, mimeType);
+  },
+
+  /**
+   * Save a microphone recording to a user-chosen WAV path and return that path.
+   *
+   * @returns {Promise<string|null>} Saved WAV path, or null if canceled
+   */
+  saveMicRecordingAs: (data: ArrayBuffer, mimeType: string): Promise<string | null> => {
+    const buf = Buffer.from(new Uint8Array(data));
+    return ipcRenderer.invoke("save-mic-recording-as", buf, mimeType);
+  },
 
 });

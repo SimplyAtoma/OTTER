@@ -49,9 +49,9 @@ def adjust_short_words(
     max_len = float(opts.get("max_len", 0.30))
     min_extend = float(opts.get("min_extend", 0.10))
 
-    if len(words) < 3:
+    if not words:
         # Nothing to do; return a shallow copy
-        dbg("adjust_short_words: Less than 3 words, returning")
+        dbg("adjust_short_words: No words to adjust, returning")
         return list(words), {"adjusted": 0}
 
     out: List[Word] = []
@@ -60,13 +60,16 @@ def adjust_short_words(
     # Copy first word unchanged
     out.append(dict(words[0]))
 
+    # Interior words only: extending start uses the previous word as a clamp.
+    # The last word is left as ASR emitted it (no following segment to justify
+    # the same heuristic end-to-end).
     for i in range(1, len(words) - 1):
         prev = out[i - 1]
         w = dict(words[i])  # copy
         duration = w["end"] - w["start"]
 
         if duration < max_len:
-            # dbg(f"adjust_short_words: adjusting {w['word']}")
+            dbg(f"adjust_short_words: adjusting '{w['word']}' {duration:.3f}s → {w['start']:.3f}", DebugLevel.DETAIL)
             extend = max(duration, min_extend)
             new_start = max(w["start"] - extend, prev["end"])
 
@@ -76,8 +79,8 @@ def adjust_short_words(
 
         out.append(w)
 
-    # Copy last word unchanged
-    out.append(dict(words[-1]))
+    if len(words) > 1:
+        out.append(dict(words[-1]))
 
     return out, {
         "adjusted": adjusted,

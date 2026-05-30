@@ -1,7 +1,7 @@
 # OTTER Read-Only Proof of Concept
 ***Open Text Transcription Editing Resource***
 
-<image src="assets/icon.png" width="35%"> <image src="assets/Screenshot1.png" width="50%" align="right">
+<img src="assets/icon.png" width="35%" alt="OTTER icon"> <img src="assets/Screenshot1.png" width="50%" align="right" alt="OTTER screenshot">
 ## Overview
 
 This repository contains a Proof of Concept (PoC) for OTTER, the **O**pen **T**ext **T**ranscription **E**diting **R**esource. It is for use with CSUMB Computer Science Capstone Program.
@@ -48,6 +48,9 @@ The purpose of this application is to demonstrate:
 		+ Preload (secure IPC boundary)
 	+ Local Whisper-based ASR
 	+ Flexible pipeline for transcription process
+	+ Transcription results are cached on disk (keyed by audio content and pipeline spec); override with `--no-cache` or clear via `clear-cache` (see CLI below).
+	+ For long audio (~20+ minutes), the `whisperx_vad` transcriber can use a parallel execution path; other transcribers stay single-process.
+	+ The Python worker supports cooperative pause, resume, and cancel over stdin (used by the Electron UI during transcription).
 
 ### What This Prototype Intentionally Does Not Do
 
@@ -60,7 +63,7 @@ To keep the focus clear, this prototype does not attempt to:
 + Package into a self-contained application
 + Provide a polished end-user experience
 
-These are deliberate omissions and are appropriate topics for the full capstone project. The Capstone Proposal can be found here: [OTTER Proposal v1](doc/OTTER\ Proposal \v1.pdf). 
+These are deliberate omissions and are appropriate topics for the full capstone project. Additional documentation lives under [`doc/`](doc/) (for example [`UnderstandingElectron.md`](doc/UnderstandingElectron.md), [`Feature_Implementation_Guide.md`](doc/Feature_Implementation_Guide.md), and [`User_Stories.md`](doc/User_Stories.md)).
 
 ### Languages
 
@@ -99,8 +102,10 @@ In this example we converted a format commonly produced by Apple devices into a 
 + Python 3.10+
 + [Electron](https://www.electronjs.org)
 + [faster-whisper](https://pypi.org/project/faster-whisper/) for text transcription
-+ [whisperx](https://pypi.org/project/whisperx/) for text transcription
++ [whisperx](https://pypi.org/project/whisperx/) for text transcription (often brings in PyTorch and related deps)
 + [pydash](https://pypi.org/project/pydash/)
++ [soundfile](https://pypi.org/project/soundfile/) (audio duration and I/O in the pipeline runner)
++ [NumPy](https://numpy.org/) (used by the parallel WhisperX path)
 + [FFmpeg](https://ffmpeg.org):
 	+ Used for audio inspection and (optionally) format normalization
 	+ Also used indirectly by waveform rendering and audio decoding
@@ -111,39 +116,43 @@ In this example we converted a format commonly produced by Apple devices into a 
 
 ### Installation & Running
 
-1. Clone the repository
+1. Clone the repository (use your fork or upstream URL as appropriate)
 
 	```
 	git clone https://github.com/Austin-Metke/OTTER.git
 	cd OTTER
 	```
 
-1. Install Node dependencies
+2. Install Node dependencies
 
 	```
 	npm install
 	```
 
-2. Set up Python environment
+3. Set up Python environment
 
 	```
 	python3 -m venv .venv
-	source .venv/bin/activate
-	pip install pydash
-	pip install faster-whisper
-	pip install whisperx
 	```
 
-3. Install `ffmpeg`
+	Activate the venv: on macOS/Linux use `source .venv/bin/activate`; on Windows use `.venv\Scripts\activate`.
+
+	```
+	pip install pydash faster-whisper whisperx soundfile numpy
+	```
+
+	(`whisperx` and `faster-whisper` pull in their own stacks; install errors usually mean a missing system library or incompatible Python—see those projects’ docs.)
+
+4. Install `ffmpeg`
 
    ```
    # This is system dependent. For example, on the mac you can use homebrew:
    brew install ffmpeg
    ```
    
-4. Run the app
+5. Run the app
 
-    **NOTE**: This PoC is not a cleanly packaged app, you must run it in a context where your python virtul environment is already active. Using the steps above in a shell/terminal will have that effect.
+    **NOTE**: This PoC is not a cleanly packaged app. Run it from a shell where the Python virtual environment is already active, or ensure `python`/`python3` on your PATH can import `otter_py` (the Electron main process prefers `.venv` when present: `Scripts\python.exe` on Windows, `bin/python3` on Unix).
 
 	```
 	npm start
@@ -165,13 +174,26 @@ In this example we converted a format commonly produced by Apple devices into a 
 1. During playback, a separate playhead highlight moves word-by-word and does not change the selection.
 1. Developer Tools
     + Use the Developer Tools to look at the log from the transcription pipeline
-	+ Select a pre-configured transcription pipeline or enter a custom specification.
-	+ If no explicit selection is made, a default pipeline will be used.
-	+ All pipelines are stored in `otter_py/sample_specs`. Any `json` file placed in that folder will be presented as a pipeline specification in the app
+	+ Select a preset from `otter_py/sample_specs` (every `.json` file in that folder is listed) or enter a custom pipeline specification.
+	+ When no preset is selected, `default_spec.json` is used (currently `whisperx_vad` plus several post-processors—see that file).
+
+### Transcription CLI (Python)
+
+The Electron app invokes the pipeline as a module from the repo root:
+
+`python -m otter_py.transcribe <command>`
+
+- `list` — print registered transcribers and post-processors (JSON on stdout).
+- `run --audio <path> (--spec-file <path> | --spec-json '<json>')` — run a pipeline; progress lines go to stderr as `PROGRESS:NN`.
+- `run ... --no-cache` — bypass the filesystem cache.
+- `run ... --emit-meta` — emit full `{ words, meta }` instead of trimming to words plus `language`.
+- `clear-cache` — delete cached pipeline results (cache lives under the system temp dir, or set `OTTER_CACHE_DIR`).
+
+By default, `run` prints JSON on stdout with `words` and a detected `language` string (metadata is otherwise omitted for a smaller payload). The app parses this the same way.
 
 ## Architectural Notes
 
-The system is broken into two primary components: the app and the thranscription pipeline. As discussed, the app uses Electron as its basis. Please see [Understanding Electron](doc/UnderstandingElectron.md) for more details on how the app is organized.
+The system is broken into two primary components: the app and the transcription pipeline. As discussed, the app uses Electron as its basis. Please see [Understanding Electron](doc/UnderstandingElectron.md) for more details on how the app is organized.
 
 The Electron sources are written in TypeScript under `src/` and compiled to `dist/` during `npm start`.
 Main and preload compile to CommonJS (Node context), while the renderer compiles to ES modules (browser context). This avoids `exports`/`require` issues in the renderer.
@@ -184,16 +206,18 @@ Even with good transcription and post-processing, transcript timing is treated a
 
 ### Transcription Pipeline
 
-The transcription pipleline consists of a primary transcription step followed by zero or more post-processing steps which may improve accuracy of the transcript and / or alignment of the transcript to the audio. There is a collection of different transcribers and post-processors available and more will be added as part of the Capstone project. For a given run of the process, the transcription pipleline accepts a JSON structure that describes which transcription component to use and which post-processors to apply in which order. It also allows parameters for each to be specified.
+The transcription pipeline consists of a primary transcription step followed by zero or more post-processing steps which may improve accuracy of the transcript and / or alignment of the transcript to the audio. There is a collection of different transcribers and post-processors available and more will be added as part of the Capstone project. For a given run, the pipeline accepts a JSON structure that describes which transcription component to use and which post-processors to apply in which order, with parameters for each. The post-processor list may use the key `"postprocessors"` (as in the sample specs) or `"post"` (canonical alias); both are accepted.
 
 The following components are provided as part of the PoC:
 
 + Transcription
-	+ **faster_whisper**: An implementation using the `faster-whisper` package. quite a few parameters may be set using the pipeline configuration with no code changes needed. For example, the model size may be changed.
+	+ **faster_whisper**: An implementation using the `faster-whisper` package. Many parameters may be set using the pipeline configuration with no code changes needed. For example, the model size may be changed.
 	+ **whisperx_vad**: An implementation using the `whisperx` package along with the `Silero` aligner. Again, many options may be specified including model size.
 + Post-processing
-	+ **clean_word\_timings**:  Normalizes adjacent word boundaries to remove small overlaps and close tiny gaps.This improves selection/playback behavior by ensuring word boundaries are "tight" and consistent.
-	+ **adjust_short\_words**: Heuristic pass that expands very short words by extending their start time leftward, without overlapping the previous word.
+	+ **clean_word_timings**: Normalizes adjacent word boundaries to remove small overlaps and close tiny gaps. This improves selection/playback behavior by ensuring word boundaries are tight and consistent.
+	+ **adjust_short_words**: Heuristic pass that expands very short words by extending their start time leftward, without overlapping the previous word.
+	+ **filter_fillers**: Removes common filler words (e.g. "uh", "um"), optionally only when confidence is below a threshold.
+	+ **filter_low_confidence_words**: Removes or replaces words below a confidence threshold (words without scores can be kept or dropped per options).
 
 The following JSON structure illustrates a pipeline configuration that uses the `faster_whisper` transcriber followed by the `adjust_short_words` and `clean_word_timings` post-processors.
 
