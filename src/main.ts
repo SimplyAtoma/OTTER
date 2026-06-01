@@ -86,6 +86,7 @@ type ManagedTranscriptionProcess = ChildProcess & {
 let win: BrowserWindow | null = null;
 let activeProcess: ManagedTranscriptionProcess | null = null;
 const repoRoot = path.join(__dirname, "..");
+const AUDIO_EXTS = new Set([".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"]);
 
 function ensureDir(p: string) {
   fs.mkdirSync(p, { recursive: true });
@@ -133,6 +134,45 @@ app.on("window-all-closed", () => {
   app.quit();
 });
 
+//==========================================================================
+
+function assertSafeAudioPath(inputPath: string): string {
+  if (typeof inputPath !== "string" || inputPath.includes("\0")) {
+    throw new Error("Invalid audio path");
+  }
+
+  const resolved = path.resolve(inputPath);
+  const ext = path.extname(resolved).toLowerCase();
+
+  if (!AUDIO_EXTS.has(ext)) {
+    throw new Error("Unsupported audio file type");
+  }
+
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile()) {
+    throw new Error("Audio path is not a file");
+  }
+
+  return resolved;
+}
+
+function assertSafeSegment(start: unknown, end: unknown) {
+  const s = Number(start);
+  const e = Number(end);
+
+  if (!Number.isFinite(s) || !Number.isFinite(e) || s < 0 || e <= s) {
+    throw new Error("Invalid EDL segment");
+  }
+
+  if (e - s > 60 * 60 * 6) {
+    throw new Error("EDL segment too long");
+  }
+
+  return { start: s, end: e };
+}
+
+//==========================================================================
+
 /**
  * IPC: Show a native file picker and return the selected audio file path.
  *
@@ -146,8 +186,7 @@ ipcMain.handle("choose-audio-file", async () => {
     title: "Choose an audio file",
     properties: ["openFile"],
     filters: [
-      { name: "Audio", extensions: ["wav"] },
-      { name: "All Files", extensions: ["*"] }
+      { name: "Audio", extensions: ["wav","mp3","m4a"] }
     ]
   };
 
@@ -172,12 +211,14 @@ ipcMain.handle("choose-audio-file", async () => {
  * @returns {Promise<{start_time:number, sample_rate:(number|null)}>}
  */
 ipcMain.handle("probe-audio", async (_event: IpcMainInvokeEvent, inputPath: string) => {
+  const audioPath = assertSafeAudioPath(inputPath);
+
   const args = [
     "-v", "error",
     "-select_streams", "a:0",
     "-show_entries", "stream=start_time,sample_rate",
     "-of", "json",
-    inputPath
+    audioPath
   ];
 
   const child = spawn("ffprobe", args);
@@ -439,15 +480,16 @@ ipcMain.handle(
     } else {
       specFile = path.join(repoRoot, "otter_py", "sample_specs", "default_spec.json");
     }
+    const safeAudioPath =  assertSafeAudioPath(audioPath);
 
     const { logLine: workerCacheLog } = buildPythonWorkerEnv();
     event.sender.send(
       "transcribe-log",
-      `INFO:PythonWorker=enabled | Audio=${audioPath}\n` + workerCacheLog
+      `INFO:PythonWorker=enabled | Audio=${safeAudioPath}\n` + workerCacheLog
     );
 
     const python = getPythonPath();
-    const argv = ["-m", "otter_py.transcribe", "run", "--audio", audioPath];
+    const argv = ["-m", "otter_py.transcribe", "run", "--audio", safeAudioPath];
     if (specFile) argv.push("--spec-file", specFile);
     if (specJson) argv.push("--spec-json", specJson);
 
@@ -710,7 +752,7 @@ ipcMain.handle(
       wavPath,
     ];
     await runFfmpeg(args);
-    return wavPath;
+    return assertSafeAudioPath(wavPath);
   }
 );
 
@@ -751,7 +793,7 @@ ipcMain.handle(
       result.filePath,
     ];
     await runFfmpeg(args);
-    return result.filePath;
+    return assertSafeAudioPath(result.filePath);
   }
 );
 
@@ -778,6 +820,8 @@ ipcMain.handle(
     startSec: number,
     durSec: number
   ) => {
+    //make the path for audiofile safe
+    const safeAudioPath = assertSafeAudioPath(audioPath);
     // Store snippets in a temp-ish folder that exists for packaged/dev
     const outDir = path.join(app.getPath("userData"), "snippets");
     fs.mkdirSync(outDir, { recursive: true });
@@ -792,13 +836,14 @@ ipcMain.handle(
       `snippet_${Date.now()}_${Math.floor(Math.random() * 1e6)}.wav`
     );
 
+
     // ffmpeg: extract small WAV segment (PCM)
     const args = [
       "-hide_banner",
       "-y",
       "-ss", String(safeStart),
       "-t", String(safeDur),
-      "-i", audioPath,
+      "-i", safeAudioPath,
       "-c:a", "pcm_s16le",
       outPath
     ];
@@ -878,7 +923,12 @@ ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJs
   }
 
   const getSource = (e: any) => (typeof e.sourceFile === "string" ? e.sourceFile : edl.sourceFile);
-  const sources = Array.from(new Set(entries.map(getSource)));
+  //santize the inputs
+  const safeEntries = entries.map((e:any) => ({
+    sourceFile: assertSafeAudioPath(getSource(e)),
+    segment: assertSafeSegment(e.sourceStart, e.sourceEnd),
+  }));
+  const sources = Array.from(new Set(safeEntries.map(e => e.sourceFile)));
 
   const inputArgs: string[] = [];
   for (const src of sources) {
@@ -889,11 +939,11 @@ ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJs
   const concatInputs: string[] = [];
 
   for (let i = 0; i < entries.length; i++) {
-    const e: any = entries[i];
-    const src = getSource(e);
-    const inputIndex = Math.max(0, sources.indexOf(src));
+    const e: any = safeEntries[i];
+    const inputIndex = sources.indexOf(e.sourceFile);
+    const {start, end} = e.segment;
     filterParts.push(
-      `[${inputIndex}:a]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
+      `[${inputIndex}:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${i}]`
     );
     concatInputs.push(`[a${i}]`);
   }
@@ -902,7 +952,7 @@ ipcMain.handle("render-edited-preview", async (_event: IpcMainInvokeEvent, edlJs
     filterParts.join("; ") +
     "; " +
     concatInputs.join("") +
-    `concat=n=${entries.length}:v=0:a=1[out]`;
+    `concat=n=${safeEntries.length}:v=0:a=1[out]`;
 
   const outDir = path.join(app.getPath("userData"), "preview_audio");
   fs.mkdirSync(outDir, { recursive: true });
@@ -962,7 +1012,12 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
   //   [0]atrim=start=S1:end=E1,asetpts=PTS-STARTPTS[a1];
   //   [a0][a1]concat=n=2:v=0:a=1[out]
   const getSource = (e: any) => (typeof e.sourceFile === "string" ? e.sourceFile : edl.sourceFile);
-  const sources = Array.from(new Set(entries.map(getSource)));
+  const safeEntries = entries.map((e: any) => ({
+    sourceFile: assertSafeAudioPath(getSource(e)),
+    segment: assertSafeSegment(e.sourceStart, e.sourceEnd),
+  }));
+
+  const sources = Array.from(new Set(safeEntries.map(e => e.sourceFile)));
 
   const inputArgs: string[] = [];
   for (const src of sources) {
@@ -972,21 +1027,23 @@ ipcMain.handle("export-edl-audio", async (_event: IpcMainInvokeEvent, edlJson: s
   const filterParts: string[] = [];
   const concatInputs: string[] = [];
 
-  for (let i = 0; i < entries.length; i++) {
-    const e: any = entries[i];
-    const src = getSource(e);
-    const inputIndex = Math.max(0, sources.indexOf(src));
-    filterParts.push(
-      `[${inputIndex}:a]atrim=start=${e.sourceStart}:end=${e.sourceEnd},asetpts=PTS-STARTPTS[a${i}]`
-    );
-    concatInputs.push(`[a${i}]`);
-  }
+  for (let i = 0; i < safeEntries.length; i++) {
+  const e = safeEntries[i];
+  const inputIndex = sources.indexOf(e.sourceFile);
+  const { start, end } = e.segment;
+
+  filterParts.push(
+    `[${inputIndex}:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${i}]`
+  );
+
+  concatInputs.push(`[a${i}]`);
+}
 
   const filterComplex =
     filterParts.join("; ") +
     "; " +
     concatInputs.join("") +
-    `concat=n=${entries.length}:v=0:a=1[out]`;
+    `concat=n=${safeEntries.length}:v=0:a=1[out]`;
 
   const args = [
     "-hide_banner",
