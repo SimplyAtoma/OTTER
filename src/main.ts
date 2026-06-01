@@ -33,6 +33,7 @@
 import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import { spawn, spawnSync, ChildProcess } from "child_process";
 
 type TranscribeSpec =
@@ -87,6 +88,7 @@ let win: BrowserWindow | null = null;
 let activeProcess: ManagedTranscriptionProcess | null = null;
 const repoRoot = path.join(__dirname, "..");
 const AUDIO_EXTS = new Set([".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"]);
+const selectedAudioFiles = new Map<string,string>();
 
 function ensureDir(p: string) {
   fs.mkdirSync(p, { recursive: true });
@@ -171,6 +173,19 @@ function assertSafeSegment(start: unknown, end: unknown) {
   return { start: s, end: e };
 }
 
+function createAudioFileId(filePath: string): string {
+  const safePath = assertSafeAudioPath(filePath);
+  const id = crypto.randomUUID();
+  selectedAudioFiles.set(id, safePath);
+  return id;
+}
+
+function getAudioPathById(id: string): string {
+  const filePath = selectedAudioFiles.get(id);
+  if (!filePath) throw new Error("Unknown audio file id");
+  return assertSafeAudioPath(filePath);
+}
+
 //==========================================================================
 
 /**
@@ -195,7 +210,12 @@ ipcMain.handle("choose-audio-file", async () => {
     : await dialog.showOpenDialog(options);
 
   if (result.canceled || result.filePaths.length === 0) return null;
-  return result.filePaths[0];
+  const filePath = result.filePaths[0];
+  const id = createAudioFileId(filePath);
+  return{
+    id,
+    name: path.basename(filePath),
+  };
 });
 
 /**
@@ -211,7 +231,7 @@ ipcMain.handle("choose-audio-file", async () => {
  * @returns {Promise<{start_time:number, sample_rate:(number|null)}>}
  */
 ipcMain.handle("probe-audio", async (_event: IpcMainInvokeEvent, inputPath: string) => {
-  const audioPath = assertSafeAudioPath(inputPath);
+  const audioPath = getAudioPathById(inputPath);
 
   const args = [
     "-v", "error",
@@ -480,7 +500,7 @@ ipcMain.handle(
     } else {
       specFile = path.join(repoRoot, "otter_py", "sample_specs", "default_spec.json");
     }
-    const safeAudioPath =  assertSafeAudioPath(audioPath);
+    const safeAudioPath =  getAudioPathById(audioPath);
 
     const { logLine: workerCacheLog } = buildPythonWorkerEnv();
     event.sender.send(
@@ -821,7 +841,7 @@ ipcMain.handle(
     durSec: number
   ) => {
     //make the path for audiofile safe
-    const safeAudioPath = assertSafeAudioPath(audioPath);
+    const safeAudioPath = getAudioPathById(audioPath);
     // Store snippets in a temp-ish folder that exists for packaged/dev
     const outDir = path.join(app.getPath("userData"), "snippets");
     fs.mkdirSync(outDir, { recursive: true });

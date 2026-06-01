@@ -123,14 +123,20 @@ type EdlV1Entry = {
   sourceFile?: string;
 };
 
+type AudioRef ={
+  id: string;
+  name: string;
+}
+
 type OtterApi = {
-  chooseAudioFile: () => Promise<string | null>;
-  transcribeAudio: (audioPath: string, spec?: TranscribeSpec) => Promise<TranscribeAudioResult>;
+  chooseAudioFile: () => Promise<AudioRef | null>;
+  readAudioAsArrayBuffer: (audioId: string)=> Promise<ArrayBuffer>;
+  readFileAsArrayBuffer: (filePath: string)=> Promise<ArrayBuffer>;
+  transcribeAudio: (audioId: string, spec?: TranscribeSpec) => Promise<TranscribeAudioResult>;
   onTranscribeLog: (cb: (msg: string) => void) => void;
-  probeAudio: (audioPath: string) => Promise<{ start_time: number; sample_rate: number | null }>;
+  probeAudio: (audioId: string) => Promise<{ start_time: number; sample_rate: number | null }>;
   onTranscribeProgress: (cb: (pct: number) => void) => void;
-  makeSnippet: (audioPath: string, startSec: number, durSec: number) => Promise<string>;
-  readFileAsArrayBuffer: (filePath: string) => Promise<ArrayBuffer>;
+  makeSnippet: (audioId: string, startSec: number, durSec: number) => Promise<string>;
   listSpecFiles: () => Promise<string[]>;
   readSpecFile: (name: string) => Promise<string>;
   readDefaultSpec: () => Promise<string>;
@@ -262,7 +268,8 @@ type InteractionMode = "select" | "move";
 type EditorState = {
   kind: EditorKind;
   paneEl: HTMLDivElement;
-  audioPath: string | null;
+  audioId: string | null;
+  audioName: string | null;
   words: TranscriptWord[];
   pieceTable: PieceTableData | null;
   undoStack: UndoSnapshot[];
@@ -286,25 +293,27 @@ let isDragging = false;
  *
  * What we snapshot:
  * - **Transcript content state**: piece-table buffers + pieces (when present) and `editor.words`.
- * - **Audio association**: `audioPath` (used to rehydrate waveforms / source file mapping).
+ * - **Audio association**: `audioId` (used to rehydrate waveforms / source file mapping).
  * - **Optional side snapshots**: during "append to main", we also capture the source pane so
  *   a single undo step can restore the cleared pane (transcript + waveform).
  *
  * What we intentionally do NOT snapshot:
  * - WaveSurfer internal playback state (playhead time, zoom, etc.). Those are derived from
- *   `audioPath` + transcript and are reloaded by UI code after undo/redo.
+ *   `audioId` + transcript and are reloaded by UI code after undo/redo.
  * - UI-only DOM state (highlight spans, drop indicators). Those are regenerated on render.
  */
 type UndoSnapshot =
   | {
       kind: "empty";
-      audioPath: string | null;
+      audioId: string | null;
+      audioName: string | null;
       words: TranscriptWord[];
       side?: Partial<Record<EditorKind, UndoSnapshot>>;
     }
   | {
       kind: "pt";
-      audioPath: string | null;
+      audioId: string | null;
+      audioName: string | null;
       pieces: Piece[];
       originalBuffer: PieceEntry[];
       addBuffer: PieceEntry[];
@@ -338,7 +347,8 @@ function setActiveEditor(next: EditorState) {
 }
 
 // The most recently chosen audio file to transcribe (import flow).
-let pendingImportAudioPath: string | null = null;
+let pendingImportAudioId: string | null = null;
+let pendingImportAudioName: string |null = null;
 
 //
 // Utility Functions
@@ -486,14 +496,16 @@ function snapshotState(editor: EditorState): UndoSnapshot {
   if (!editor.pieceTable) {
     return {
       kind: "empty",
-      audioPath: editor.audioPath,
+      audioId: editor.audioId,
+      audioName: editor.audioName,
       words: editor.words.map(w => ({ ...w })),
     };
   }
   const pt = editor.pieceTable;
   return {
     kind: "pt",
-    audioPath: editor.audioPath,
+    audioId: editor.audioId,
+    audioName: editor.audioName,
     pieces: pt.pieces.map(p => ({ ...p })),
     originalBuffer: pt.originalBuffer.map(e => ({ ...e })),
     addBuffer: pt.addBuffer.map(e => ({ ...e })),
@@ -511,7 +523,8 @@ function pushUndo(editor: EditorState): void {
 }
 
 function restoreSnapshot(editor: EditorState, snap: UndoSnapshot): void {
-  editor.audioPath = snap.audioPath ?? null;
+  editor.audioId = snap.audioId ?? null;
+  editor.audioName = snap.audioName ?? null;
   editor.words = snap.words.map(w => ({ ...w }));
   if (snap.kind === "empty") {
     editor.pieceTable = null;
@@ -611,9 +624,9 @@ async function refreshDetailIfActive(): Promise<void> {
   const endIdx2 = Math.min(detailSelEnd, currentDetailEditor.words.length - 1);
   const viewEntries = currentDetailEditor.pieceTable ? getViewEntries(currentDetailEditor.pieceTable) : [];
   const rangeEntries = viewEntries.slice(detailSelStart, endIdx2 + 1);
-  const rangeSourceFile = rangeEntries[0]?.entry.sourceFile || currentDetailEditor.audioPath;
+  const rangeSourceFile = rangeEntries[0]?.entry.sourceFile || currentDetailEditor.audioId;
   if (!rangeSourceFile) return;
-  const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || currentDetailEditor.audioPath) !== rangeSourceFile);
+  const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || currentDetailEditor.audioId) !== rangeSourceFile);
   if (mixedSources) return;
   const rangeStart = Number(currentDetailEditor.words[detailSelStart].start);
   const rangeEnd = Number(currentDetailEditor.words[endIdx2].end);
@@ -1023,7 +1036,8 @@ const statusEl = mustGetEl<HTMLDivElement>("status");
 importedEditor = {
   kind: "imported",
   paneEl: transcriptImportedEl,
-  audioPath: null,
+  audioId: null,
+  audioName: null,
   words: [],
   pieceTable: null,
   undoStack: [],
@@ -1038,7 +1052,8 @@ importedEditor = {
 pendingImportEditor = {
   kind: "pending-import",
   paneEl: transcriptPendingImportedEl,
-  audioPath: null,
+  audioId: null,
+  audioName: null,
   words: [],
   pieceTable: null,
   undoStack: [],
@@ -1053,7 +1068,8 @@ pendingImportEditor = {
 recordedEditor = {
   kind: "recorded",
   paneEl: transcriptRecordedEl,
-  audioPath: null,
+  audioId: null,
+  audioName: null,
   words: [],
   pieceTable: null,
   undoStack: [],
@@ -1181,7 +1197,8 @@ function setRecordedTranscribingState(active: boolean) {
 }
 
 function resetEditorState(editor: EditorState) {
-  editor.audioPath = null;
+  editor.audioId = null;
+  editor.audioName = null;
   editor.words = [];
   editor.pieceTable = null;
   editor.undoStack = [];
@@ -1200,7 +1217,7 @@ function resetEditorState(editor: EditorState) {
  * - The user appends the staged transcript into the main transcript.
  *
  * Invariants after this returns:
- * - `pendingImportEditor` has no audioPath, words, pieceTable, or undo history.
+ * - `pendingImportEditor` has no audioId, words, pieceTable, or undo history.
  * - Imported waveform pane is hidden and playback controls are disabled.
  */
 function clearPendingImportedView() {
@@ -1222,7 +1239,7 @@ function clearPendingImportedView() {
  * or when resetting the recorded state due to workflow changes.
  *
  * Invariants after this returns:
- * - `recordedEditor` has no audioPath, words, pieceTable, or undo history.
+ * - `recordedEditor` has no audioId, words, pieceTable, or undo history.
  * - Recorded waveform pane is hidden and playback/transcribe controls are disabled.
  */
 function clearRecordedView() {
@@ -1619,10 +1636,10 @@ function buildPreviewWordTimesFromActiveEntries(activeEntries: ViewEntry[]): Arr
  * - Pauses any current playback before loading.
  * - Enables/disables the main play control based on load completion.
  */
-async function loadMainWaveFromPath(filePath: string) {
+async function loadMainWaveFromPath(audioId: string) {
   btnPlay.disabled = true;
   if (ws.isPlaying()) ws.pause();
-  const ab = await otter.readFileAsArrayBuffer(filePath);
+  const ab = await otter.readAudioAsArrayBuffer(audioId);
   const blob = new Blob([ab]);
   await ws.loadBlob(blob);
   btnPlay.disabled = false;
@@ -1646,7 +1663,7 @@ async function loadMainWaveFromPath(filePath: string) {
  *   word indices while in edited preview mode.
  */
 async function refreshMainWavePreviewFromEdits() {
-  const baseAudio = importedEditor.audioPath;
+  const baseAudio = importedEditor.audioId;
   if (!baseAudio || !importedEditor.pieceTable) {
     resetEditedPreviewState();
     clearMainWave();
@@ -1955,7 +1972,7 @@ function renderTranscript(editor: EditorState) {
 
       const selectedViewEntries = editor.pieceTable ? getViewEntries(editor.pieceTable) : [];
       const clickedEntry = selectedViewEntries[i]?.entry;
-      const clickedSourceFile = clickedEntry?.sourceFile || editor.audioPath;
+      const clickedSourceFile = clickedEntry?.sourceFile || editor.audioId;
       if (!clickedSourceFile) return;
 
       if (editor.kind === "imported") {
@@ -1979,7 +1996,7 @@ function renderTranscript(editor: EditorState) {
       }
       const rangeEntries = selectedViewEntries.slice(rangeStartIdx, rangeEndIdx + 1);
       const rangeSourceFile = rangeEntries[0]?.entry.sourceFile || clickedSourceFile;
-      const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || editor.audioPath) !== rangeSourceFile);
+      const mixedSources = rangeEntries.some((ve) => (ve.entry.sourceFile || editor.audioId) !== rangeSourceFile);
       if (mixedSources) {
         appendLog("INFO:Detail playback is only available for selections from a single source audio.\n");
         return;
@@ -2437,7 +2454,7 @@ type TranscriptionJobKind = "pending-import" | "recorded";
 type TranscriptionJob = {
   id: string;
   kind: TranscriptionJobKind;
-  audioPath: string;
+  audioId: string;
   specArg: TranscribeSpec;
   enqueuedAt: number;
 };
@@ -2451,7 +2468,7 @@ let isTranscriptionRunning = false;
  */
 function describeJob(job: TranscriptionJob): string {
   const label = job.kind === "pending-import" ? "Imported audio" : "Recorded audio";
-  const fname = job.audioPath.split("/").pop() ?? job.audioPath;
+  const fname = job.audioId.split("/").pop() ?? job.audioId;
   return `${label} (${fname})`;
 }
 
@@ -2483,9 +2500,9 @@ async function runTranscriptionQueue(): Promise<void> {
       appendLog(`\n=== Transcription job started: ${describeJob(job)} ===\n`);
 
       if (job.kind === "pending-import") {
-        await transcribePendingImportAudio(job.audioPath, job.specArg);
+        await transcribePendingImportAudio(job.audioId, job.specArg);
       } else {
-        await transcribeRecordedAudio(job.audioPath, job.specArg);
+        await transcribeRecordedAudio(job.audioId, job.specArg);
       }
     }
   } finally {
@@ -2500,11 +2517,11 @@ async function runTranscriptionQueue(): Promise<void> {
  * - If another job is running (or already queued), we immediately notify the user
  *   that this job is waiting.
  */
-function enqueueTranscription(kind: TranscriptionJobKind, audioPath: string, specArg: TranscribeSpec): void {
+function enqueueTranscription(kind: TranscriptionJobKind, audioId: string, specArg: TranscribeSpec): void {
   const job: TranscriptionJob = {
     id: crypto.randomUUID(),
     kind,
-    audioPath,
+    audioId,
     specArg,
     enqueuedAt: Date.now(),
   };
@@ -2554,7 +2571,7 @@ async function transcribePendingImportAudio(toTranscribe: string, specArg: Trans
     const langSuffix = lang ? `, lang=${lang}` : "";
     setStatus(`Transcript ready (${newWords.length} words${langSuffix})`, "success");
 
-    pendingImportEditor.audioPath = toTranscribe;
+    pendingImportEditor.audioId = toTranscribe;
     pendingImportEditor.words = newWords;
     pendingImportEditor.pieceTable = buildPieceTableFromTranscript(newWords, toTranscribe);
     pendingImportEditor.undoStack = [];
@@ -2567,7 +2584,7 @@ async function transcribePendingImportAudio(toTranscribe: string, specArg: Trans
 
     renderTranscript(pendingImportEditor);
     setActiveEditor(pendingImportEditor);
-    pendingImportAudioPath = null;
+    pendingImportAudioId = null;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.toLowerCase().includes("cancelled")) {
@@ -2578,7 +2595,7 @@ async function transcribePendingImportAudio(toTranscribe: string, specArg: Trans
     }
   } finally {
     btnChoose.disabled = false;
-    btnTranscribe.disabled = pendingImportAudioPath == null;
+    btnTranscribe.disabled = pendingImportAudioId == null;
     setTranscribingState(false);
     progressEl.hidden = true;
   }
@@ -2595,7 +2612,7 @@ async function transcribePendingImportAudio(toTranscribe: string, specArg: Trans
  * Input:
  * - `specArg` is a snapshot taken at the time the user clicked Transcribe Rec.
  */
-async function transcribeRecordedAudio(audioPath: string, specArg: TranscribeSpec): Promise<void> {
+async function transcribeRecordedAudio(audioId: string, specArg: TranscribeSpec): Promise<void> {
   btnTranscribeRecorded.disabled = true;
   setRecordedTranscribingState(true);
   setStatus("Transcribing recording…", "working");
@@ -2603,7 +2620,7 @@ async function transcribeRecordedAudio(audioPath: string, specArg: TranscribeSpe
   progressEl.hidden = false;
 
   try {
-    const result = await otter.transcribeAudio(audioPath, specArg);
+    const result = await otter.transcribeAudio(audioId, specArg);
     if (result && typeof result === "object" && "cancelled" in result && (result as any).cancelled) {
       setStatus("Recording transcription cancelled.", "info");
       return;
@@ -2617,13 +2634,13 @@ async function transcribeRecordedAudio(audioPath: string, specArg: TranscribeSpe
 
     // Only apply if this recording is still the current one in the UI.
     // (User may have recorded a new clip while this job was queued.)
-    if (recordedEditor.audioPath !== audioPath) {
-      appendLog(`INFO: recorded transcription finished for a stale audioPath; ignoring UI apply.\n`);
+    if (recordedEditor.audioId !== audioId) {
+      appendLog(`INFO: recorded transcription finished for a stale audioId; ignoring UI apply.\n`);
       return;
     }
 
     recordedEditor.words = newWords;
-    recordedEditor.pieceTable = buildPieceTableFromTranscript(newWords, audioPath);
+    recordedEditor.pieceTable = buildPieceTableFromTranscript(newWords, audioId);
     recordedEditor.undoStack = [];
     recordedEditor.redoStack = [];
     recordedEditor.selectedIndices = [];
@@ -2648,7 +2665,7 @@ async function transcribeRecordedAudio(audioPath: string, specArg: TranscribeSpe
 
 // Handle the "Transcribe" button
 btnTranscribe.addEventListener("click", async () => {
-  const toTranscribe = pendingImportAudioPath;
+  const toTranscribe = pendingImportAudioId;
   if (!toTranscribe) return;
   enqueueTranscription("pending-import", toTranscribe, getActiveSpecArg());
 });
@@ -2732,7 +2749,7 @@ btnRecord.addEventListener("click", async () => {
         }
 
         // Show the recorded waveform + a separate transcribe button.
-        recordedEditor.audioPath = wavPath;
+        recordedEditor.audioId = wavPath;
         recordedEditor.words = [];
         recordedEditor.pieceTable = null;
         recordedEditor.undoStack = [];
@@ -2790,8 +2807,8 @@ btnRecordPause.addEventListener("click", () => {
 });
 
 btnTranscribeRecorded.addEventListener("click", async () => {
-  if (!recordedEditor.audioPath) return;
-  enqueueTranscription("recorded", recordedEditor.audioPath, getActiveSpecArg());
+  if (!recordedEditor.audioId) return;
+  enqueueTranscription("recorded", recordedEditor.audioId, getActiveSpecArg());
 });
 
 btnStopRecorded.addEventListener("click", async () => {
@@ -2812,28 +2829,33 @@ btnChoose.addEventListener("click", async () => {
   resetEditedPreviewState();
   setStatus("Choosing file…", "info");
 
-  const selectedPath = await otter.chooseAudioFile();
-  if (!selectedPath) {
+  const selected = await otter.chooseAudioFile();
+  if (!selected) {
     setStatus("File selection canceled.", "info");
     return;
   }
 
   clearPendingImportedView();
-  pendingImportAudioPath = selectedPath;
+  pendingImportAudioId = selected.id;
+  pendingImportAudioName = selected.name;
 
-  const fname = pendingImportAudioPath.split("/").pop() ?? pendingImportAudioPath;
-  setStatus(`Selected imported audio: ${fname}`, "success");
+  pendingImportEditor.audioId = selected.id;
+  pendingImportEditor.audioName = selected.name;
+
+  setStatus(`Selected imported audio: ${selected.name}`, "success");
 
   btnTranscribe.disabled = false;
 
   importedWavePane.hidden = false;
   importedWaveDivider.hidden = false;
-  importedLoadedFileEl.textContent = shortenFilenameMiddle(fname);
+  importedLoadedFileEl.textContent = shortenFilenameMiddle(selected.name);
   btnImportedPlay.disabled = true;
   importedTimeEl.textContent = "0.00";
-  const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
-  const blob = new Blob([ab]);
-  await wsImported.loadBlob(blob);
+
+
+  const ab = await otter.readAudioAsArrayBuffer(selected.id);
+  await wsImported.loadBlob(new Blob([ab]));
+
   btnImportedPlay.disabled = false;
   setImportedPlayIcon(false);
 });
@@ -3208,13 +3230,13 @@ btnUndo.addEventListener("click", () => {
 
     // Restore staged/recorded waveforms from current editor state
     void (async () => {
-      if (pendingImportEditor.audioPath) {
+      if (pendingImportEditor.audioId) {
         importedWavePane.hidden = false;
         importedWaveDivider.hidden = false;
-        importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
+        importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioId.split("/").pop() ?? pendingImportEditor.audioId));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
+          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioId);
           await wsImported.loadBlob(new Blob([importAb]));
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
@@ -3230,14 +3252,14 @@ btnUndo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = "No imported audio staged";
       }
 
-      if (recordedEditor.audioPath) {
+      if (recordedEditor.audioId) {
         recordedWavePane.hidden = false;
         recordedWaveDivider.hidden = false;
         btnRecordedPlay.disabled = true;
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
+          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioId);
           await wsRecorded.loadBlob(new Blob([recAb]));
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
@@ -3255,7 +3277,7 @@ btnUndo.addEventListener("click", () => {
       }
     })();
 
-    if (importedEditor.audioPath && importedEditor.pieceTable) {
+    if (importedEditor.audioId && importedEditor.pieceTable) {
       void refreshMainWavePreviewFromEdits();
     } else {
       clearMainWave();
@@ -3277,13 +3299,13 @@ btnRedo.addEventListener("click", () => {
 
     // Restore staged/recorded waveforms from current editor state
     void (async () => {
-      if (pendingImportEditor.audioPath) {
+      if (pendingImportEditor.audioId) {
         importedWavePane.hidden = false;
         importedWaveDivider.hidden = false;
-        importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
+        importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioId.split("/").pop() ?? pendingImportEditor.audioId));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
+          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioId);
           await wsImported.loadBlob(new Blob([importAb]));
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
@@ -3299,14 +3321,14 @@ btnRedo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = "No imported audio staged";
       }
 
-      if (recordedEditor.audioPath) {
+      if (recordedEditor.audioId) {
         recordedWavePane.hidden = false;
         recordedWaveDivider.hidden = false;
         btnRecordedPlay.disabled = true;
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
+          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioId);
           await wsRecorded.loadBlob(new Blob([recAb]));
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
@@ -3324,7 +3346,7 @@ btnRedo.addEventListener("click", () => {
       }
     })();
 
-    if (importedEditor.audioPath && importedEditor.pieceTable) {
+    if (importedEditor.audioId && importedEditor.pieceTable) {
       void refreshMainWavePreviewFromEdits();
     } else {
       clearMainWave();
@@ -3356,7 +3378,8 @@ function appendEditorToMain(sourceEditor: EditorState, sourcePrefix: string, suc
     // Make this undoable (restore empty main + restore the source pane we’re about to clear).
     const emptyMain: UndoSnapshot = {
       kind: "empty",
-      audioPath: null,
+      audioId: null,
+      audioName: null,
       words: [],
       side: {
         [sourceEditor.kind]: snapshotState(sourceEditor),
@@ -3365,7 +3388,8 @@ function appendEditorToMain(sourceEditor: EditorState, sourcePrefix: string, suc
     importedEditor.undoStack.push(emptyMain);
     importedEditor.redoStack = [];
 
-    importedEditor.audioPath = sourceEditor.audioPath;
+    importedEditor.audioId = sourceEditor.audioId;
+    importedEditor.audioName = sourceEditor.audioName;
     importedEditor.words = sourceEditor.words.map(w => ({ ...w }));
     // Clone to avoid sharing state between panes (undo can restore source).
     const srcSnap = snapshotState(sourceEditor);
@@ -3402,7 +3426,7 @@ function appendEditorToMain(sourceEditor: EditorState, sourcePrefix: string, suc
       sourceStart: ve.entry.sourceStart,
       sourceEnd: ve.entry.sourceEnd,
       breakAfter: ve.entry.breakAfter,
-      sourceFile: sourceEditor.audioPath || ve.entry.sourceFile,
+      sourceFile: sourceEditor.audioId || ve.entry.sourceFile,
     }));
 
     const insertOffset = mainPt.addBuffer.length;
@@ -3441,7 +3465,7 @@ btnAddRecordedToTranscript.addEventListener("click", () => {
   /* eslint-disable no-unreachable */
   // If there is no imported transcript yet, promote recorded → imported.
   if (!importedEditor.pieceTable) {
-    importedEditor.audioPath = importedEditor.audioPath || recordedEditor.audioPath;
+    importedEditor.audioId = importedEditor.audioId || recordedEditor.audioId;
     importedEditor.words = recordedEditor.words.map(w => ({ ...w }));
     importedEditor.pieceTable = recordedEditor.pieceTable;
     importedEditor.undoStack = recordedEditor.undoStack.slice();
@@ -3451,7 +3475,7 @@ btnAddRecordedToTranscript.addEventListener("click", () => {
     importedEditor.selectionStart = null;
     importedEditor.selectionEnd = null;
 
-    recordedEditor.audioPath = null;
+    recordedEditor.audioId = null;
     recordedEditor.words = [];
     recordedEditor.pieceTable = null;
     recordedEditor.undoStack = [];
@@ -3489,7 +3513,7 @@ btnAddRecordedToTranscript.addEventListener("click", () => {
     sourceStart: ve.entry.sourceStart,
     sourceEnd: ve.entry.sourceEnd,
     breakAfter: ve.entry.breakAfter,
-    sourceFile: recordedEditor.audioPath || ve.entry.sourceFile,
+    sourceFile: recordedEditor.audioId || ve.entry.sourceFile,
   }));
 
   const insertOffset = mainPt.addBuffer.length;
@@ -3506,7 +3530,7 @@ btnAddRecordedToTranscript.addEventListener("click", () => {
   renderTranscript(importedEditor);
 
   // Clear recorded editor after merge
-  recordedEditor.audioPath = null;
+  recordedEditor.audioId = null;
   recordedEditor.words = [];
   recordedEditor.pieceTable = null;
   recordedEditor.undoStack = [];
@@ -3637,9 +3661,9 @@ btnSaveEdl.addEventListener("click", async () => {
       imported: importedEditor.pieceTable,
       pendingImported: pendingImportEditor.pieceTable,
       recorded: recordedEditor.pieceTable,
-      importedAudioPath: importedEditor.audioPath,
-      pendingImportedAudioPath: pendingImportEditor.audioPath,
-      recordedAudioPath: recordedEditor.audioPath,
+      importedAudioId: importedEditor.audioId,
+      pendingImportedAudioId: pendingImportEditor.audioId,
+      recordedAudioId: recordedEditor.audioId,
     };
     const json = JSON.stringify(payload, null, 2);
     const savedPath = await otter.saveEdl(json);
@@ -3668,30 +3692,30 @@ btnLoadEdl.addEventListener("click", async () => {
       importedEditor.pieceTable = p.imported ?? null;
       pendingImportEditor.pieceTable = p.pendingImported ?? null;
       recordedEditor.pieceTable = p.recorded ?? null;
-      importedEditor.audioPath = typeof p.importedAudioPath === "string" ? p.importedAudioPath : (importedEditor.pieceTable?.sourceFile ?? null);
-      pendingImportEditor.audioPath = typeof p.pendingImportedAudioPath === "string" ? p.pendingImportedAudioPath : (pendingImportEditor.pieceTable?.sourceFile ?? null);
-      recordedEditor.audioPath = typeof p.recordedAudioPath === "string" ? p.recordedAudioPath : (recordedEditor.pieceTable?.sourceFile ?? null);
+      importedEditor.audioId = typeof p.importedAudioId === "string" ? p.importedAudioId : (importedEditor.pieceTable?.sourceFile ?? null);
+      pendingImportEditor.audioId = typeof p.pendingImportedAudioId === "string" ? p.pendingImportedAudioId : (pendingImportEditor.pieceTable?.sourceFile ?? null);
+      recordedEditor.audioId = typeof p.recordedAudioIdaudioId === "string" ? p.recordedAudioIdaudioId : (recordedEditor.pieceTable?.sourceFile ?? null);
     } else if (parsed && typeof parsed === "object" && parsed.version === 3) {
       const p = parsed as any;
       importedEditor.pieceTable = p.imported ?? null;
       pendingImportEditor.pieceTable = null;
       recordedEditor.pieceTable = p.recorded ?? null;
-      importedEditor.audioPath = typeof p.importedAudioPath === "string" ? p.importedAudioPath : (importedEditor.pieceTable?.sourceFile ?? null);
-      pendingImportEditor.audioPath = null;
-      recordedEditor.audioPath = typeof p.recordedAudioPath === "string" ? p.recordedAudioPath : (recordedEditor.pieceTable?.sourceFile ?? null);
+      importedEditor.audioId = typeof p.importedAudioId === "string" ? p.importedAudioId : (importedEditor.pieceTable?.sourceFile ?? null);
+      pendingImportEditor.audioId = null;
+      recordedEditor.audioId = typeof p.recordedAudioId === "string" ? p.recordedAudioId : (recordedEditor.pieceTable?.sourceFile ?? null);
     } else
     if (isEdlV2(parsed)) {
       importedEditor.pieceTable = parsed.pieceTable;
       pendingImportEditor.pieceTable = null;
       recordedEditor.pieceTable = null;
-      pendingImportEditor.audioPath = null;
-      recordedEditor.audioPath = null;
+      pendingImportEditor.audioId = null;
+      recordedEditor.audioId = null;
     } else if (isEdlV1(parsed)) {
       importedEditor.pieceTable = convertV1ToV2(parsed);
       pendingImportEditor.pieceTable = null;
       recordedEditor.pieceTable = null;
-      pendingImportEditor.audioPath = null;
-      recordedEditor.audioPath = null;
+      pendingImportEditor.audioId = null;
+      recordedEditor.audioId = null;
     } else {
       setStatus("Invalid EDL file.", "error");
       appendLog("\nERROR: file is not a valid OTTER EDL.\n");
@@ -3720,7 +3744,7 @@ btnLoadEdl.addEventListener("click", async () => {
     recordedEditor.selectionEnd = null;
 
     if (importedEditor.pieceTable) {
-      importedEditor.audioPath = importedEditor.audioPath || importedEditor.pieceTable.sourceFile;
+      importedEditor.audioId = importedEditor.audioId || importedEditor.pieceTable.sourceFile;
       const viewEntries = getViewEntries(importedEditor.pieceTable);
       importedEditor.words = viewEntries.map(ve => ({
         word: ve.entry.word,
@@ -3733,7 +3757,7 @@ btnLoadEdl.addEventListener("click", async () => {
     }
 
     if (pendingImportEditor.pieceTable) {
-      pendingImportEditor.audioPath = pendingImportEditor.audioPath || pendingImportEditor.pieceTable.sourceFile;
+      pendingImportEditor.audioId = pendingImportEditor.audioId || pendingImportEditor.pieceTable.sourceFile;
       const viewEntries = getViewEntries(pendingImportEditor.pieceTable);
       pendingImportEditor.words = viewEntries.map(ve => ({
         word: ve.entry.word,
@@ -3746,7 +3770,7 @@ btnLoadEdl.addEventListener("click", async () => {
     }
 
     if (recordedEditor.pieceTable) {
-      recordedEditor.audioPath = recordedEditor.audioPath || recordedEditor.pieceTable.sourceFile;
+      recordedEditor.audioId = recordedEditor.audioId || recordedEditor.pieceTable.sourceFile;
       const viewEntries = getViewEntries(recordedEditor.pieceTable);
       recordedEditor.words = viewEntries.map(ve => ({
         word: ve.entry.word,
@@ -3765,13 +3789,13 @@ btnLoadEdl.addEventListener("click", async () => {
     if (pendingImportEditor.pieceTable) renderTranscript(pendingImportEditor);
     if (recordedEditor.pieceTable) renderTranscript(recordedEditor);
 
-    if (pendingImportEditor.audioPath) {
+    if (pendingImportEditor.audioId) {
       importedWavePane.hidden = false;
       importedWaveDivider.hidden = false;
-      importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
+      importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioId.split("/").pop() ?? pendingImportEditor.audioId));
       btnImportedPlay.disabled = true;
       try {
-        const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
+        const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioId);
         await wsImported.loadBlob(new Blob([importAb]));
         btnImportedPlay.disabled = false;
         setImportedPlayIcon(false);
@@ -3789,14 +3813,14 @@ btnLoadEdl.addEventListener("click", async () => {
       importedLoadedFileEl.textContent = "No imported audio staged";
     }
 
-    if (recordedEditor.audioPath) {
+    if (recordedEditor.audioId) {
       recordedWavePane.hidden = false;
       recordedWaveDivider.hidden = false;
       btnRecordedPlay.disabled = true;
       btnTranscribeRecorded.disabled = false;
       btnStopRecorded.hidden = true;
       try {
-        const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
+        const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioId);
         await wsRecorded.loadBlob(new Blob([recAb]));
         btnRecordedPlay.disabled = false;
         setRecordedPlayIcon(false);
@@ -3815,20 +3839,20 @@ btnLoadEdl.addEventListener("click", async () => {
       btnStopRecorded.hidden = true;
     }
 
-    if (importedEditor.audioPath && importedEditor.pieceTable) {
+    if (importedEditor.audioId && importedEditor.pieceTable) {
       await refreshMainWavePreviewFromEdits();
     } else {
       clearMainWave();
     }
 
     // Update UI state
-    const fname = (importedEditor.audioPath || "").split("/").pop() ?? "";
+    const fname = (importedEditor.audioId || "").split("/").pop() ?? "";
     fnameEl.textContent = fname ? shortenFilenameMiddle(fname) : "No file loaded";
     setStatus(`EDL loaded`, "success");
     appendLog(`EDL loaded from ${result.path}\n`);
 
     btnPlay.disabled = importedEditor.pieceTable == null;
-    btnTranscribe.disabled = pendingImportAudioPath == null;
+    btnTranscribe.disabled = pendingImportAudioId == null;
     setActiveEditor(importedEditor.pieceTable ? importedEditor : (pendingImportEditor.pieceTable ? pendingImportEditor : recordedEditor));
     updateEditButtonStates();
     updateDeletedRegions();
@@ -3854,10 +3878,10 @@ btnSaveEdits.addEventListener("click", async () => {
 
     const exportPayload = {
       version: 1,
-      sourceFile: importedEditor.audioPath || "",
+      sourceFile: importedEditor.audioId || "",
       entries: activeEntries.map(ve => ({
         id: ve.entry.id,
-        sourceFile: ve.entry.sourceFile || importedEditor.audioPath || "",
+        sourceFile: ve.entry.sourceFile || importedEditor.audioId || "",
         sourceStart: ve.entry.sourceStart,
         sourceEnd: ve.entry.sourceEnd,
         label: ve.entry.word,
