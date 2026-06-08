@@ -33,7 +33,7 @@
 import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
 import path from "path";
 import fs from "fs";
-import { spawn, spawnSync, ChildProcess } from "child_process";
+import { spawn, spawnSync, ChildProcess} from "child_process";
 
 type TranscribeSpec =
   | { mode: "file"; name: string }
@@ -79,7 +79,7 @@ type TranscriptionControlCommand =
  * - short-circuit resolution as `{ cancelled: true }` on cancellation
  */
 type ManagedTranscriptionProcess = ChildProcess & {
-  otterState?: "running" | "paused" | "cancelling";
+  otterState?: "running" | "paused" | "cancelling"| "pause-requested";
   otterCancelled?: boolean;
 };
 
@@ -87,6 +87,8 @@ let win: BrowserWindow | null = null;
 let activeProcess: ManagedTranscriptionProcess | null = null;
 const repoRoot = path.join(__dirname, "..");
 const AUDIO_EXTS = new Set([".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"]);
+
+
 
 function ensureDir(p: string) {
   fs.mkdirSync(p, { recursive: true });
@@ -148,7 +150,7 @@ function assertSafeAudioPath(inputPath: string): string {
     throw new Error("Unsupported audio file type");
   }
 
-  const stat = fs.statSync(resolved);
+  const stat = fs.lstatSync(resolved);
   if (!stat.isFile()) {
     throw new Error("Audio path is not a file");
   }
@@ -499,7 +501,7 @@ ipcMain.handle(
       // Important: leaving stdin open as a pipe can cause local transcription
       // backends to hang indefinitely on Windows. This one-shot path does not
       // need stdin for control messages, so close it up front.
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       env,
     }) as ManagedTranscriptionProcess;
 
@@ -629,39 +631,40 @@ ipcMain.handle(
   });
 
 ipcMain.handle("pause-transcription", async () => {
-  if (!activeProcess || !activeProcess.pid) return false;
-  if (activeProcess.otterState !== "running") return false;
-  try {
-    process.kill(activeProcess.pid, "SIGSTOP");
-    activeProcess.otterState = "paused";
-    return true;
-  } catch {
-    return false;
-  }
+  if(!activeProcess) return {ok: false};
+
+  activeProcess.otterState = "pause-requested";
+  sendControlCommand(activeProcess,{type:"pause"});
+
+  return {ok : true}
 });
 
 ipcMain.handle("resume-transcription", async () => {
-  if (!activeProcess || !activeProcess.pid) return false;
-  if (activeProcess.otterState !== "paused") return false;
-  try {
-    process.kill(activeProcess.pid, "SIGCONT");
-    activeProcess.otterState = "running";
-    return true;
-  } catch {
-    return false;
-  }
+  if(!activeProcess) return {ok: false};
+
+  activeProcess.otterState = "running";
+  sendControlCommand(activeProcess,{type: "resume"});
+
+  return{ok: true};
 });
 
 /**
  * 
  */
 ipcMain.handle("cancel-transcription", async () => {
-  if (!activeProcess) return false;
+  if (!activeProcess) return {ok: false};
 
-  const proc = activeProcess;
-  proc.otterCancelled = true;
-  proc.otterState = "cancelling";
-  return terminateProcess(proc);
+  activeProcess.otterCancelled = true;
+  activeProcess.otterState = "cancelling";
+  sendControlCommand(activeProcess, {type: "cancel"});
+
+  setTimeout(()=> {
+    if(activeProcess && !activeProcess.killed){
+      activeProcess.kill();
+    }
+
+  }, 3000);
+  return {ok: true};
 });
 
 ipcMain.handle("get-transcription-state", async () => {
