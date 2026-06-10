@@ -31,7 +31,7 @@
  */
 
 import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
-import path from "path";
+import path, { resolve } from "path";
 import fs from "fs";
 import { spawn, spawnSync, ChildProcess} from "child_process";
 
@@ -174,6 +174,38 @@ function assertSafeSegment(start: unknown, end: unknown) {
 }
 
 //==========================================================================
+
+ipcMain.handle("audio-section", async(_,audioPath, start,end)=> {
+  const safePath = assertSafeAudioPath(audioPath);
+
+  return await extractAudioSection(safePath,start,end);
+})
+
+function extractAudioSection( audioPath: string, start:number, end: number){
+  return new Promise<Buffer>((resolve,reject)=> {
+    const args = [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-ss", String(start),
+      "-to", String(end),
+      "-i",audioPath,
+      "-f" , "wav",
+      "pipe:1",
+    ];
+
+    const ff = spawn("ffmpeg", args);
+
+    const chunks: Buffer[]= [];
+
+    ff.stdout.on("data",chunk => chunks.push(chunk));
+    ff.stderr.on("data",err => console.error(err.toString()));
+
+    ff.on("close", code =>{
+      if( code === 0 )resolve(Buffer.concat(chunks));
+      else reject(new Error('ffmpeg exited with ${code}'));
+    });
+  });
+}
 
 /**
  * IPC: Show a native file picker and return the selected audio file path.
