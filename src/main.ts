@@ -178,11 +178,24 @@ function assertSafeSegment(start: unknown, end: unknown) {
 ipcMain.handle("audio-section", async(_,audioPath, start,end)=> {
   const safePath = assertSafeAudioPath(audioPath);
 
+  if ( 
+    typeof start !== "number" ||
+    typeof end !== "number" ||
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    start < 0 ||
+    end <= start
+  ){
+    throw new Error("invalid audio section range");
+  }
+
   return await extractAudioSection(safePath,start,end);
 })
 
 function extractAudioSection( audioPath: string, start:number, end: number){
   return new Promise<Buffer>((resolve,reject)=> {
+    const duration = end - start;
+
     const args = [
       "-hide_banner",
       "-loglevel", "error",
@@ -196,14 +209,14 @@ function extractAudioSection( audioPath: string, start:number, end: number){
     const ff = spawn("ffmpeg", args);
 
     const chunks: Buffer[]= [];
+    let stderr = "";
 
     ff.stdout.on("data",chunk => chunks.push(chunk));
     ff.stderr.on("data",err => console.error(err.toString()));
 
     ff.on("close", code =>{
       if( code === 0 )resolve(Buffer.concat(chunks));
-      else reject(new Error('ffmpeg exited with ${code}'));
-    });
+      else reject(new Error(`ffmpeg exited with ${code}`));    });
   });
 }
 

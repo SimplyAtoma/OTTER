@@ -178,6 +178,9 @@ contextBridge.exposeInMainWorld("otter", {
   readDefaultSpec: (): Promise<string> =>
     ipcRenderer.invoke("read-spec-file", "default_spec.json"),
 
+  audioSection: (audioPath: string, start: number, end: number) =>
+    ipcRenderer.invoke("audio-section", audioPath, start, end),
+
   // -------------------------------------------------------------------------
   // EDL (Edit Decision List) operations
   // -------------------------------------------------------------------------
