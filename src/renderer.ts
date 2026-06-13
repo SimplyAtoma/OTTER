@@ -141,9 +141,9 @@ type OtterApi = {
   renderEditedPreview: (edlJson: string) => Promise<string>;
   saveMicRecording: (data: ArrayBuffer, mimeType: string) => Promise<string>;
   saveMicRecordingAs: (data: ArrayBuffer, mimeType: string) => Promise<string | null>;
-  pauseTranscription: () => Promise<boolean>;
-  resumeTranscription: () => Promise<boolean>;
-  cancelTranscription: () => Promise<boolean>;
+  pauseTranscription: () => Promise<{ok: boolean}>;
+  resumeTranscription: () => Promise<{ok: boolean}>;
+  cancelTranscription: () => Promise<{ok:boolean}>;
 };
 
 declare global {
@@ -1446,7 +1446,7 @@ function clearSearchHighlights() {
 }
 
 findInput.addEventListener("input", () => {
-  const searchQuery = findInput.value.trim();
+  const searchQuery = findInput.value.trim().toLowerCase();
   const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
 
   transcriptWords.forEach((node)=> {
@@ -2078,7 +2078,7 @@ function renderHighlightedWord(
   }
 
   const lowerWord = wordText.toLowerCase();
-  const lowerQuery = searchQuery.toLowerCase();
+  const lowerQuery = searchQuery;
   const matchPosition = lowerWord.indexOf(lowerQuery);
 
   if (matchPosition === -1) {
