@@ -114,6 +114,26 @@ type ViewEntry = {
   visualIndex: number;
 };
 
+type AudioViewport = {
+  sourcePath: string;
+start: number;
+end: number;
+}
+
+let importedViewport: AudioViewport | null = null;
+let recordedViewport: AudioViewport | null = null;
+
+function viewportContains(
+  viewport: AudioViewport | null,
+  time: number
+) {
+  return (
+    viewport &&
+    time >= viewport.start &&
+    time <= viewport.end
+  );
+}
+
 type EdlV1Entry = {
   id: string;
   sourceStart: number;
@@ -122,6 +142,16 @@ type EdlV1Entry = {
   muted: boolean;
   sourceFile?: string;
 };
+
+type ClipKind = "imported"| "recorded";
+
+type ClipSource = {
+  id: string;
+  kind: ClipKind;
+  audioPath: string;
+  label:string;
+  editor: EditorState;
+}
 
 type OtterApi = {
   chooseAudioFile: () => Promise<string | null>;
@@ -458,6 +488,32 @@ function getViewEntries(pt: PieceTableData): ViewEntry[] {
  */
 function getActiveEntries(pt: PieceTableData): ViewEntry[] {
   return getViewEntries(pt).filter(v => v.status !== "deleted");
+}
+
+function getClipSources(): ClipSource[] {
+  const clips: ClipSource[] = [];
+
+  if (pendingImportEditor.audioPath) {
+    clips.push({
+      id: "pending-import",
+      kind: "imported",
+      audioPath: pendingImportEditor.audioPath,
+      label: "Imported Clip",
+      editor: pendingImportEditor,
+    });
+  }
+
+  if (recordedEditor.audioPath) {
+    clips.push({
+      id: "recorded",
+      kind: "recorded",
+      audioPath: recordedEditor.audioPath,
+      label: "Recorded Clip",
+      editor: recordedEditor,
+    });
+  }
+
+  return clips;
 }
 
 /**
@@ -1724,6 +1780,8 @@ async function loadWaveformWindow(
   await wsInstance.loadBlob(
     new Blob([wav], { type: "audio/wav" })
   );
+
+  return {sourcePath: audioPath, start, end};
 }
 
 /**
@@ -2793,8 +2851,7 @@ btnRecord.addEventListener("click", async () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
 
-        const recAb = await otter.readFileAsArrayBuffer(wavPath);
-        await wsRecorded.loadBlob(new Blob([recAb]));
+        recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
         btnRecordedPlay.disabled = false;
         setRecordedPlayIcon(false);
 
@@ -2875,9 +2932,7 @@ btnChoose.addEventListener("click", async () => {
   importedLoadedFileEl.textContent = shortenFilenameMiddle(fname);
   btnImportedPlay.disabled = true;
   importedTimeEl.textContent = "0.00";
-  const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
-  const blob = new Blob([ab]);
-  await wsImported.loadBlob(blob);
+  importedViewport = await loadWaveformWindow(wsImported,pendingImportAudioPath,0,120);
   btnImportedPlay.disabled = false;
   setImportedPlayIcon(false);
 });
@@ -3258,8 +3313,8 @@ btnUndo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-          await wsImported.loadBlob(new Blob([importAb]));
+
+          importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
         } catch {
@@ -3281,8 +3336,7 @@ btnUndo.addEventListener("click", () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-          await wsRecorded.loadBlob(new Blob([recAb]));
+          recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
         } catch {
@@ -3327,8 +3381,7 @@ btnRedo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-          await wsImported.loadBlob(new Blob([importAb]));
+          importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
         } catch {
@@ -3350,8 +3403,7 @@ btnRedo.addEventListener("click", () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-          await wsRecorded.loadBlob(new Blob([recAb]));
+          recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
         } catch {
@@ -3815,8 +3867,7 @@ btnLoadEdl.addEventListener("click", async () => {
       importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
       btnImportedPlay.disabled = true;
       try {
-        const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-        await wsImported.loadBlob(new Blob([importAb]));
+        importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
         btnImportedPlay.disabled = false;
         setImportedPlayIcon(false);
       } catch (err: unknown) {
@@ -3840,8 +3891,7 @@ btnLoadEdl.addEventListener("click", async () => {
       btnTranscribeRecorded.disabled = false;
       btnStopRecorded.hidden = true;
       try {
-        const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-        await wsRecorded.loadBlob(new Blob([recAb]));
+        recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
         btnRecordedPlay.disabled = false;
         setRecordedPlayIcon(false);
       } catch (err: unknown) {
