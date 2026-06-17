@@ -178,6 +178,9 @@ contextBridge.exposeInMainWorld("otter", {
   readDefaultSpec: (): Promise<string> =>
     ipcRenderer.invoke("read-spec-file", "default_spec.json"),
 
+  audioSection: (audioPath: string, start: number, end: number): Promise<ArrayBuffer> =>
+    ipcRenderer.invoke("audio-section", audioPath, start, end),
+
   // -------------------------------------------------------------------------
   // EDL (Edit Decision List) operations
   // -------------------------------------------------------------------------
@@ -211,8 +214,6 @@ contextBridge.exposeInMainWorld("otter", {
   exportEdlAudio: (edlJson: string): Promise<string | null> =>
     ipcRenderer.invoke("export-edl-audio", edlJson),
 
-  renderEditedPreview: (edlJson: string): Promise<string> =>
-    ipcRenderer.invoke("render-edited-preview", edlJson),
   /**
    * Render an "edited preview" WAV for fast playback in the renderer.
    *
@@ -223,6 +224,8 @@ contextBridge.exposeInMainWorld("otter", {
    * The renderer uses this to update the main waveform after edits, without
    * permanently exporting audio.
    */
+  renderEditedPreview: (edlJson: string): Promise<string> =>
+    ipcRenderer.invoke("render-edited-preview", edlJson),
 
   /**
    * Save a microphone recording to disk and return a WAV path.

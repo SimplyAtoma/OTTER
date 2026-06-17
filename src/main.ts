@@ -31,7 +31,7 @@
  */
 
 import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, OpenDialogOptions } from "electron";
-import path from "path";
+import path, { resolve } from "path";
 import fs from "fs";
 import { spawn, spawnSync, ChildProcess} from "child_process";
 
@@ -59,10 +59,6 @@ type Edl = {
  * Control messages that (in the long-lived worker mode) can be sent to the Python
  * transcription process over stdin as line-delimited JSON.
  *
- * Important: This PoC currently uses a one-shot process invocation for transcription
- * (`stdio: ["ignore", ...]` below), so pause/resume are not wired through. The types
- * remain here because the Python side supports cooperative control and the Electron
- * UI already models the states.
  */
 type TranscriptionControlCommand =
   | { type: "pause" }
@@ -166,14 +162,56 @@ function assertSafeSegment(start: unknown, end: unknown) {
     throw new Error("Invalid EDL segment");
   }
 
-  if (e - s > 60 * 60 * 6) {
-    throw new Error("EDL segment too long");
+  if (e - s > 60 * 10) {
+    throw new Error("Preview segement too long");
   }
 
   return { start: s, end: e };
 }
 
 //==========================================================================
+
+function extractAudioSection( audioPath: string, start:number, end: number){
+  //assert the segment is safe to use prior to resolving
+    const seg = assertSafeSegment(start,end);
+    const duration = seg.end - seg.start;
+
+    return new Promise<Buffer>((resolve,reject)=> {
+
+      const args = [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", String(seg.start),
+        "-i",audioPath,
+        "-t", String(duration),
+        "-f" , "wav",
+        "pipe:1",
+      ];
+
+    const ff = spawn("ffmpeg", args);
+
+    if(!ff.stdout || !ff.stderr){
+      reject(new Error("ffmpeg did not expose stdout/stderr"));
+      return;
+    }
+
+    const chunks: Buffer[]= [];
+    let stderr = "";
+
+    ff.stdout.on("data",chunk => chunks.push(chunk));
+    ff.stderr.on("data", chunk => {
+      stderr += chunk.toString();
+    });
+
+    ff.on("error", reject);
+
+    ff.on("close", code =>{
+      if( code === 0 )resolve(Buffer.concat(chunks));
+      else reject(new Error(`ffmpeg exited with ${code}: ${stderr}`));
+    }
+    );
+  });
+}
 
 /**
  * IPC: Show a native file picker and return the selected audio file path.
@@ -322,8 +360,6 @@ function getPythonPath() {
 /**
  * 
  */
-// Used by earlier refactors; retained for future control routing.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function sendControlCommand(
   proc: ManagedTranscriptionProcess,
   cmd: TranscriptionControlCommand
@@ -484,7 +520,7 @@ ipcMain.handle(
     }
     const safeAudioPath =  assertSafeAudioPath(audioPath);
 
-    const { logLine: workerCacheLog } = buildPythonWorkerEnv();
+    const { env, logLine: workerCacheLog } = buildPythonWorkerEnv();
     event.sender.send(
       "transcribe-log",
       `INFO:PythonWorker=enabled | Audio=${safeAudioPath}\n` + workerCacheLog
@@ -495,12 +531,8 @@ ipcMain.handle(
     if (specFile) argv.push("--spec-file", specFile);
     if (specJson) argv.push("--spec-json", specJson);
 
-    const { env } = buildPythonWorkerEnv();
     const child = spawn(python, argv, {
       cwd: repoRoot,
-      // Important: leaving stdin open as a pipe can cause local transcription
-      // backends to hang indefinitely on Windows. This one-shot path does not
-      // need stdin for control messages, so close it up front.
       stdio: ["pipe", "pipe", "pipe"],
       env,
     }) as ManagedTranscriptionProcess;
@@ -660,7 +692,7 @@ ipcMain.handle("cancel-transcription", async () => {
 
   setTimeout(()=> {
     if(activeProcess && !activeProcess.killed){
-      activeProcess.kill();
+      terminateProcess(activeProcess);
     }
 
   }, 3000);
@@ -855,6 +887,16 @@ ipcMain.handle(
     return outPath;
   }
 );
+
+/**
+ * 
+ */
+ipcMain.handle("audio-section", 
+  async(_event,audioPath: string, start: number,end)=> {
+  const safePath = assertSafeAudioPath(audioPath);
+  const seg = assertSafeSegment(start, end);
+  return await extractAudioSection(safePath,seg.start,seg.end);
+})
 
 // =============================================================================
 // EDL: Save / Load / Export
