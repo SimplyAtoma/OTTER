@@ -114,6 +114,26 @@ type ViewEntry = {
   visualIndex: number;
 };
 
+type AudioViewport = {
+  sourcePath: string;
+start: number;
+end: number;
+}
+
+let importedViewport: AudioViewport | null = null;
+let recordedViewport: AudioViewport | null = null;
+
+function viewportContains(
+  viewport: AudioViewport | null,
+  time: number
+) {
+  return (
+    viewport &&
+    time >= viewport.start &&
+    time <= viewport.end
+  );
+}
+
 type EdlV1Entry = {
   id: string;
   sourceStart: number;
@@ -122,6 +142,15 @@ type EdlV1Entry = {
   muted: boolean;
   sourceFile?: string;
 };
+
+type ClipKind = "imported"| "recorded";
+
+type ClipSource = {
+  id: string;
+  kind: ClipKind;
+  audioPath: string;
+  label:string;
+}
 
 type OtterApi = {
   chooseAudioFile: () => Promise<string | null>;
@@ -159,6 +188,8 @@ declare global {
 const SEEK_EPS = 0.01;
 const DETAIL_PAD_BEFORE = 0.25; // seconds
 const DETAIL_PAD_AFTER  = 0.25; // seconds
+const VIEWPORT_DURATION_SEC = 120; //MAX viewport length
+const VIEWPORT_HALF_SEC = VIEWPORT_DURATION_SEC /2;// HALF viewport length
 
 
 //
@@ -326,6 +357,8 @@ let dragMoveEditorKind: EditorKind | null = null;
 let isEditedPreviewMode = false;
 let previewWordTimes: Array<{ start: number; end: number }> = [];
 let previewRefreshToken = 0;
+let importedViewportLoading = false;
+let recordedViewportLoading = false;
 // Used to gate UI behaviors / debugging; kept for future progress UI.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 let isRefreshingPreview = false;
@@ -458,6 +491,31 @@ function getViewEntries(pt: PieceTableData): ViewEntry[] {
  */
 function getActiveEntries(pt: PieceTableData): ViewEntry[] {
   return getViewEntries(pt).filter(v => v.status !== "deleted");
+}
+
+
+function getClipSources(): ClipSource[] {
+  const clips: ClipSource[] = [];
+
+  if (pendingImportEditor.audioPath) {
+    clips.push({
+      id: "pending-import",
+      kind: "imported",
+      audioPath: pendingImportEditor.audioPath,
+      label: "Imported Clip",
+    });
+  }
+
+  if (recordedEditor.audioPath) {
+    clips.push({
+      id: "recorded",
+      kind: "recorded",
+      audioPath: recordedEditor.audioPath,
+      label: "Recorded Clip",
+    });
+  }
+
+  return clips;
 }
 
 /**
@@ -624,6 +682,102 @@ async function refreshDetailIfActive(): Promise<void> {
     console.error("Failed to refresh detail view:", err);
   }
 }
+async function ensureImportedViewport(
+  seekTime: number
+): Promise<AudioViewport | null> {
+  if (
+    pendingImportEditor.audioPath &&
+    !viewportContains(importedViewport, seekTime)
+  ) {
+    importedViewport = await loadWaveformWindow(
+      wsImported,
+      pendingImportEditor.audioPath,
+      Math.max(0, seekTime - VIEWPORT_HALF_SEC),
+      seekTime + VIEWPORT_HALF_SEC
+    );
+  }
+
+  return importedViewport;
+}
+
+async function ensureRecordedViewport(
+  seekTime: number
+): Promise<AudioViewport | null> {
+  if (
+    recordedEditor.audioPath &&
+    !viewportContains(recordedViewport, seekTime)
+  ) {
+    recordedViewport = await loadWaveformWindow(
+      wsRecorded,
+      recordedEditor.audioPath,
+      Math.max(0, seekTime - VIEWPORT_HALF_SEC),
+      seekTime + VIEWPORT_HALF_SEC
+    );
+  }
+
+  return recordedViewport;
+}
+
+async function advanceImportedViewport(){
+  if (!importedViewport || importedViewportLoading){
+    return;
+  }
+
+  importedViewportLoading = true;
+  try{
+    const absoluteTime = viewportToAbsoluteTime(importedViewport,wsImported.getCurrentTime());
+    const wasPlaying = wsImported.isPlaying();
+    importedViewport = await loadWaveformWindow(wsImported,importedViewport.sourcePath,importedViewport.start +VIEWPORT_HALF_SEC, importedViewport.end +VIEWPORT_HALF_SEC);
+    wsImported.setTime(absoluteToViewportTime(importedViewport,absoluteTime));
+
+    if (wasPlaying){
+      wsImported.play()
+    }
+  } finally{
+    importedViewportLoading = false;
+  }
+  
+}
+
+async function advanceRecordedViewport() {
+  if (!recordedViewport || recordedViewportLoading) {
+    return;
+  }
+
+  recordedViewportLoading = true;
+
+  try {
+    const absoluteTime =
+      viewportToAbsoluteTime(
+        recordedViewport,
+        wsRecorded.getCurrentTime()
+      );
+
+    const wasPlaying = wsRecorded.isPlaying();
+
+    recordedViewport =
+      await loadWaveformWindow(
+        wsRecorded,
+        recordedViewport.sourcePath,
+        recordedViewport.start + VIEWPORT_HALF_SEC,
+        recordedViewport.end + VIEWPORT_HALF_SEC
+      );
+
+    wsRecorded.setTime(
+      absoluteToViewportTime(
+        recordedViewport,
+        absoluteTime
+      )
+    );
+
+    if (wasPlaying) {
+      wsRecorded.play();
+    }
+  } finally {
+    recordedViewportLoading = false;
+  }
+}
+
 
 
 /**
@@ -988,6 +1142,17 @@ function updateDeletedRegions() {
     });
     i = j;
   }
+}
+
+function absoluteToViewportTime(viewport: AudioViewport, absoluteTime: number){
+  return absoluteTime - viewport.start;
+}
+
+function viewportToAbsoluteTime(
+  viewport: AudioViewport,
+  viewportTime: number
+) {
+  return viewport.start + viewportTime;
 }
 
 
@@ -1724,6 +1889,8 @@ async function loadWaveformWindow(
   await wsInstance.loadBlob(
     new Blob([wav], { type: "audio/wav" })
   );
+
+  return {sourcePath: audioPath, start, end};
 }
 
 /**
@@ -1974,9 +2141,21 @@ function renderTranscript(editor: EditorState) {
         ws.setTime(seekTime + SEEK_EPS);
         setPlayheadIndex(i);
       } else if (editor.kind === "pending-import") {
-        wsImported.setTime(Number(w.start) + SEEK_EPS);
-      } else {
-        wsRecorded.setTime(Number(w.start) + SEEK_EPS);
+        const seekTime = Number(w.start);
+        const vp = await ensureImportedViewport(seekTime);
+
+        if(vp){
+          wsImported.setTime(absoluteToViewportTime(vp,seekTime)+ SEEK_EPS);
+        }
+  
+      } else if (editor.kind === "recorded"){
+        const seekTime = Number(w.start);
+        const vp = await ensureRecordedViewport(seekTime)
+
+        if(vp){
+          wsRecorded.setTime( absoluteToViewportTime(vp,seekTime) + SEEK_EPS);
+        }
+        
       }
 
       // Load the detail waveform snippet centered on the selected range
@@ -2190,8 +2369,19 @@ function setImportedPlayIcon(isPlaying: boolean) {
 wsImported.on("play", () => setImportedPlayIcon(true));
 wsImported.on("pause", () => setImportedPlayIcon(false));
 wsImported.on("finish", () => setImportedPlayIcon(false));
-wsImported.on("timeupdate", (t: number) => {
-  importedTimeEl.textContent = `${t.toFixed(2)}s`;
+wsImported.on("timeupdate", async (t: number) => {
+  if(!importedViewport) return;
+  importedTimeEl.textContent =
+  `${viewportToAbsoluteTime(
+      importedViewport,
+      t
+    ).toFixed(2)}s`;
+
+  const absoluteTime = viewportToAbsoluteTime(importedViewport, t);
+
+  if (absoluteTime > importedViewport.end-10){
+    await advanceImportedViewport();
+  }
 });
 
 btnImportedPlay.addEventListener("click", () => {
@@ -2208,8 +2398,23 @@ wsRecorded.on("play", () => setRecordedPlayIcon(true));
 wsRecorded.on("pause", () => setRecordedPlayIcon(false));
 wsRecorded.on("finish", () => setRecordedPlayIcon(false));
 
-wsRecorded.on("timeupdate", (t: number) => {
-  recordedTimeEl.textContent = `${t.toFixed(2)}s`;
+wsRecorded.on("timeupdate", async (t: number) => {
+  if(!recordedViewport)return;
+  recordedTimeEl.textContent =
+  `${viewportToAbsoluteTime(
+      recordedViewport,
+      t
+    ).toFixed(2)}s`;
+
+    const absoluteTime = viewportToAbsoluteTime(recordedViewport, t);
+    
+    if (
+      absoluteTime >
+      recordedViewport.end - 10
+    ) {
+      await advanceRecordedViewport();
+    }
+
 });
 
 btnRecordedPlay.addEventListener("click", () => {
@@ -2793,8 +2998,7 @@ btnRecord.addEventListener("click", async () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
 
-        const recAb = await otter.readFileAsArrayBuffer(wavPath);
-        await wsRecorded.loadBlob(new Blob([recAb]));
+        recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
         btnRecordedPlay.disabled = false;
         setRecordedPlayIcon(false);
 
@@ -2875,9 +3079,7 @@ btnChoose.addEventListener("click", async () => {
   importedLoadedFileEl.textContent = shortenFilenameMiddle(fname);
   btnImportedPlay.disabled = true;
   importedTimeEl.textContent = "0.00";
-  const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
-  const blob = new Blob([ab]);
-  await wsImported.loadBlob(blob);
+  importedViewport = await loadWaveformWindow(wsImported,pendingImportAudioPath,0,120);
   btnImportedPlay.disabled = false;
   setImportedPlayIcon(false);
 });
@@ -3258,8 +3460,8 @@ btnUndo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-          await wsImported.loadBlob(new Blob([importAb]));
+
+          importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
         } catch {
@@ -3281,8 +3483,7 @@ btnUndo.addEventListener("click", () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-          await wsRecorded.loadBlob(new Blob([recAb]));
+          recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
         } catch {
@@ -3327,8 +3528,7 @@ btnRedo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-          await wsImported.loadBlob(new Blob([importAb]));
+          importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
         } catch {
@@ -3350,8 +3550,7 @@ btnRedo.addEventListener("click", () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-          await wsRecorded.loadBlob(new Blob([recAb]));
+          recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
         } catch {
@@ -3815,8 +4014,7 @@ btnLoadEdl.addEventListener("click", async () => {
       importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
       btnImportedPlay.disabled = true;
       try {
-        const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-        await wsImported.loadBlob(new Blob([importAb]));
+        importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
         btnImportedPlay.disabled = false;
         setImportedPlayIcon(false);
       } catch (err: unknown) {
@@ -3840,8 +4038,7 @@ btnLoadEdl.addEventListener("click", async () => {
       btnTranscribeRecorded.disabled = false;
       btnStopRecorded.hidden = true;
       try {
-        const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-        await wsRecorded.loadBlob(new Blob([recAb]));
+        recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
         btnRecordedPlay.disabled = false;
         setRecordedPlayIcon(false);
       } catch (err: unknown) {
